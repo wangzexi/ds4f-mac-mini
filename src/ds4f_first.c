@@ -391,8 +391,8 @@ static int ffn_layer(const ds4f_gguf *g, int layer, int token,
     const ds4f_tensor *gt = layer_tensor(g, layer, "ffn_gate_exps", n, sizeof(n));
     const ds4f_tensor *ut = layer_tensor(g, layer, "ffn_up_exps", n, sizeof(n));
     const ds4f_tensor *dt = layer_tensor(g, layer, "ffn_down_exps", n, sizeof(n));
-    if (ds4f_matvec_expert_q8k_pair(g, gt, ut, expert_ids, USED, norm, 0, E,
-                                    gate_batch, FF, up_batch, FF)) return -1;
+    if (ds4f_matvec_expert_q8k_pair_prefetch(g, gt, ut, expert_ids, USED, norm, 0, E,
+                                             gate_batch, FF, up_batch, FF, dt)) return -1;
     if (getenv("DS4F_VALIDATE_METAL_EXPERTS") && layer == 0) {
         float *cpu_gate = malloc((size_t)FF * sizeof(*cpu_gate));
         float *cpu_up = malloc((size_t)FF * sizeof(*cpu_up));

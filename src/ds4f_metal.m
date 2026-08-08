@@ -886,12 +886,30 @@ static int metal_expert_rows_pair(const ds4f_gguf *g,
     return 0;
 }
 
+/* The selected experts are known before the gate/up GPU work starts.  Queue
+ * their down projections while that command buffer runs so the next MoE stage
+ * finds them resident without changing arithmetic or routing. */
+static void metal_prefetch_experts(const ds4f_gguf *g, const ds4f_tensor *t,
+                                   const uint32_t *experts, size_t count) {
+    if (!g || !t || !experts || !count || t->n_dims != 3 || !t->dims[2] ||
+        t->nbytes % t->dims[2]) return;
+    const uint64_t expert_bytes = t->nbytes / t->dims[2];
+    for (size_t i = 0; i < count; ++i) {
+        if (experts[i] >= t->dims[2]) continue;
+        ds4f_tensor slice = *t;
+        slice.file_offset += (uint64_t)experts[i] * expert_bytes;
+        slice.nbytes = expert_bytes;
+        (void)get_weight(g, &slice);
+    }
+}
+
 static int metal_iq2_rows_pair(const ds4f_gguf *g,
                                const ds4f_tensor *a, const ds4f_tensor *b,
                                const uint32_t *experts, size_t count,
                                const float *x, size_t x_stride, size_t in,
                                float *ya, size_t ya_stride,
-                               float *yb, size_t yb_stride) {
+                               float *yb, size_t yb_stride,
+                               const ds4f_tensor *prefetch) {
     if (!g || !a || !b || !experts || !count || !x || !ya || !yb ||
         a->type != 16 || b->type != 16 || a->n_dims != 3 || b->n_dims != 3 ||
         a->dims[0] != b->dims[0] || a->dims[1] != b->dims[1] ||
@@ -942,7 +960,10 @@ static int metal_iq2_rows_pair(const ds4f_gguf *g,
                   threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         }
         [enc endEncoding];
-        [cb commit]; [cb waitUntilCompleted];
+        [cb commit];
+        if (prefetch && !getenv("DS4F_DISABLE_DOWN_PREFETCH"))
+            metal_prefetch_experts(g, prefetch, experts, count);
+        [cb waitUntilCompleted];
         if (cb.status != MTLCommandBufferStatusCompleted) return -1;
         const float *pa = (const float *)[out_a contents];
         const float *pb = (const float *)[out_b contents];
@@ -981,12 +1002,24 @@ int ds4f_metal_matvec_expert_q8k_pair(const ds4f_gguf *g,
     if (metal_init() != 0) return -1;
     if (a->type == 16)
         return metal_iq2_rows_pair(g, a, b, experts, count, x, x_stride, in,
-                                   ya, ya_stride, yb, yb_stride);
+                                   ya, ya_stride, yb, yb_stride, NULL);
     if (a->type == 10)
         return metal_expert_rows_pair(g, a, b, experts, count, x, x_stride, in,
                                       ya, ya_stride, yb, yb_stride,
                                       g_q2_pipeline, 0);
     return -1;
+}
+
+int ds4f_metal_matvec_expert_q8k_pair_prefetch(
+        const ds4f_gguf *g, const ds4f_tensor *a, const ds4f_tensor *b,
+        const uint32_t *experts, size_t count, const float *x,
+        size_t x_stride, size_t in, float *ya, size_t ya_stride,
+        float *yb, size_t yb_stride, const ds4f_tensor *prefetch) {
+    if (!prefetch || !a || !b || a->type != 16 || b->type != 16 ||
+        getenv("DS4F_FORCE_CPU_EXPERTS")) return -1;
+    if (metal_init() != 0) return -1;
+    return metal_iq2_rows_pair(g, a, b, experts, count, x, x_stride, in,
+                               ya, ya_stride, yb, yb_stride, prefetch);
 }
 
 int ds4f_metal_matvec_expert_q8k(const ds4f_gguf *g, const ds4f_tensor *t,

@@ -37,6 +37,15 @@ extern int ds4f_metal_matvec_expert_q8k_pair(const ds4f_gguf *g,
                                              size_t x_stride, size_t n,
                                              float *ya, size_t ya_stride,
                                              float *yb, size_t yb_stride);
+extern int ds4f_metal_matvec_expert_q8k_pair_prefetch(const ds4f_gguf *g,
+                                                       const ds4f_tensor *a,
+                                                       const ds4f_tensor *b,
+                                                       const uint32_t *experts,
+                                                       size_t count, const float *x,
+                                                       size_t x_stride, size_t n,
+                                                       float *ya, size_t ya_stride,
+                                                       float *yb, size_t yb_stride,
+                                                       const ds4f_tensor *prefetch);
 extern int ds4f_metal_matvec_group(const ds4f_gguf *g, const ds4f_tensor *t,
                                    const float *x, uint32_t groups,
                                    uint32_t group_in, uint32_t group_out,
@@ -441,6 +450,7 @@ int ds4f_matvec_expert_q8k_pair(const ds4f_gguf *g,
                                           yb_stride) == 0)
         return 0;
 #endif
+
     for (size_t i = 0; i < count; ++i) {
         const float *xi = x + (x_stride ? i * x_stride : 0);
         if (ds4f_matvec_expert_q8k(g, a, experts[i], xi, n,
@@ -449,6 +459,27 @@ int ds4f_matvec_expert_q8k_pair(const ds4f_gguf *g,
                                    yb + i * yb_stride)) return -1;
     }
     return 0;
+}
+
+int ds4f_matvec_expert_q8k_pair_prefetch(const ds4f_gguf *g,
+                                         const ds4f_tensor *a, const ds4f_tensor *b,
+                                         const uint32_t *experts, size_t count,
+                                         const float *x, size_t x_stride, size_t n,
+                                         float *ya, size_t ya_stride,
+                                         float *yb, size_t yb_stride,
+                                         const ds4f_tensor *prefetch) {
+#ifndef DS4F_USE_METAL
+    (void)prefetch;
+#endif
+#ifdef DS4F_USE_METAL
+    if (prefetch && a && b && a->type == 16 && b->type == 16 &&
+        ds4f_metal_matvec_expert_q8k_pair_prefetch(g, a, b, experts, count,
+                                                    x, x_stride, n, ya, ya_stride,
+                                                    yb, yb_stride, prefetch) == 0)
+        return 0;
+#endif
+    return ds4f_matvec_expert_q8k_pair(g, a, b, experts, count, x, x_stride,
+                                        n, ya, ya_stride, yb, yb_stride);
 }
 
 int ds4f_matvec(const ds4f_gguf *g, const ds4f_tensor *t, const float *x, float *y) {

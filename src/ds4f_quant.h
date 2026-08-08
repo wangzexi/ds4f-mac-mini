@@ -34,6 +34,13 @@ int ds4f_matvec_expert_q8k_pair(const ds4f_gguf *g,
                                 const float *x, size_t x_stride, size_t n,
                                 float *ya, size_t ya_stride,
                                 float *yb, size_t yb_stride);
+int ds4f_matvec_expert_q8k_pair_prefetch(const ds4f_gguf *g,
+                                         const ds4f_tensor *a, const ds4f_tensor *b,
+                                         const uint32_t *experts, size_t count,
+                                         const float *x, size_t x_stride, size_t n,
+                                         float *ya, size_t ya_stride,
+                                         float *yb, size_t yb_stride,
+                                         const ds4f_tensor *prefetch);
 int ds4f_matvec_group(const ds4f_gguf *g, const ds4f_tensor *t,
                       const float *x, uint32_t groups, uint32_t group_in,
                       uint32_t group_out, float *y);
