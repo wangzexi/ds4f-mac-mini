@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifndef DS4F_FFN_DUMP
 #define DS4F_FFN_DUMP(name, x, n, layer) ((void)0)
@@ -22,6 +23,12 @@ enum {
     FF = 2048, EXPERTS = 256, USED = 6, LAYERS = 43, VOCAB = 129280,
     ROT = 64
 };
+
+static double ffn_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
+}
 
 static const ds4f_tensor *need(const ds4f_gguf *g, const char *name) {
     const ds4f_tensor *t = ds4f_gguf_find(g, name);
@@ -324,6 +331,11 @@ static void print_compare(const char *name, const float *gpu, const float *cpu, 
 
 static int ffn_layer(const ds4f_gguf *g, int layer, int token,
                      const float *inp, float *out) {
+    const int ffn_profile = getenv("DS4F_FFN_PROFILE") != NULL;
+    const double ffn_t0 = ffn_profile ? ffn_now_ms() : 0.0;
+    double routed_pair_ms = 0.0, routed_activation_ms = 0.0;
+    double routed_down_ms = 0.0, shared_ms = 0.0;
+    double routed_activation_t0 = 0.0, routed_down_t0 = 0.0;
     char n[96];
     float *res = malloc((size_t)E * HC * sizeof(float));
     float *cur = malloc((size_t)E * sizeof(float));
@@ -411,8 +423,13 @@ static int ffn_layer(const ds4f_gguf *g, int layer, int token,
     const ds4f_tensor *gt = layer_tensor(g, layer, "ffn_gate_exps", n, sizeof(n));
     const ds4f_tensor *ut = layer_tensor(g, layer, "ffn_up_exps", n, sizeof(n));
     const ds4f_tensor *dt = layer_tensor(g, layer, "ffn_down_exps", n, sizeof(n));
+    double routed_pair_t0 = ffn_profile ? ffn_now_ms() : 0.0;
     if (ds4f_matvec_expert_q8k_pair_prefetch(g, gt, ut, expert_ids, USED, norm, 0, E,
                                              gate_batch, FF, up_batch, FF, dt)) return -1;
+    if (ffn_profile) {
+        routed_pair_ms = ffn_now_ms() - routed_pair_t0;
+        routed_activation_t0 = ffn_now_ms();
+    }
     if (getenv("DS4F_VALIDATE_METAL_EXPERTS") && layer == 0) {
         float *cpu_gate = malloc((size_t)FF * sizeof(*cpu_gate));
         float *cpu_up = malloc((size_t)FF * sizeof(*cpu_up));
@@ -481,11 +498,16 @@ static int ffn_layer(const ds4f_gguf *g, int layer, int token,
         }
     }
     DS4F_FFN_DUMP("ffn_moe_weighted_swiglu", mid_batch, (size_t)USED * FF, layer);
+    if (ffn_profile) {
+        routed_activation_ms = ffn_now_ms() - routed_activation_t0;
+        routed_down_t0 = ffn_now_ms();
+    }
     if (ds4f_matvec_expert_q8k_batch(g, dt, expert_ids, USED, mid_batch, FF, FF,
                                      down_batch, E)) return -1;
     for (int s = 0; s < USED; ++s)
         for (int i = 0; i < E; ++i) moe[i] += down_batch[(size_t)s * E + i];
     DS4F_FFN_DUMP("ffn_moe_out", moe, E, layer);
+    if (ffn_profile) routed_down_ms = ffn_now_ms() - routed_down_t0;
     if (getenv("DS4F_TRACE_EXPERT_DETAIL") && layer == 0) {
         for (int s = 0; s < USED; ++s) {
             char name[64];
@@ -494,6 +516,7 @@ static int ffn_layer(const ds4f_gguf *g, int layer, int token,
         }
     }
 
+    double shared_t0 = ffn_profile ? ffn_now_ms() : 0.0;
     if (ds4f_matvec_q8_pair(g,
                              layer_tensor(g, layer, "ffn_gate_shexp", n, sizeof(n)),
                              layer_tensor(g, layer, "ffn_up_shexp", n, sizeof(n)),
@@ -514,6 +537,13 @@ static int ffn_layer(const ds4f_gguf *g, int layer, int token,
         print_stats(name, shared, E);
     }
     hc_post(out, shared, res, post, comb);
+    if (ffn_profile) {
+        shared_ms = ffn_now_ms() - shared_t0;
+        fprintf(stderr,
+                "ds4f MoE profile layer=%d gate_up_ms=%.3f activation_ms=%.3f down_ms=%.3f shared_ms=%.3f total_ms=%.3f\n",
+                layer, routed_pair_ms, routed_activation_ms, routed_down_ms,
+                shared_ms, ffn_now_ms() - ffn_t0);
+    }
 
     free(down_batch); free(mid_batch); free(up_batch); free(gate_batch);
     free(down); free(mid); free(up); free(gate); free(shared); free(moe);
