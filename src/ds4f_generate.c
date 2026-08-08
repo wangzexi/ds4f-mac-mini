@@ -413,6 +413,7 @@ static int gen_forward(const ds4f_gguf *g, gen_cache *cache, int token,
     double attention_ms = 0.0, ffn_ms = 0.0;
     for (int l = 0; l < LAYERS; ++l) {
         double t0 = profile ? gen_now_ms() : 0.0;
+        gen_active_pos = pos;
         gen_attention(g, l, pos, cur, attn, &cache->layer[l]);
         if (profile) attention_ms += gen_now_ms() - t0;
         t0 = profile ? gen_now_ms() : 0.0;

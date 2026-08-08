@@ -22,7 +22,9 @@
 
 2026-08-08/09 在 Mini 上重新验证：target-only SSD streaming 路径能够在 M4/16GB 上实际输出 token。`ds4f-fast` 通过 DwarfStar 的公开 engine API 复用已验证的完整 Metal graph；空 chat prompt（3 个 prompt token）连续生成 8 token，输出 `DeepSeek-V2, released in`，generation 为 **1.83 token/s**（6GiB cache）。在同一 16-token 对照中，6GiB 为 **1.86 token/s**，4GiB 为 **1.67 token/s**；连续生成应保持 6GiB 默认。因此“16GB 机器上把这个固定模型跑起来”的目标已有可部署入口。
 
-自写运行器已完成独立 GGUF、tokenizer、原始/压缩 KV cache、连续 greedy decode 和 Metal Q8/IQ2/Q2 路径。对同一空 chat prompt 的 8-token 回归中，DwarfStar 与 ds4f-generate-metal 的 top-k 排名和每一步选中的 token 全部一致；第 0 步 top-1 logit 差为 +0.0120345。这证明当前数值路径可以稳定地连续生成，仍不代表长上下文、多种 prompt 和 DSpark 的完整覆盖。
+自写运行器已完成独立 GGUF、tokenizer、原始/压缩 KV cache、连续 greedy decode 和 Metal Q8/IQ2/Q2 路径。空 chat prompt 的 8-token 历史回归只能证明这一条极小输入可连续运行，不能外推为通用数值正确性。
+
+2026-08-09 实际生成审计：同一渲染 chat 输入下，自写 Metal 与 `ds4f-fast` 在中文短提示词前 4 个 token ID 一致；但英文 `Explain one plus one in one word.` 在共同首 token `One` 后分叉为自写 Metal 的 `.` 与部署路径的 ` word`。同一自写代码的 CPU 路径输出 `One word`，因此问题在自写 Metal 数值累积，而非模型、tokenizer 或硬件随机性。`ds4f-generate-metal` 仅作研究/差分工具，**不得作为部署或数值基线**；部署只使用 `ds4f-fast` 的参考完整 Metal graph。设置 `DS4F_FAST_TRACE_IDS=1` 可输出部署路径 token ID 以做回归。
 
 自写路径仍是实验运行器：默认 10GiB Metal weight cache 下，短 prompt prefill 约 10 秒，decode 约 2.6–2.8 秒/token（约 0.37 token/s）。性能差距来自逐层 CPU/Metal 同步和专家切片调度。`ds4f-fast` 已把同一模型接入完整单-token Metal graph、GPU router 与 SSD expert cache，当前是 Mini 上的实际推荐入口；下一阶段才是把这张图改为项目自有实现。
 

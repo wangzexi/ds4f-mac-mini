@@ -75,6 +75,10 @@ static void emit_token(void *ud, int token) {
     fwrite(text, 1, len, stdout);
     fflush(stdout);
     free(text);
+    if (getenv("DS4F_FAST_TRACE_IDS")) {
+        fprintf(stderr, "trace token[%d]=%d", state->emitted, token);
+        fputc(10, stderr);
+    }
     state->emitted++;
 }
 

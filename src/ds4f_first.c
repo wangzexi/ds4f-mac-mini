@@ -143,6 +143,8 @@ static void hc_pre(const ds4f_gguf *g, int layer, const char *kind,
     if (!flat || !mix) exit(1);
     ds4f_rms_norm(flat, res, NULL, (size_t)E * HC, 1e-6f);
     if (ds4f_matvec(g, fn, flat, mix)) exit(1);
+    DS4F_FFN_DUMP(kind[0] == 'a' ? "hc_attn_pre_mixes" : "hc_ffn_pre_mixes",
+                  mix, 24, layer);
     load_tensor(g, st, (void **)&scale);
     load_tensor(g, bt, (void **)&base);
     float split[24];
