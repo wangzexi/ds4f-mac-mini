@@ -20,7 +20,7 @@
 - DSpark support GGUF 已下载并通过结构验证（约 5.58 GiB）；尚未接入运行时，因此当前程序仍是 target-only decoding。
 - `ds4f-fast` 是可选的快速部署入口：仅支持固定 Flash 0731 模型，复用 reference-ds4 的公开 engine API 与 Metal graph；默认 6GiB SSD expert cache，可用 `DS4F_FAST_CACHE_GIB=1..6` 调整。
 
-2026-08-08 在 Mini 上重新验证：target-only SSD streaming 路径能够在 M4/16GB 上实际输出 token。`ds4f-fast` 通过 DwarfStar 的公开 engine API 复用已验证的完整 Metal graph；空 chat prompt（3 个 prompt token）连续生成 8 token，输出 `DeepSeek-V2, released in`，generation 为 **1.83 token/s**（6GiB cache）。同日的 2-token 4GiB 对照为 2.74–2.99 token/s；长一点的连续输出使用 6GiB 更稳定。因此“16GB 机器上把这个固定模型跑起来”的目标已有可部署入口。
+2026-08-08/09 在 Mini 上重新验证：target-only SSD streaming 路径能够在 M4/16GB 上实际输出 token。`ds4f-fast` 通过 DwarfStar 的公开 engine API 复用已验证的完整 Metal graph；空 chat prompt（3 个 prompt token）连续生成 8 token，输出 `DeepSeek-V2, released in`，generation 为 **1.83 token/s**（6GiB cache）。在同一 16-token 对照中，6GiB 为 **1.86 token/s**，4GiB 为 **1.67 token/s**；连续生成应保持 6GiB 默认。因此“16GB 机器上把这个固定模型跑起来”的目标已有可部署入口。
 
 自写运行器已完成独立 GGUF、tokenizer、原始/压缩 KV cache、连续 greedy decode 和 Metal Q8/IQ2/Q2 路径。对同一空 chat prompt 的 8-token 回归中，DwarfStar 与 ds4f-generate-metal 的 top-k 排名和每一步选中的 token 全部一致；第 0 步 top-1 logit 差为 +0.0120345。这证明当前数值路径可以稳定地连续生成，仍不代表长上下文、多种 prompt 和 DSpark 的完整覆盖。
 
@@ -40,7 +40,7 @@ make fast
 
 `ds4f-fast` 是受限部署适配器：只暴露这个固定模型的 greedy SSD-streaming 路径，静态链接 `reference-ds4` 的公开 engine API，并在运行时使用其 Metal shader；它不修改 reference 源码。自写路径保持独立，作为下一步将整张 GPU 图迁入项目本身的数值和结构基线。
 
-`--ssd-streaming` 是在 16GB 机器上成立的关键；不要省略。`ds4f-fast` 默认使用 6GiB 专家 cache：在此次完整 8-token 空 prompt 回归中为 1.83 token/s，输出与数值基线一致。短请求可用 `DS4F_FAST_CACHE_GIB=4`；8GiB 会因 macOS 无法锁住足够的专家页而显著退化。
+`--ssd-streaming` 是在 16GB 机器上成立的关键；不要省略。`ds4f-fast` 默认使用 6GiB 专家 cache：完整 8-token 空 prompt 回归为 1.83 token/s，输出与数值基线一致；最新相同 16-token 请求对照中，6GiB 为 **1.86 token/s**，4GiB 为 **1.67 token/s**，因此保持默认 6GiB。8GiB 会因 macOS 无法锁住足够的专家页而显著退化。
 
 为这个限定的 Mini 部署，`ds4f-fast` 将 context 固定为 2048 token：这把 KV 预算从约 0.61GiB 降到约 0.18GiB，并将短 prompt 的 prefill 从约 0.33 提升到 0.61 token/s；它不改变连续 greedy 输出，decode 仍主要受 SSD expert streaming 限制。
 
