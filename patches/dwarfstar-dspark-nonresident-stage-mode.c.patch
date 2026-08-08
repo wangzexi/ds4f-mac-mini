@@ -1,0 +1,14 @@
+--- ds4.c
++++ ds4.c
+@@ -31399,8 +31399,10 @@
+               draft_attn_norm_view && draft_hc_view &&
+               draft_hc_split_view && kv_target_view && kv_draft_view &&
+               after_attn_hc_view;
++    const bool use_streamed_rows =
++        g->ssd_streaming && dspark_ssd_nonresident_enabled();
+     const bool saved_streaming = g->ssd_streaming;
+-    g->ssd_streaming = false;
++    if (!use_streamed_rows) g->ssd_streaming = false;
+ 
+     const float freq_base = DS4_ROPE_FREQ_BASE;
+     const float freq_scale = 1.0f;

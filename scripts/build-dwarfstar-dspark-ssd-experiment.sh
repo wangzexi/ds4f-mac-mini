@@ -2,8 +2,7 @@
 set -euo pipefail
 
 # Build a separate experimental DwarfStar binary. The checked-out reference
-# source stays untouched: two narrow patches are applied only to temporary
-# compiler inputs.
+# source stays untouched: narrow patches are applied only to temporary compiler inputs.
 
 project_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 reference_dir="${1:-"$project_dir/reference-ds4"}"
@@ -28,7 +27,11 @@ cp "$reference_dir/ds4_metal.m" "$work_dir/ds4_metal.m"
 (
     cd "$work_dir"
     patch --batch -p0 < "$project_dir/patches/dwarfstar-dspark-ssd.c.patch"
+    patch --batch -p0 < "$project_dir/patches/dwarfstar-dspark-map-restore.c.patch"
+    patch --batch -p0 < "$project_dir/patches/dwarfstar-dspark-nonresident.c.patch"
+    patch --batch -p0 < "$project_dir/patches/dwarfstar-dspark-nonresident-stage-mode.c.patch"
     patch --batch -p0 < "$project_dir/patches/dwarfstar-dspark-ssd.metal.patch"
+    patch --batch -p0 < "$project_dir/patches/dwarfstar-dspark-nonresident.metal.patch"
 )
 
 cc -O3 -ffast-math -g -mcpu=native -Wall -Wextra -std=c99 \

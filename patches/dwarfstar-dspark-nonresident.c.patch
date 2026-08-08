@@ -1,0 +1,245 @@
+--- ds4.c
++++ ds4.c
+@@ -6540,7 +6540,40 @@ static DS4_MAYBE_UNUSED bool weights_model_map_token_spans(
+     model_map_span_vec_include_one(spans, w->token_embd);
+     return model_map_span_vec_finish(spans);
+ }
+ 
++static bool dspark_ssd_nonresident_enabled(void) {
++    const char *value = getenv("DS4_DSPARK_SSD_NONRESIDENT");
++    return value && value[0] && strcmp(value, "0") != 0;
++}
++
++static bool dspark_model_map_nonexpert_spans(
++        const ds4_dspark_weights *dw,
++        ds4_model_map_span_vec   *spans) {
++    if (!dw || !spans || dw->n_stages == 0 ||
++        dw->n_stages > DS4_DSPARK_MAX_STAGES) {
++        return false;
++    }
++    memset(spans, 0, sizeof(*spans));
++    for (uint32_t stage = 0; stage < dw->n_stages; stage++) {
++        const ds4_dspark_stage_weights *sw = &dw->stage[stage];
++        model_map_span_vec_include_layer_decode_static(spans, &sw->block);
++        if (stage == 0) {
++            model_map_span_vec_include_one(spans, sw->main_proj);
++            model_map_span_vec_include_one(spans, sw->main_norm);
++        }
++        if (stage + 1u == dw->n_stages) {
++            model_map_span_vec_include_one(spans, sw->norm);
++            model_map_span_vec_include_one(spans, sw->hc_head_base);
++            model_map_span_vec_include_one(spans, sw->hc_head_fn);
++            model_map_span_vec_include_one(spans, sw->hc_head_scale);
++            model_map_span_vec_include_one(spans, sw->markov_w1);
++            model_map_span_vec_include_one(spans, sw->markov_w2);
++            model_map_span_vec_include_one(spans, sw->confidence_proj);
++        }
++    }
++    return model_map_span_vec_finish(spans);
++}
++
+ static DS4_MAYBE_UNUSED bool weights_model_map_output_spans(
+         const ds4_weights *w,
+         ds4_model_map_span_vec *spans) {
+@@ -17529,6 +17571,33 @@ static bool metal_graph_install_model_spans(
+     return ok;
+ }
+ 
++static bool metal_graph_install_dspark_nonexpert_views(
++        const ds4_model          *model,
++        const ds4_dspark_weights *dw) {
++    ds4_model_map_span_vec spans;
++    if (!model || !dspark_model_map_nonexpert_spans(dw, &spans)) return false;
++    const uint64_t total_bytes = model_map_span_vec_total_bytes(&spans);
++    bool ok = true;
++    for (uint32_t i = 0; ok && i < spans.len; i++) {
++        const uint64_t span_bytes = spans.v[i].end - spans.v[i].off;
++        ok = ds4_gpu_set_model_map_range(model->map,
++                                         model->size,
++                                         spans.v[i].off,
++                                         span_bytes,
++                                         span_bytes) != 0;
++    }
++    if (ok) {
++        fprintf(stderr,
++                "ds4: DSpark SSD nonresident support map: %u spans, %.2f GiB non-expert weights\n",
++                spans.len,
++                (double)total_bytes / 1073741824.0);
++    } else {
++        fprintf(stderr, "ds4: DSpark SSD nonresident support map failed\n");
++    }
++    free(spans.v);
++    return ok;
++}
++
+ static bool metal_graph_stream_readahead_enabled(void) {
+     return glm_graph_env_present("DS4_ROCM_ENABLE_STREAMING_READAHEAD",
+                                  "DS4_METAL_ENABLE_STREAMING_READAHEAD") &&
+@@ -29739,7 +29900,9 @@ static bool metal_graph_eval_token_raw_swa_streaming(
+         const ds4_weights     *weights,
+         int                    token,
+         uint32_t               pos,
+         float                 *logits) {
++    if (!model || ds4_gpu_set_model_fd(model->fd) == 0) return false;
++
+     if (g->raw_cap == 0) {
+         fprintf(stderr, "ds4: Metal graph raw KV cache is not allocated\n");
+         return false;
+@@ -31320,6 +31411,58 @@ static bool metal_graph_dspark_stage_profile_boundary(
+     return ds4_gpu_begin_commands() != 0;
+ }
+ 
++static bool metal_graph_encode_dspark_stage_ffn_streamed_rows(
++        ds4_gpu_graph            *g,
++        const ds4_model          *model,
++        const ds4_layer_weights  *layer,
++        uint32_t                  stage,
++        uint32_t                  pos,
++        uint32_t                  rows) {
++    if (!g || !model || !layer || !g->dspark_draft_tokens || rows == 0) {
++        return false;
++    }
++    const uint64_t hc_bytes =
++        (uint64_t)DS4_N_HC * DS4_N_EMBD * sizeof(float);
++    const uint32_t saved_token_offset = g->batch_token_offset;
++    bool ok = true;
++    for (uint32_t row = 0; ok && row < rows; row++) {
++        if (row != 0) {
++            ok = ds4_gpu_tensor_copy(metal_graph_batch_after_attn_hc(g),
++                                     0,
++                                     metal_graph_batch_after_attn_hc(g),
++                                     (uint64_t)row * hc_bytes,
++                                     hc_bytes) != 0;
++        }
++        if (ok) {
++            ok = ds4_gpu_tensor_copy(metal_graph_prefill_tokens(g),
++                                     0,
++                                     g->dspark_draft_tokens,
++                                     (uint64_t)row * sizeof(int32_t),
++                                     sizeof(int32_t)) != 0;
++        }
++        g->batch_token_offset = 0;
++        if (ok) {
++            ok = metal_graph_encode_layer_ffn_batch(g,
++                                                     model,
++                                                     layer,
++                                                     stage,
++                                                     pos + row,
++                                                     1,
++                                                     NULL,
++                                                     0);
++        }
++        if (ok && row != 0) {
++            ok = ds4_gpu_tensor_copy(metal_graph_batch_next_hc(g),
++                                     (uint64_t)row * hc_bytes,
++                                     metal_graph_batch_next_hc(g),
++                                     0,
++                                     hc_bytes) != 0;
++        }
++    }
++    g->batch_token_offset = saved_token_offset;
++    return ok;
++}
++
+ static bool metal_graph_eval_dspark_stage_block(
+         ds4_gpu_graph            *g,
+         const ds4_model          *dspark_model,
+@@ -31622,11 +31759,22 @@ static bool metal_graph_eval_dspark_stage_block(
+     DS4_DSPARK_PROFILE_STAGE("attn_output_hc");
+ 
+-    if (ok) ok = metal_graph_encode_layer_ffn_batch(g,
+-                                                     dspark_model,
+-                                                     block,
+-                                                     stage,
+-                                                     pos,
+-                                                     draft,
+-                                                     NULL,
+-                                                     0);
++    if (ok) {
++        if (use_streamed_rows) {
++            ok = metal_graph_encode_dspark_stage_ffn_streamed_rows(g,
++                                                                    dspark_model,
++                                                                    block,
++                                                                    stage,
++                                                                    pos,
++                                                                    draft);
++        } else {
++            ok = metal_graph_encode_layer_ffn_batch(g,
++                                                     dspark_model,
++                                                     block,
++                                                     stage,
++                                                     pos,
++                                                     draft,
++                                                     NULL,
++                                                     0);
++        }
++    }
+     DS4_DSPARK_PROFILE_STAGE("ffn");
+@@ -56909,13 +56979,23 @@
+         const bool support_model_runtime_ready =
+             e->mtp_ready ||
+             (e->support_kind == DS4_SUPPORT_DSPARK && e->dspark);
+-        if (support_model_runtime_ready &&
+-            !ds4_gpu_set_model_map_range(e->mtp_model.map,
+-                                           e->mtp_model.size,
+-                                           e->mtp_model.tensor_data_pos,
+-                                           e->mtp_model.size - e->mtp_model.tensor_data_pos,
+-                                           e->mtp_model.max_tensor_bytes))
+-        {
++        bool support_model_map_ok = true;
++        if (support_model_runtime_ready) {
++            if (e->ssd_streaming &&
++                e->support_kind == DS4_SUPPORT_DSPARK &&
++                dspark_ssd_nonresident_enabled()) {
++                support_model_map_ok =
++                    metal_graph_install_dspark_nonexpert_views(&e->mtp_model,
++                                                                &e->dspark_weights);
++            } else {
++                support_model_map_ok = ds4_gpu_set_model_map_range(
++                        e->mtp_model.map, e->mtp_model.size,
++                        e->mtp_model.tensor_data_pos,
++                        e->mtp_model.size - e->mtp_model.tensor_data_pos,
++                        e->mtp_model.max_tensor_bytes) != 0;
++            }
++        }
++        if (!support_model_map_ok) {
+             fprintf(stderr,
+                     "ds4: %s failed to map support model views; aborting startup. "
+                     "This is commonly caused by insufficient memory or accelerator VM budget.\n",
+@@ -59863,17 +59941,25 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
+     const char *probe = getenv("DS4_DSPARK_PROBE");
+     const bool probe_log = probe && probe[0];
+     const bool enabled = s->engine->dspark;
+-    /* SSD target span updates replace the active target views. Restore the
+-     * support model before the proposer; the range mapper appends its views. */
+-    if (enabled && s->engine->ssd_streaming && s->engine->mtp_model.map &&
+-        !ds4_gpu_set_model_map_range(s->engine->mtp_model.map,
+-                                     s->engine->mtp_model.size,
+-                                     s->engine->mtp_model.tensor_data_pos,
+-                                     s->engine->mtp_model.size -
+-                                         s->engine->mtp_model.tensor_data_pos,
+-                                     s->engine->mtp_model.max_tensor_bytes)) {
+-        fprintf(stderr, "ds4: failed to restore DSpark support model map\n");
+-        return false;
++    if (enabled && s->engine->ssd_streaming && s->engine->mtp_model.map) {
++        bool support_map_ok;
++        if (dspark_ssd_nonresident_enabled()) {
++            support_map_ok = metal_graph_install_dspark_nonexpert_views(
++                    &s->engine->mtp_model, &s->engine->dspark_weights);
++        } else {
++            support_map_ok = ds4_gpu_set_model_map_range(
++                    s->engine->mtp_model.map,
++                    s->engine->mtp_model.size,
++                    s->engine->mtp_model.tensor_data_pos,
++                    s->engine->mtp_model.size -
++                        s->engine->mtp_model.tensor_data_pos,
++                    s->engine->mtp_model.max_tensor_bytes) != 0;
++        }
++        if (!support_map_ok ||
++            ds4_gpu_set_model_fd(s->engine->mtp_model.fd) == 0) {
++            fprintf(stderr, "ds4: failed to restore DSpark support model map\n");
++            return false;
++        }
+     }
+     const char *fake_argmax = getenv("DS4_DSPARK_FAKE_ARGMAX_PROPOSAL");
+     const bool fake_argmax_enabled =

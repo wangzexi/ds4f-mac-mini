@@ -17,7 +17,7 @@
 - routed IQ2/Q2 专家切片有独立 LRU 缓存，`DS4F_EXPERT_CACHE_GIB` 控制预算，默认 4 GiB，上限 8 GiB；Metal 版本已加入 IQ2/Q2 专家线程组 kernel 和 gate/up 批处理。
 - Metal 权重 cache 对专家 buffer 命中会刷新 LRU 次序；默认 10GiB 的空 prompt 8-token 回归中，专家 SSD 读取从 11.85GiB 降至 10.75GiB（miss 5739→5238），greedy token 不变。
 - 路由结果确定后，会在 gate/up Metal command buffer 执行期间预取同一批专家的 down 权重；8-token 空 prompt 对照中 decode 从约 2.75 秒/token 降至约 2.59 秒/token，`DS4F_DISABLE_DOWN_PREFETCH=1` 可作诊断开关。
-- DSpark support GGUF 已下载并通过结构验证（约 5.58 GiB）；尚未接入运行时，因此当前程序仍是 target-only decoding。
+- `ds4f-fast` 的部署路径仍是 target-only；DSpark 仅在下文隔离的 DwarfStar 实验中接入，不能作为部署默认值。
 - `ds4f-fast` 是可选的快速部署入口：仅支持固定 Flash 0731 模型，复用 reference-ds4 的公开 engine API 与 Metal graph；默认 128K context，设 `DS4F_FAST_CONTEXT_K=256` 可切换至 256K；默认 6GiB SSD expert cache，可用 `DS4F_FAST_CACHE_GIB=1..6` 调整。
 
 2026-08-08/09 在 Mini 上重新验证：target-only SSD streaming 路径能够在 M4/16GB 上实际输出 token。`ds4f-fast` 通过 DwarfStar 的公开 engine API 复用已验证的完整 Metal graph；空 chat prompt（3 个 prompt token）连续生成 8 token，输出 `DeepSeek-V2, released in`，generation 为 **1.83 token/s**（6GiB cache）。在同一 16-token 对照中，6GiB 为 **1.86 token/s**，4GiB 为 **1.67 token/s**；连续生成应保持 6GiB 默认。因此“16GB 机器上把这个固定模型跑起来”的目标已有可部署入口。
@@ -83,42 +83,21 @@ printf '%s\n' '你好' '介绍一下你自己' | ./ds4f-reuse \
 
 ## DwarfStar 的 SSD + DSpark 实验
 
-patches/ 与 scripts/build-dwarfstar-dspark-ssd-experiment.sh 提供一个**不修改**
-reference-ds4 的可重复实验构建。它修复了 DwarfStar 原先拒绝
---ssd-streaming --mtp 的限制，并在 SSD 模式下：
+`patches/` 与 `scripts/build-dwarfstar-dspark-ssd-experiment.sh` 提供一个**不修改** `reference-ds4` 的可重复实验构建。它修复 DwarfStar 原先拒绝 `--ssd-streaming --mtp` 的限制；target 与 DSpark support 保留独立 Metal views，最终仍由 target 的普通逐 token SSD decode 验证草稿，因此提交的 KV cache 和 greedy token 与 target-only 路径一致。
 
-- 保留 target 和 DSpark support 的独立 Metal model views；
-- 在每次提案前恢复 support 映射；
-- 用 target 的普通逐 token SSD decode 验证草稿，保证 KV cache 和最终 greedy
-  token 与 target-only 完全一致。
+2026-08-09 的非驻留原型用 `DS4_DSPARK_SSD_NONRESIDENT=1` 开启：support 只映射 19 段非专家权重（0.52GiB），路由专家仍由主模型现有 SSD expert cache 按需 `pread`；5 个 draft row 会逐行执行，从而复用单 token 的 IQ2/Q2 专家路径。它不是把完整 5.58GiB support GGUF 常驻到 16GB 统一内存。
 
-在 Mini 上构建并运行：
+在 Mini 上构建并做确定性数值验收：
 
 ~~~sh
 cd /Users/zexi/workspace/ds4f-mini
 ./scripts/build-dwarfstar-dspark-ssd-experiment.sh
 
 cd reference-ds4
-DS4_DSPARK_STATS=1 \
-../bin/ds4-dspark-ssd \
-  -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
-  --ssd-streaming --ssd-streaming-cache-experts 4GB \
-  --mtp gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf \
-  --dspark --temp 0 --nothink -n 16 \
-  -p '<｜User｜>a<｜Assistant｜></think>'
+env DS4_DSPARK_SSD_NONRESIDENT=1 DS4_DSPARK_SCHEDULER=0 DS4_DSPARK_STATS=1 DS4_DSPARK_SPEC_LOG=1 ../bin/ds4-dspark-ssd -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf --mtp gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf --dspark --dspark-confidence 0 --ssd-streaming --ssd-streaming-cache-experts 6GB -c 2048 --temp 0 -p "Explain one plus one in one word." -n 2
 ~~~
 
-2026-08-08 的验证中，DSpark 16-token 输出与 target-only 输出逐字节相同；共提出
-7 个草稿 token、接受 4 个，且没有 verifier error。它当前只有功能价值：每个草稿
-仍由 target 逐 token 验证，速度明显慢于上面的 target-only SSD streaming 路径。
-因此默认仍使用 target-only 命令；DSpark 留作正确性验证和后续实现真正的层级
-streaming verifier 的基础。
-
-2026-08-09 的 Mini 复验表明，这条正确性实验不能作为部署加速器：即使主模型
-cache 设为 4GiB，DSpark support 映射仍会触发明显 swap；36 秒只生成到 `Deep`，
-故已主动终止。它没有数值错误，但 16GiB M4 上的支持模型常驻和 target SSD
-streaming 无法同时满足低延迟。除非实现真正的层级 streaming verifier 并显著降低
-support 模型常驻页，否则不要把 `ds4-dspark-ssd` 用于实际服务。
+该命令实际生成了 5-token Markov draft，首 token 为 target 的 `1309`，sequential verifier 提交 1 个 token；最终输出 `We need` 与同一 `--temp 0` 的 target-only 输出完全一致。当前 proposal 约 603ms、逐 token verifier 约 2240ms、总 generation 约 0.59 token/s，仍**不加速**。它的价值是把实验从“全量 support 映射会挤压 16GB”推进到可运行的按专家读取正确性闭环；默认部署仍使用上文 `ds4f-fast` target-only 路径。
 
 在 Mini 上运行：
 
@@ -138,4 +117,4 @@ DS4F_METAL_CACHE_GIB=10 ./ds4f-generate-metal /path/to/model.gguf "你好，世�
 DS4F_PROFILE=1 DS4F_METAL_CACHE_GIB=10 ./ds4f-generate-metal /path/to/model.gguf "你好，世界" 1 4096
 ```
 
-`ds4f-first-token` 仍保留作为单 token 回归测试；`ds4f-generate` 是当前连续生成入口。`ds4f-dspark-probe` 已能验证 Flash 0731 support 文件，但 DSpark 推理闭环仍未接入。Metal 目前已覆盖 Q8_0 共享矩阵和 routed IQ2/Q2 专家，但还没有 DwarfStar 那样的完整 fused MoE/批量 verifier。
+`ds4f-first-token` 仍保留作为单 token 回归测试；`ds4f-generate` 是当前连续生成入口。`ds4f-dspark-probe` 已能验证 Flash 0731 support 文件；自写 runtime 尚未接入 DSpark 闭环，而上文的隔离 DwarfStar 实验已实现可验收的非驻留原型。Metal 目前已覆盖 Q8_0 共享矩阵和 routed IQ2/Q2 专家，但还没有 DwarfStar 那样的完整 fused MoE/批量 verifier。
