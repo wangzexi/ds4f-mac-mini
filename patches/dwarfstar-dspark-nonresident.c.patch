@@ -116,7 +116,7 @@
              fprintf(stderr,
                      "ds4: %s failed to map support model views; aborting startup. "
                      "This is commonly caused by insufficient memory or accelerator VM budget.\n",
-@@ -59863,17 +59941,25 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
+@@ -59863,17 +59941,28 @@ static bool ds4_session_prepare_dspark_draft_impl(ds4_session *s,
      const char *probe = getenv("DS4_DSPARK_PROBE");
      const bool probe_log = probe && probe[0];
      const bool enabled = s->engine->dspark;
@@ -145,6 +145,9 @@
 +                        s->engine->mtp_model.tensor_data_pos,
 +                    s->engine->mtp_model.max_tensor_bytes) != 0;
 +        }
++        /* Support spans replace target decode views. Reinstall target static
++         * views on the next SSD decode instead of reusing a stale flag. */
++        s->graph.streaming_static_decode_map_current = false;
 +        if (!support_map_ok ||
 +            ds4_gpu_set_model_fd(s->engine->mtp_model.fd) == 0) {
 +            fprintf(stderr, "ds4: failed to restore DSpark support model map\n");

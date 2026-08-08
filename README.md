@@ -99,6 +99,8 @@ env DS4_DSPARK_SSD_NONRESIDENT=1 DS4_DSPARK_SCHEDULER=0 DS4_DSPARK_STATS=1 DS4_D
 
 完整 support 映射与 0.52GiB 非驻留路径的同一审计都得到 `proposal0=1309`、`confidence0=2.114`；因此默认 confidence 0.7 会保留草稿前缀。`-n 2` 回归会提交一个草稿 token，最终输出 `We need` 与同一 `--temp 0` 的 target-only 输出完全一致。`-n 6` 的确定性复验中两次各提出并接受 2 个草稿；但 sequential verifier 总计约 6506ms，generation 约 0.65 token/s，仍**不加速**。它的价值是把实验从“全量 support 映射会挤压 16GB”推进到可运行的按专家读取、且与完整 support proposal 数值对齐的闭环；默认部署仍使用上文 `ds4f-fast` target-only 路径。
 
+每次提案把 GPU 视图切到 support 后，运行器都会使 target 的静态 decode-view 缓存状态失效；下一次 target 验证会重新安装 target spans。该修复已用短 raw prompt（Hello，输出 #World）与 target-only 做逐字节对照。
+
 随后在 `/tmp` 做的 target batch-verifier 探针会先重装 target 静态 views，再以 SSD expert cache 验证整段草稿并回滚/replay；6-token 输出也逐字节等于 target-only。然而一次 5-token 草稿只接受 2 个 draft token，batch verify 为约 7685ms、精确 replay 为约 2630ms、总 generation 约 0.33 token/s，慢于顺序 verifier。该探针没有进入 `patches/` 或部署二进制；在 16GB SSD 约束下，只有能同时提高 acceptance 且避免 replay 的 verifier 才有加速可能。
 
 在 Mini 上运行：
