@@ -61,6 +61,9 @@ make fast
 - 将预填充保留区从两层降为一层，虽可请求 654 个专家，但 `mlock` 只能锁约 2.99GiB，保护逻辑最终把运行时缓存降到 151 个，generation 为 0.31 token/s；不采用。
 - 将专家 slab 从 Shared 改为 CPU 可写的 Managed 也不改变 token ID，但 654 槽仅 0.73 token/s、910 槽仅 0.23 token/s；在 M4 统一内存上它不会形成额外的常驻缓存层，不采用。
 - 将 SSD `pread` 并发从默认 9 提至 18 不改变 token ID，但在常驻两请求复测中没有稳定胜过默认值；保持参考默认值。
+- 同一 32-token 对照下，将 `pread` 并发降至 6 为 1.61 token/s，默认 9 为 1.63 token/s；前者没有稳定优势，保持默认 9。
+- 设置 `DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD=1` 后，16-token 对照在第一个输出 token 后超过一分钟仍未完成；`F_RDADVISE` 预读是这条 SSD 路径必要的默认策略。
+- 临时将“命中/缺失专家分阶段执行”的阈值从至少 3 个缺失降到任意混合命中，首个生产 token 向量仍一致，但 32-token generation 从 1.63 降至 1.62 token/s；不采用。
 - eviction 时的文件页 `DONTNEED` 在参考实现中默认关闭，不是可回收的默认性能损失。
 - 保持 6GiB 总预算但在 prefill 后只将动态缓存从 398 增至 440 槽（约 2.90GiB）也不可行：首次 decode 的新增 6.75MiB 专家页就 `mlock` 失败并中断生成。这直接验证 398 槽已是完整图在本机的可执行上限，不是保守留量。
 - 在 128K 下临时请求 7GiB 总专家预算（549 个专家）同样在约 2.99GiB `mlock` 处失败，保护逻辑将缓存降至 151 槽；不采用。
