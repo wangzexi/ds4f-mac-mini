@@ -17,31 +17,26 @@
 - routed IQ2/Q2 专家切片有独立 LRU 缓存，`DS4F_EXPERT_CACHE_GIB` 控制预算，默认 4 GiB，上限 8 GiB；Metal 版本已加入 IQ2/Q2 专家线程组 kernel 和 gate/up 批处理。
 - DSpark support GGUF 已下载并通过结构验证（约 5.58 GiB）；尚未接入运行时，因此当前程序仍是 target-only decoding。
 
-2026-08-08 在 Mini 上重新验证：DwarfStar 的 target-only SSD streaming 路径能够在 M4/16GB 上实际输出 token。以固定 prompt 生成 4 token 时，日志给出的 generation 速度为 **1.98 token/s**；其内存规划为 5.84 GiB（KV 0.61 GiB、常驻 embedding 0.99 GiB、SSD expert cache/reserve 4 GiB 等）。因此“16GB 机器上把这个固定模型跑起来”的目标已经有一条可用的参考运行路径。
+2026-08-08 在 Mini 上重新验证：DwarfStar 的 target-only SSD streaming 路径能够在 M4/16GB 上实际输出 token。对空 chat prompt（3 个 prompt token）生成 2 token 时，日志给出的 generation 速度为 **2.99 token/s**；其内存规划为 5.84 GiB（KV 0.61 GiB、常驻 embedding 0.99 GiB、SSD expert cache/reserve 4 GiB 等）。因此“16GB 机器上把这个固定模型跑起来”的目标已经有一条可用且有速度的参考运行路径。
 
-自写运行器已经通过一个端到端回归：对固定 chat prompt `<｜User｜>a<｜Assistant｜></think>` 连续生成 4 token 时，`ds4f-generate-metal` 与 DwarfStar 一致地输出 `I apologize, but`。这覆盖了 tokenizer、prefill、原始/压缩 KV cache、连续 greedy decode、Metal dense 路径和 routed IQ2/Q2 专家路径。Metal IQ2 kernel 的 block 解析已与 CPU 参考逐向量校准（RMS 误差约 `4.7e-7`）。
+自写运行器已完成独立 GGUF、tokenizer、原始/压缩 KV cache、连续 greedy decode 和 Metal Q8/IQ2/Q2 路径。对同一空 chat prompt 的 8-token 回归中，DwarfStar 与 ds4f-generate-metal 的 top-k 排名和每一步选中的 token 全部一致；第 0 步 top-1 logit 差为 +0.0120345。这证明当前数值路径可以稳定地连续生成，仍不代表长上下文、多种 prompt 和 DSpark 的完整覆盖。
 
-自写路径仍应视为实验运行器：上面的回归并不等同于覆盖长上下文、多种 prompt 和 DSpark。默认 10GiB Metal weight cache 下，M4/16GB 上该版本短 prompt 的 prefill 约 14.2 秒、decode 约 6.37 秒/token，进程报告的 unified peak footprint 约 10.7 GiB；DwarfStar SSD streaming 仍是速度更好的推荐启动器。
+自写路径仍是实验运行器：默认 10GiB Metal weight cache 下，短 prompt prefill 约 10 秒，decode 约 2.6–2.8 秒/token（约 0.37 token/s）。性能差距来自逐层 CPU/Metal 同步和专家切片调度；DwarfStar 的单 token GPU graph、GPU router 与 SSD expert cache 是当前实际推理的推荐路径。
 
-更严格的 8-token 对照表明，自写 Metal 路径前 6 个 token 与 reference 一致，但第 7
-个 token 开始会分歧；强制 CPU routed-expert 路径更早分歧。因此它目前仅用于研究
-GGUF、tokenizer、KV cache 与 Metal kernel，**不应用于要求模型输出精确一致的任务**。
-实际推理请使用下面的 DwarfStar SSD target-only 路径，或本 README 后面的 DSpark
-实验路径。
-
-`DS4F_PROFILE=1` 可输出 attention、FFN 与 head 的分项时间。提高 `DS4F_METAL_CACHE_GIB` 到 12–13 能让单次 decode 降至约 2.8–3.3 秒，但连续 4 token 的 13GiB 实验峰值达到约 14.7GiB，离 16GB 上限过近；因此不把它设为默认值。
+DS4F_PROFILE=1 可输出 attention、FFN 与 head 的分项时间。10GiB 是自写路径的安全默认值；提高到 11GiB 以上会造成统一内存压力并使连续 decode 变慢，因此不把它设为默认值。
 
 当前可用的 target-only 启动命令：
 
 ```sh
 cd /Users/zexi/workspace/ds4f-mini/reference-ds4
-./ds4 --ssd-streaming --ssd-streaming-cache-experts 4GB \
+./ds4 \
+  -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
+  --ssd-streaming --ssd-streaming-cache-experts 4GB \
   --temp 0 --nothink -n 16 -p '<｜User｜>你好<｜Assistant｜></think>'
 ```
 
-`--ssd-streaming` 是在 16GB 机器上成立的关键；不要省略。4GB expert cache 是已验证的保守起点，较大 cache 会减少 SSD 抖动，但必须始终为 macOS 和统一内存预留空间。
+--ssd-streaming 是在 16GB 机器上成立的关键；不要省略。4GB expert cache 是当前 Mini 上的最佳安全设置。6GB 在短请求上无收益；8GB 会因 macOS 无法锁住足够的专家页而退化到约 0.63 token/s。
 
-实际试验表明，8GB cache 虽然把规划内存提高到约 9.84 GiB，却会让短请求因预热更多专家而降至约 0.18 token/s；当前固定模型与短请求应优先使用 4GB。
 
 ## DwarfStar 的 SSD + DSpark 实验
 
@@ -71,10 +66,10 @@ DS4_DSPARK_STATS=1 \
 ~~~
 
 2026-08-08 的验证中，DSpark 16-token 输出与 target-only 输出逐字节相同；共提出
-7 个草稿 token、接受 4 个，且没有 verifier error。它当前只有功能价值：因为每个
-草稿仍由 target 逐 token 验证，约 **0.15 token/s**，明显慢于 target-only 的约
-**1.82 token/s**。因此默认仍使用上面的 target-only 命令；DSpark 留作正确性验证和
-后续实现真正的层级 streaming verifier 的基础。
+7 个草稿 token、接受 4 个，且没有 verifier error。它当前只有功能价值：每个草稿
+仍由 target 逐 token 验证，速度明显慢于上面的 target-only SSD streaming 路径。
+因此默认仍使用 target-only 命令；DSpark 留作正确性验证和后续实现真正的层级
+streaming verifier 的基础。
 
 在 Mini 上运行：
 
