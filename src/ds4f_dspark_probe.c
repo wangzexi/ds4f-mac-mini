@@ -1,8 +1,10 @@
 #include "ds4f_gguf.h"
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 enum { TARGET_LAYERS = 3, STAGES = 3, BLOCK = 5, MARKOV = 256, VOCAB = 129280 };
 
@@ -75,6 +77,38 @@ static void stage_check(const ds4f_gguf *g, int stage) {
 #undef M
 }
 
+static void print_streaming_inventory(const ds4f_gguf *g) {
+    uint64_t resident = 0;
+    uint64_t routed = 0;
+    uint64_t stage_routed[STAGES] = {0};
+    for (uint64_t i = 0; i < g->tensor_count; ++i) {
+        const ds4f_tensor *t = &g->tensors[i];
+        const bool is_routed =
+            strstr(t->name, ".ffn_gate_exps.weight") != NULL ||
+            strstr(t->name, ".ffn_up_exps.weight") != NULL ||
+            strstr(t->name, ".ffn_down_exps.weight") != NULL;
+        if (!is_routed) {
+            resident += t->nbytes;
+            continue;
+        }
+        routed += t->nbytes;
+        int stage = -1;
+        if (sscanf(t->name, "mtp.%d.", &stage) == 1 &&
+            stage >= 0 && stage < STAGES) {
+            stage_routed[stage] += t->nbytes;
+        }
+    }
+    printf("dspark streaming inventory: resident=%.2f GiB routed=%.2f GiB\n",
+           (double)resident / 1073741824.0,
+           (double)routed / 1073741824.0);
+    for (int stage = 0; stage < STAGES; ++stage) {
+        printf("  stage %d routed=%.2f GiB per_expert=%.2f MiB\n",
+               stage,
+               (double)stage_routed[stage] / 1073741824.0,
+               (double)stage_routed[stage] / 256.0 / 1048576.0);
+    }
+}
+
 int main(int argc, char **argv) {
     if (argc != 3) {
         fprintf(stderr, "usage: %s TARGET.gguf DSPARK_SUPPORT.gguf\n", argv[0]);
@@ -110,6 +144,7 @@ int main(int argc, char **argv) {
     check_tensor(&support, "mtp.2.markov_head.markov_w1.weight", 8, MARKOV, VOCAB);
     check_tensor(&support, "mtp.2.markov_head.markov_w2.weight", 8, MARKOV, VOCAB);
     check_vector(&support, "mtp.2.norm.weight", 0, 4096);
+    print_streaming_inventory(&support);
     if (fail_count) printf("dspark probe: FAIL (%d issues)\n", fail_count);
     else printf("dspark probe: OK; Flash 0731 support is structurally compatible\n");
     ds4f_gguf_close(&support); ds4f_gguf_close(&target);
