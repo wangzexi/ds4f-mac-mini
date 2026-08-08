@@ -32,6 +32,10 @@ extern int ds4f_metal_matvec_expert_q8k_pair(const ds4f_gguf *g,
                                              size_t x_stride, size_t n,
                                              float *ya, size_t ya_stride,
                                              float *yb, size_t yb_stride);
+extern int ds4f_metal_matvec_group(const ds4f_gguf *g, const ds4f_tensor *t,
+                                   const float *x, uint32_t groups,
+                                   uint32_t group_in, uint32_t group_out,
+                                   float *y);
 #else
 int ds4f_metal_iq2_probe(const ds4f_gguf *g, const ds4f_tensor *t,
                           uint32_t expert, const float *x, size_t n, float *out) {
@@ -481,15 +485,9 @@ int ds4f_matvec_group(const ds4f_gguf *g, const ds4f_tensor *t,
                       uint32_t group_out, float *y) {
     if (!g || !t || t->n_dims != 2 || t->dims[0] != group_in || t->dims[1] != (uint64_t)groups*group_out) { errno=EINVAL; return -1; }
 #ifdef DS4F_USE_METAL
-    if (t->type == 8 && group_out <= UINT32_MAX) {
-        int ok = 1;
-        for (uint32_t gr = 0; gr < groups; ++gr) {
-            if (ds4f_metal_matvec_rows(g, t, x + (size_t)gr * group_in,
-                                       y + (size_t)gr * group_out,
-                                       gr * group_out, group_out) != 0) { ok = 0; break; }
-        }
-        if (ok) return 0;
-    }
+    if (t->type == 8 &&
+        ds4f_metal_matvec_group(g, t, x, groups, group_in, group_out, y) == 0)
+        return 0;
 #endif
     void *raw=NULL; if (ds4f_tensor_load(g,t,&raw)) return -1;
     size_t rowbytes=t->nbytes/t->dims[1];

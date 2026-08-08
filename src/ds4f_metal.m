@@ -13,6 +13,7 @@
 static id<MTLDevice> g_device;
 static id<MTLCommandQueue> g_queue;
 static id<MTLComputePipelineState> g_pipeline;
+static id<MTLComputePipelineState> g_q8_group_pipeline;
 static id<MTLComputePipelineState> g_q8_pair_pipeline;
 static id<MTLComputePipelineState> g_iq2_pipeline;
 static id<MTLComputePipelineState> g_iq2_pair_pipeline;
@@ -21,8 +22,14 @@ static id<MTLComputePipelineState> g_q2_pipeline;
 static id<MTLBuffer> g_iq2_signed_grid;
 static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_buffers;
 static NSMutableArray<NSString *> *g_order;
+static NSMutableDictionary<NSString *, NSNumber *> *g_buffer_is_expert;
 static uint64_t g_cache_bytes;
 static uint64_t g_cache_limit;
+static uint64_t g_cache_hits;
+static uint64_t g_cache_misses;
+static uint64_t g_dense_load_bytes;
+static uint64_t g_expert_load_bytes;
+static uint64_t g_cache_evicted_bytes;
 static int g_initialized;
 
 /* Match DwarfStar's `iq2xxs_signed_grid[g][s][j]` literally, keeping the CPU
@@ -85,6 +92,39 @@ static const char *g_kernel_source =
 "            for (uint i = 0; i < 32u; ++i) sum += partial[r][i];\n"
 "            if (first_row + r < rows) y[first_row + r] = sum;\n"
 "        }\n"
+"    }\n"
+"}\n"
+"kernel void q8_matvec_group(device const char *w [[buffer(0)]],\n"
+"                            device const float *x [[buffer(1)]],\n"
+"                            device float *y [[buffer(2)]],\n"
+"                            constant uint &group_in [[buffer(3)]],\n"
+"                            constant uint &group_out [[buffer(4)]],\n"
+"                            constant uint &n_groups [[buffer(5)]],\n"
+"                            uint tg [[threadgroup_position_in_grid]],\n"
+"                            uint lane [[thread_index_in_threadgroup]]) {\n"
+"    const uint chunks = (group_out + 3u) / 4u;\n"
+"    const uint group = tg / chunks;\n"
+"    const uint local_row = (tg % chunks) * 4u;\n"
+"    if (group >= n_groups || local_row >= group_out) return;\n"
+"    const uint first_row = group * group_out + local_row;\n"
+"    const uint blocks = (group_in + 31u) / 32u;\n"
+"    const uint row_bytes = blocks * 34u;\n"
+"    device const float *gx = x + group * group_in;\n"
+"    threadgroup float partial[4][32];\n"
+"    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};\n"
+"    for (uint b = lane; b < blocks; b += 32u) {\n"
+"        for (uint r = 0u; r < 4u; ++r) if (local_row + r < group_out) {\n"
+"            device const char *row = w + (first_row + r) * row_bytes + b * 34u;\n"
+"            ushort hb = ushort(uchar(row[0])) | (ushort(uchar(row[1])) << 8u);\n"
+"            const float d = float(as_type<half>(hb));\n"
+"            for (uint i = 0u; i < 32u; ++i) sums[r] += d * float(int(row[2u + i])) * gx[b * 32u + i];\n"
+"        }\n"
+"    }\n"
+"    for (uint r = 0u; r < 4u; ++r) partial[r][lane] = sums[r];\n"
+"    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    if (lane == 0u) for (uint r = 0u; r < 4u; ++r) if (local_row + r < group_out) {\n"
+"        float sum = 0.0f; for (uint i = 0u; i < 32u; ++i) sum += partial[r][i];\n"
+"        y[first_row + r] = sum;\n"
 "    }\n"
 "}\n";
 
@@ -349,7 +389,7 @@ static uint64_t cache_limit_from_env(void) {
 }
 
 static int metal_init(void) {
-    if (g_initialized) return g_pipeline && g_q8_pair_pipeline && g_iq2_pipeline && g_iq2_pair_pipeline && g_iq2_probe_pipeline &&
+    if (g_initialized) return g_pipeline && g_q8_group_pipeline && g_q8_pair_pipeline && g_iq2_pipeline && g_iq2_pair_pipeline && g_iq2_probe_pipeline &&
         g_q2_pipeline && g_iq2_signed_grid ? 0 : -1;
     g_initialized = 1;
     @autoreleasepool {
@@ -358,6 +398,7 @@ static int metal_init(void) {
         g_queue = [g_device newCommandQueue];
         g_buffers = [NSMutableDictionary dictionary];
         g_order = [NSMutableArray array];
+        g_buffer_is_expert = [NSMutableDictionary dictionary];
         g_cache_limit = cache_limit_from_env();
         NSError *error = nil;
         MTLCompileOptions *options = [MTLCompileOptions new];
@@ -376,6 +417,14 @@ static int metal_init(void) {
         g_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
         if (!g_pipeline) {
             fprintf(stderr, "ds4f: Metal pipeline failed: %s\n", error.localizedDescription.UTF8String);
+            return -1;
+        }
+        id<MTLFunction> group_fn = [library newFunctionWithName:@"q8_matvec_group"];
+        g_q8_group_pipeline =
+            [g_device newComputePipelineStateWithFunction:group_fn error:&error];
+        if (!g_q8_group_pipeline) {
+            fprintf(stderr, "ds4f: Metal Q8 group pipeline failed: %s\n",
+                    error.localizedDescription.UTF8String);
             return -1;
         }
         NSString *pair_source = [NSString stringWithUTF8String:g_q8_pair_kernel_source];
@@ -430,7 +479,7 @@ static int metal_init(void) {
         fprintf(stderr, "ds4f: Metal Q8 backend enabled, cache limit %.2f GiB\n",
                 (double)g_cache_limit / (1024.0 * 1024.0 * 1024.0));
     }
-    return g_pipeline ? 0 : -1;
+    return g_pipeline && g_buffer_is_expert ? 0 : -1;
 }
 
 static NSString *buffer_key(const ds4f_gguf *g, const ds4f_tensor *t) {
@@ -438,20 +487,52 @@ static NSString *buffer_key(const ds4f_gguf *g, const ds4f_tensor *t) {
             (unsigned long long)t->file_offset, (unsigned long long)t->nbytes];
 }
 
+__attribute__((destructor))
+static void report_cache_stats(void) {
+    if (!getenv("DS4F_METAL_CACHE_STATS")) return;
+    const double gib = 1024.0 * 1024.0 * 1024.0;
+    fprintf(stderr,
+            "ds4f: Metal cache stats hits=%llu misses=%llu dense_load=%.2fGiB "
+            "expert_load=%.2fGiB evicted=%.2fGiB resident=%.2fGiB\n",
+            (unsigned long long)g_cache_hits,
+            (unsigned long long)g_cache_misses,
+            (double)g_dense_load_bytes / gib,
+            (double)g_expert_load_bytes / gib,
+            (double)g_cache_evicted_bytes / gib,
+            (double)g_cache_bytes / gib);
+}
+
 static id<MTLBuffer> get_weight(const ds4f_gguf *g, const ds4f_tensor *t) {
     NSString *key = buffer_key(g, t);
     id<MTLBuffer> existing = g_buffers[key];
-    if (existing) return existing;
+    if (existing) {
+        ++g_cache_hits;
+        return existing;
+    }
     if (t->nbytes > g_cache_limit || t->nbytes > SIZE_MAX) return nil;
+    ++g_cache_misses;
+    if (t->n_dims == 3) g_expert_load_bytes += t->nbytes;
+    else g_dense_load_bytes += t->nbytes;
     void *raw = NULL;
     if (posix_memalign(&raw, 16384, (size_t)t->nbytes) != 0 || !raw) return nil;
     if (ds4f_gguf_read(g, t, 0, raw, t->nbytes)) { free(raw); return nil; }
     while (g_cache_bytes + t->nbytes > g_cache_limit && g_order.count) {
-        NSString *old_key = g_order.firstObject;
+        NSUInteger old_index = NSNotFound;
+        for (NSUInteger i = 0; i < g_order.count; ++i) {
+            NSString *candidate = g_order[i];
+            if (g_buffer_is_expert[candidate].boolValue) {
+                old_index = i;
+                break;
+            }
+        }
+        if (old_index == NSNotFound) old_index = 0;
+        NSString *old_key = g_order[old_index];
         id<MTLBuffer> old = g_buffers[old_key];
         g_cache_bytes -= old.length;
+        g_cache_evicted_bytes += old.length;
         [g_buffers removeObjectForKey:old_key];
-        [g_order removeObjectAtIndex:0];
+        [g_buffer_is_expert removeObjectForKey:old_key];
+        [g_order removeObjectAtIndex:old_index];
         (void)old;
     }
     id<MTLBuffer> buffer = nil;
@@ -477,6 +558,7 @@ static id<MTLBuffer> get_weight(const ds4f_gguf *g, const ds4f_tensor *t) {
     if (!buffer) return nil;
     if (getenv("DS4F_METAL_NO_CACHE")) return buffer;
     g_buffers[key] = buffer;
+    g_buffer_is_expert[key] = @(t->n_dims == 3);
     [g_order addObject:key];
     g_cache_bytes += t->nbytes;
     return buffer;
@@ -513,6 +595,49 @@ int ds4f_metal_matvec_rows(const ds4f_gguf *g, const ds4f_tensor *t,
         [cb commit]; [cb waitUntilCompleted];
         if (cb.status != MTLCommandBufferStatusCompleted) return -1;
         memcpy(y, [out contents], (size_t)rows * sizeof(float));
+    }
+    return 0;
+}
+
+int ds4f_metal_matvec_group(const ds4f_gguf *g, const ds4f_tensor *t,
+                            const float *x, uint32_t groups,
+                            uint32_t group_in, uint32_t group_out,
+                            float *y) {
+    if (!g || !t || !x || !y || !groups || !group_in || !group_out ||
+        t->type != 8 || t->n_dims != 2 || t->dims[0] != group_in ||
+        t->dims[1] != (uint64_t)groups * group_out ||
+        (size_t)groups > SIZE_MAX / group_in ||
+        (size_t)groups > SIZE_MAX / group_out) return -1;
+    @autoreleasepool {
+        if (metal_init() != 0 || !g_q8_group_pipeline) return -1;
+        const size_t in_floats = (size_t)groups * group_in;
+        const size_t out_floats = (size_t)groups * group_out;
+        id<MTLBuffer> weight = get_weight(g, t);
+        id<MTLBuffer> input =
+            [g_device newBufferWithLength:in_floats * sizeof(float)
+                                  options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out =
+            [g_device newBufferWithLength:out_floats * sizeof(float)
+                                  options:MTLResourceStorageModeShared];
+        if (!weight || !input || !out) return -1;
+        memcpy(input.contents, x, in_floats * sizeof(float));
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:g_q8_group_pipeline];
+        [enc setBuffer:weight offset:0 atIndex:0];
+        [enc setBuffer:input offset:0 atIndex:1];
+        [enc setBuffer:out offset:0 atIndex:2];
+        [enc setBytes:&group_in length:sizeof(group_in) atIndex:3];
+        [enc setBytes:&group_out length:sizeof(group_out) atIndex:4];
+        [enc setBytes:&groups length:sizeof(groups) atIndex:5];
+        const NSUInteger chunks = ((NSUInteger)group_out + 3u) / 4u;
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)groups * chunks, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) return -1;
+        memcpy(y, out.contents, out_floats * sizeof(float));
     }
     return 0;
 }
