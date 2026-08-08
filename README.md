@@ -94,10 +94,10 @@ cd /Users/zexi/workspace/ds4f-mini
 ./scripts/build-dwarfstar-dspark-ssd-experiment.sh
 
 cd reference-ds4
-env DS4_DSPARK_SSD_NONRESIDENT=1 DS4_DSPARK_SCHEDULER=0 DS4_DSPARK_STATS=1 DS4_DSPARK_SPEC_LOG=1 ../bin/ds4-dspark-ssd -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf --mtp gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf --dspark --dspark-confidence 0 --ssd-streaming --ssd-streaming-cache-experts 6GB -c 2048 --temp 0 -p "Explain one plus one in one word." -n 2
+  --dspark --ssd-streaming --ssd-streaming-cache-experts 6GB \\
 ~~~
 
-该命令实际生成了 5-token Markov draft，首 token 为 target 的 `1309`，sequential verifier 提交 1 个 token；最终输出 `We need` 与同一 `--temp 0` 的 target-only 输出完全一致。当前 proposal 约 603ms、逐 token verifier 约 2240ms、总 generation 约 0.59 token/s，仍**不加速**。它的价值是把实验从“全量 support 映射会挤压 16GB”推进到可运行的按专家读取正确性闭环；默认部署仍使用上文 `ds4f-fast` target-only 路径。
+完整 support 映射与 0.52GiB 非驻留路径的同一审计都得到 `proposal0=1309`、`confidence0=2.114`；因此默认 confidence 0.7 会保留草稿前缀。`-n 2` 回归会提交一个草稿 token，最终输出 `We need` 与同一 `--temp 0` 的 target-only 输出完全一致。`-n 6` 的确定性复验中两次各提出并接受 2 个草稿；但 sequential verifier 总计约 6506ms，generation 约 0.65 token/s，仍**不加速**。它的价值是把实验从“全量 support 映射会挤压 16GB”推进到可运行的按专家读取、且与完整 support proposal 数值对齐的闭环；默认部署仍使用上文 `ds4f-fast` target-only 路径。
 
 随后在 `/tmp` 做的 target batch-verifier 探针会先重装 target 静态 views，再以 SSD expert cache 验证整段草稿并回滚/replay；6-token 输出也逐字节等于 target-only。然而一次 5-token 草稿只接受 2 个 draft token，batch verify 为约 7685ms、精确 replay 为约 2630ms、总 generation 约 0.33 token/s，慢于顺序 verifier。该探针没有进入 `patches/` 或部署二进制；在 16GB SSD 约束下，只有能同时提高 acceptance 且避免 replay 的 verifier 才有加速可能。
 
