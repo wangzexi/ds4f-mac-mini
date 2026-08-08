@@ -44,85 +44,21 @@ static void build_iq2_signed_grid(void) {
     }
 }
 
-/* DwarfStar feeds every routed-expert projection with Q8_K activations.
- * The GPU kernels consume float inputs, so preserve that graph exactly enough
- * by quantizing with the reference Q8_K rule and expanding the same values
- * back to float before dispatch. */
-static void q8k_dequantize_activation(float *dst, const float *src, size_t n) {
-    if (n % 256u) abort();
-    for (size_t base = 0; base < n; base += 256u) {
-        float amax = 0.0f;
-        float max = 0.0f;
-        for (size_t j = 0; j < 256u; ++j) {
-            float v = src[base + j];
-            float av = fabsf(v);
-            if (av > amax) {
-                amax = av;
-                max = v;
-            }
-        }
-        if (amax == 0.0f) {
-            memset(dst + base, 0, 256u * sizeof(*dst));
-            continue;
-        }
-        float iscale = -127.0f / max;
-        float d = 1.0f / iscale;
-        for (size_t j = 0; j < 256u; ++j) {
-            int q = (int)lrintf(iscale * src[base + j]);
-            if (q > 127) q = 127;
-            if (q < -128) q = -128;
-            dst[base + j] = d * (float)q;
-        }
-    }
-}
+/* DwarfStar's routed-expert Metal kernels consume raw F32 ffn_norm values. */
+/* Do not insert a Q8_K quantize/dequantize round-trip before dispatch. */
 
-static void q8k_prepare_inputs(float *dst, const float *src, size_t count,
-                               size_t stride, size_t in) {
-    size_t n_input = stride ? count : 1u;
-    for (size_t i = 0; i < n_input; ++i) {
-        q8k_dequantize_activation(dst + (stride ? i * stride : 0),
-                                  src + (stride ? i * stride : 0), in);
-    }
-}
-
-/* Keep dense Q8_0 activations as integer blocks.  The previous Metal path
- * expanded them back to float before multiplying; that changes the order and
- * rounding of DwarfStar's `d_w * d_x * dot_i8_32` calculation enough to alter
- * close top-k router decisions. */
-static void q8_0_quantize_activation(int8_t *dst, float *scales,
-                                      const float *src, size_t n) {
-    const size_t blocks = (n + 31u) / 32u;
-    for (size_t b = 0; b < blocks; ++b) {
-        const size_t base = b * 32u;
-        const size_t width = n - base < 32u ? n - base : 32u;
-        float amax = 0.0f;
-        for (size_t j = 0; j < width; ++j) {
-            float av = fabsf(src[base + j]);
-            if (av > amax) amax = av;
-        }
-        float d = amax / 127.0f;
-        float id = d != 0.0f ? 1.0f / d : 0.0f;
-        scales[b] = d;
-        for (size_t j = 0; j < width; ++j) {
-            int q = (int)lrintf(src[base + j] * id);
-            if (q > 127) q = 127;
-            if (q < -128) q = -128;
-            dst[base + j] = (int8_t)q;
-        }
-        memset(dst + base + width, 0, (32u - width) * sizeof(*dst));
-    }
-}
+/* DwarfStar's Metal dense-Q8 kernels consume raw F32 activations. */
+/* Keep activation quantization out of the Metal path. */
 
 static const char *g_kernel_source =
 "#include <metal_stdlib>\n"
 "using namespace metal;\n"
 "kernel void q8_matvec(device const char *w [[buffer(0)]],\n"
-"                       device const char *xq [[buffer(1)]],\n"
-"                       device const float *xscale [[buffer(2)]],\n"
-"                       device float *y [[buffer(3)]],\n"
-"                       constant uint &in_dim [[buffer(4)]],\n"
-"                       constant uint &row0 [[buffer(5)]],\n"
-"                       constant uint &rows [[buffer(6)]],\n"
+"                       device const float *x [[buffer(1)]],\n"
+"                       device float *y [[buffer(2)]],\n"
+"                       constant uint &in_dim [[buffer(3)]],\n"
+"                       constant uint &row0 [[buffer(4)]],\n"
+"                       constant uint &rows [[buffer(5)]],\n"
 "                       uint tg [[threadgroup_position_in_grid]],\n"
 "                       uint lane [[thread_index_in_threadgroup]]) {\n"
 "    const uint first_row = tg * 4u;\n"
@@ -137,9 +73,7 @@ static const char *g_kernel_source =
 "                device const char *row = w + (row0 + first_row + r) * row_bytes + b * 34u;\n"
 "                ushort hb = (ushort)(uchar)row[0] | ((ushort)(uchar)row[1] << 8);\n"
 "                float d = float(as_type<half>(hb));\n"
-"                int z = 0;\n"
-"                for (uint i = 0; i < 32u; ++i) z += int(row[2u + i]) * int(xq[b * 32u + i]);\n"
-"                sums[r] += d * xscale[b] * float(z);\n"
+"                for (uint i = 0; i < 32u; ++i) sums[r] += d * float(int(row[2u + i])) * x[b * 32u + i];\n"
 "            }\n"
 "        }\n"
 "    }\n"
@@ -159,12 +93,11 @@ static const char *g_q8_pair_kernel_source =
 "using namespace metal;\n"
 "kernel void q8_matvec_pair(device const char *wa [[buffer(0)]],\n"
 "                           device const char *wb [[buffer(1)]],\n"
-"                           device const char *xq [[buffer(2)]],\n"
-"                           device const float *xscale [[buffer(3)]],\n"
-"                           device float *ya [[buffer(4)]],\n"
-"                           device float *yb [[buffer(5)]],\n"
-"                           constant uint &in_dim [[buffer(6)]],\n"
-"                           constant uint &rows [[buffer(7)]],\n"
+"                           device const float *x [[buffer(2)]],\n"
+"                           device float *ya [[buffer(3)]],\n"
+"                           device float *yb [[buffer(4)]],\n"
+"                           constant uint &in_dim [[buffer(5)]],\n"
+"                           constant uint &rows [[buffer(6)]],\n"
 "                           uint tg [[threadgroup_position_in_grid]],\n"
 "                           uint lane [[thread_index_in_threadgroup]]) {\n"
 "    const uint first_row = tg * 4u;\n"
@@ -182,14 +115,14 @@ static const char *g_q8_pair_kernel_source =
 "                device const char *rb = wb + (first_row + r) * row_bytes + b * 34u;\n"
 "                ushort ha = (ushort)(uchar)ra[0] | ((ushort)(uchar)ra[1] << 8);\n"
 "                ushort hb = (ushort)(uchar)rb[0] | ((ushort)(uchar)rb[1] << 8);\n"
-"                int za = 0, zb = 0;\n"
+"                float za = 0.0f, zb = 0.0f;\n"
 "                for (uint i = 0; i < 32u; ++i) {\n"
-"                    int q = int(xq[b * 32u + i]);\n"
-"                    za += int(ra[2u + i]) * q;\n"
-"                    zb += int(rb[2u + i]) * q;\n"
+"                    float v = x[b * 32u + i];\n"
+"                    za += float(int(ra[2u + i])) * v;\n"
+"                    zb += float(int(rb[2u + i])) * v;\n"
 "                }\n"
-"                sa[r] += float(as_type<half>(ha)) * xscale[b] * float(za);\n"
-"                sb[r] += float(as_type<half>(hb)) * xscale[b] * float(zb);\n"
+"                sa[r] += float(as_type<half>(ha)) * za;\n"
+"                sb[r] += float(as_type<half>(hb)) * zb;\n"
 "            }\n"
 "        }\n"
 "    }\n"
@@ -428,7 +361,11 @@ static int metal_init(void) {
         g_cache_limit = cache_limit_from_env();
         NSError *error = nil;
         MTLCompileOptions *options = [MTLCompileOptions new];
-        options.mathMode = MTLMathModeSafe;
+        /* DwarfStar's production graph uses default fast math.  Keep strict
+         * IEEE mode available for diagnostics, but do not make it the default
+         * oracle path. */
+        if (getenv("DS4F_METAL_MATH_SAFE"))
+            options.mathMode = MTLMathModeSafe;
         NSString *source = [NSString stringWithUTF8String:g_kernel_source];
         id<MTLLibrary> library = [g_device newLibraryWithSource:source options:options error:&error];
         if (!library) {
@@ -553,27 +490,22 @@ int ds4f_metal_matvec_rows(const ds4f_gguf *g, const ds4f_tensor *t,
         if (metal_init() != 0) return -1;
         size_t in = (size_t)t->dims[0];
         id<MTLBuffer> weight = get_weight(g, t);
-        const size_t blocks = (in + 31u) / 32u;
-        id<MTLBuffer> input = [g_device newBufferWithLength:blocks * 32u * sizeof(int8_t)
+        id<MTLBuffer> input = [g_device newBufferWithLength:in * sizeof(float)
                                                      options:MTLResourceStorageModeShared];
-        id<MTLBuffer> scales = [g_device newBufferWithLength:blocks * sizeof(float)
-                                                      options:MTLResourceStorageModeShared];
         id<MTLBuffer> out = [g_device newBufferWithLength:(NSUInteger)rows * sizeof(float)
                                                   options:MTLResourceStorageModeShared];
-        if (!weight || !input || !scales || !out) return -1;
-        q8_0_quantize_activation((int8_t *)[input contents],
-                                 (float *)[scales contents], x, in);
+        if (!weight || !input || !out) return -1;
+        memcpy([input contents], x, in * sizeof(float));
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:g_pipeline];
         [enc setBuffer:weight offset:0 atIndex:0];
         [enc setBuffer:input offset:0 atIndex:1];
-        [enc setBuffer:scales offset:0 atIndex:2];
-        [enc setBuffer:out offset:0 atIndex:3];
+        [enc setBuffer:out offset:0 atIndex:2];
         uint32_t in32 = (uint32_t)in;
-        [enc setBytes:&in32 length:sizeof(in32) atIndex:4];
-        [enc setBytes:&row0 length:sizeof(row0) atIndex:5];
-        [enc setBytes:&rows length:sizeof(rows) atIndex:6];
+        [enc setBytes:&in32 length:sizeof(in32) atIndex:3];
+        [enc setBytes:&row0 length:sizeof(row0) atIndex:4];
+        [enc setBytes:&rows length:sizeof(rows) atIndex:5];
         NSUInteger groups = (rows + 3) / 4;
         [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
@@ -595,32 +527,27 @@ int ds4f_metal_matvec_q8_pair(const ds4f_gguf *g,
         if (metal_init() != 0 || !g_q8_pair_pipeline) return -1;
         const size_t in = (size_t)a->dims[0];
         const size_t rows = (size_t)a->dims[1];
-        const size_t blocks = (in + 31u) / 32u;
         id<MTLBuffer> wa = get_weight(g, a);
         id<MTLBuffer> wb = get_weight(g, b);
-        id<MTLBuffer> input = [g_device newBufferWithLength:blocks * 32u * sizeof(int8_t)
+        id<MTLBuffer> input = [g_device newBufferWithLength:in * sizeof(float)
                                                      options:MTLResourceStorageModeShared];
-        id<MTLBuffer> scales = [g_device newBufferWithLength:blocks * sizeof(float)
-                                                      options:MTLResourceStorageModeShared];
         id<MTLBuffer> outa = [g_device newBufferWithLength:rows * sizeof(float)
                                                     options:MTLResourceStorageModeShared];
         id<MTLBuffer> outb = [g_device newBufferWithLength:rows * sizeof(float)
                                                     options:MTLResourceStorageModeShared];
-        if (!wa || !wb || !input || !scales || !outa || !outb) return -1;
-        q8_0_quantize_activation((int8_t *)[input contents],
-                                 (float *)[scales contents], x, in);
+        if (!wa || !wb || !input || !outa || !outb) return -1;
+        memcpy([input contents], x, in * sizeof(float));
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:g_q8_pair_pipeline];
         [enc setBuffer:wa offset:0 atIndex:0];
         [enc setBuffer:wb offset:0 atIndex:1];
         [enc setBuffer:input offset:0 atIndex:2];
-        [enc setBuffer:scales offset:0 atIndex:3];
-        [enc setBuffer:outa offset:0 atIndex:4];
-        [enc setBuffer:outb offset:0 atIndex:5];
+        [enc setBuffer:outa offset:0 atIndex:3];
+        [enc setBuffer:outb offset:0 atIndex:4];
         uint32_t in32 = (uint32_t)in, rows32 = (uint32_t)rows;
-        [enc setBytes:&in32 length:sizeof(in32) atIndex:6];
-        [enc setBytes:&rows32 length:sizeof(rows32) atIndex:7];
+        [enc setBytes:&in32 length:sizeof(in32) atIndex:5];
+        [enc setBytes:&rows32 length:sizeof(rows32) atIndex:6];
         [enc dispatchThreadgroups:MTLSizeMake((rows + 3u) / 4u, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         [enc endEncoding];
@@ -654,7 +581,7 @@ static int metal_expert_rows_batch(const ds4f_gguf *g, const ds4f_tensor *t,
         id<MTLBuffer> out = [g_device newBufferWithLength:count * rows * sizeof(float)
                                                  options:MTLResourceStorageModeShared];
         if (!input || !out) return -1;
-        q8k_prepare_inputs((float *)[input contents], x, count, x_stride, in);
+        memcpy([input contents], x, input_floats * sizeof(float));
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
         uint32_t in32 = (uint32_t)in, rows32 = (uint32_t)rows;
         const NSUInteger tg = 32;
@@ -716,7 +643,7 @@ static int metal_expert_rows_pair(const ds4f_gguf *g,
         id<MTLBuffer> out_b = [g_device newBufferWithLength:count * rows_b * sizeof(float)
                                                      options:MTLResourceStorageModeShared];
         if (!input || !out_a || !out_b) return -1;
-        q8k_prepare_inputs((float *)[input contents], x, count, x_stride, in);
+        memcpy([input contents], x, input_floats * sizeof(float));
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
         uint32_t in32 = (uint32_t)in, rows_a32 = (uint32_t)rows_a;
         uint32_t rows_b32 = (uint32_t)rows_b;
@@ -798,7 +725,7 @@ static int metal_iq2_rows_pair(const ds4f_gguf *g,
         id<MTLBuffer> out_b = [g_device newBufferWithLength:count * rows * sizeof(float)
                                                      options:MTLResourceStorageModeShared];
         if (!input || !out_a || !out_b) return -1;
-        q8k_prepare_inputs((float *)[input contents], x, count, x_stride, in);
+        memcpy([input contents], x, input_floats * sizeof(float));
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
         uint32_t in32 = (uint32_t)in, rows32 = (uint32_t)rows;
         NSUInteger groups = (rows + 3) / 4;
@@ -908,7 +835,7 @@ int ds4f_metal_iq2_probe(const ds4f_gguf *g, const ds4f_tensor *t,
             fprintf(stderr, "ds4f: IQ2 probe buffer allocation failed\n");
             return -1;
         }
-        q8k_dequantize_activation((float *)[input contents], x, in);
+        memcpy([input contents], x, in * sizeof(float));
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:g_iq2_probe_pipeline];

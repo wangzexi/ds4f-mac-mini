@@ -7,6 +7,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef DS4F_FFN_DUMP
+#define DS4F_FFN_DUMP(name, x, n, layer) ((void)0)
+#endif
+
+#ifndef DS4F_HEAD_DUMP
+#define DS4F_HEAD_DUMP(name, x, n) ((void)0)
+#endif
+
 /* Fixed target: DeepSeek V4 Flash 0731 on the 16 GB Mini. */
 enum {
     E = 4096, HC = 4, HEAD = 64, HD = 512, Q = HEAD * HD,
@@ -170,7 +178,7 @@ static float e4m3_round(float x) {
     return sign * e4m3_value(lo);
 }
 
-static uint16_t f32_to_f16(float f) {
+static __attribute__((unused)) uint16_t f32_to_f16(float f) {
     uint32_t bits;
     memcpy(&bits, &f, sizeof(bits));
     uint32_t sign = (bits >> 16) & 0x8000u;
@@ -200,10 +208,6 @@ static void fp8_kv_round(float *x) {
         if (amax < 1e-4f) amax = 1e-4f;
         float scale = ldexpf(1.0f, (int)ceilf(log2f(amax / 448.0f)));
         for (int i = 0; i < 64; ++i) x[off + i] = e4m3_round(x[off + i] / scale) * scale;
-    }
-    for (int i = 0; i < HD; ++i) {
-        uint16_t h = f32_to_f16(x[i]);
-        x[i] = ds4f_f16_to_f32(h);
     }
 }
 
@@ -344,16 +348,16 @@ static int ffn_layer(const ds4f_gguf *g, int layer, int token,
         !up_batch || !mid_batch || !down_batch) exit(1);
 
     hc_pre(g, layer, "ffn", inp, cur, res, post, comb);
+    DS4F_FFN_DUMP("hc_ffn_pre", cur, E, layer);
     float *ffnw = NULL;
     load_tensor(g, layer_tensor(g, layer, "ffn_norm", n, sizeof(n)), (void **)&ffnw);
     ds4f_rms_norm(norm, cur, ffnw, E, 1e-6f);
+    DS4F_FFN_DUMP("ffn_norm", norm, E, layer);
     free(ffnw);
     const ds4f_tensor *router = layer_tensor(g, layer, "ffn_gate_inp", n, sizeof(n));
-    /* Routing boundaries are sensitive to a few ULPs.  When a router is Q8_0,
-     * retain DwarfStar's exact integer-dot accumulation on CPU; some model
-     * layers instead store this tensor in another dense format. */
-    if ((router->type == 8 ? ds4f_matvec_q8_0_cpu(g, router, norm, logits)
-                           : ds4f_matvec(g, router, norm, logits))) return -1;
+    /* The Metal graph consumes the raw F32 normalization output for routers. */
+    if (ds4f_matvec(g, router, norm, logits)) return -1;
+    DS4F_FFN_DUMP("ffn_moe_logits", logits, EXPERTS, layer);
     for (int i = 0; i < EXPERTS; ++i) probs[i] = sqrtf(softplus(logits[i]));
 
     int sel[USED];
@@ -366,7 +370,8 @@ static int ffn_layer(const ds4f_gguf *g, int layer, int token,
     } else {
         float *bias = NULL;
         char bn[96];
-        layer_name(bn, sizeof(bn), layer, "exp_probs_b");
+        int bn_len = snprintf(bn, sizeof(bn), "blk.%d.exp_probs_b.bias", layer);
+        if (bn_len < 0 || (size_t)bn_len >= sizeof(bn)) return -1;
         const ds4f_tensor *bt = ds4f_gguf_find(g, bn);
         if (bt) load_tensor(g, bt, (void **)&bias);
         top6(probs, bias, sel);
@@ -409,6 +414,17 @@ static int ffn_layer(const ds4f_gguf *g, int layer, int token,
         free(single_gate); free(cpu_up); free(cpu_gate);
     }
     for (int s = 0; s < USED; ++s) {
+        float *expert_gate = gate_batch + (size_t)s * FF;
+        float *expert_up = up_batch + (size_t)s * FF;
+        for (int i = 0; i < FF; ++i) {
+            if (expert_gate[i] > 10.0f) expert_gate[i] = 10.0f;
+            if (expert_up[i] > 10.0f) expert_up[i] = 10.0f;
+            if (expert_up[i] < -10.0f) expert_up[i] = -10.0f;
+        }
+    }
+    DS4F_FFN_DUMP("ffn_moe_gate_clamped", gate_batch, (size_t)USED * FF, layer);
+    DS4F_FFN_DUMP("ffn_moe_up_clamped", up_batch, (size_t)USED * FF, layer);
+    for (int s = 0; s < USED; ++s) {
         if (getenv("DS4F_TRACE_EXPERT_DETAIL") && layer == 0) {
             char name[64];
             snprintf(name, sizeof(name), "ds4f expert %d gate", sel[s]);
@@ -427,10 +443,12 @@ static int ffn_layer(const ds4f_gguf *g, int layer, int token,
             print_stats(name, mid_batch + (size_t)s * FF, FF);
         }
     }
+    DS4F_FFN_DUMP("ffn_moe_weighted_swiglu", mid_batch, (size_t)USED * FF, layer);
     if (ds4f_matvec_expert_q8k_batch(g, dt, expert_ids, USED, mid_batch, FF, FF,
                                      down_batch, E)) return -1;
     for (int s = 0; s < USED; ++s)
         for (int i = 0; i < E; ++i) moe[i] += down_batch[(size_t)s * E + i];
+    DS4F_FFN_DUMP("ffn_moe_out", moe, E, layer);
     if (getenv("DS4F_TRACE_EXPERT_DETAIL") && layer == 0) {
         for (int s = 0; s < USED; ++s) {
             char name[64];
@@ -476,18 +494,23 @@ static int output_head(const ds4f_gguf *g, const float *inp, float *logits) {
     if (!flat || !pre || !out || !norm) exit(1);
     ds4f_rms_norm(flat, inp, NULL, (size_t)E * HC, 1e-6f);
     if (ds4f_matvec(g, need(g, "output_hc_fn.weight"), flat, pre)) return -1;
+    DS4F_HEAD_DUMP("result_hc_pre", pre, HC);
     float *scale = NULL, *base = NULL;
     load_tensor(g, need(g, "output_hc_scale.weight"), (void **)&scale);
     load_tensor(g, need(g, "output_hc_base.weight"), (void **)&base);
     float w[HC];
     for (int i = 0; i < HC; ++i) w[i] = 1.0f / (1.0f + expf(-(pre[i] * scale[0] + base[i]))) + 1e-6f;
+    DS4F_HEAD_DUMP("result_hc_weights", w, HC);
     weighted(out, inp, w);
+    DS4F_HEAD_DUMP("result_hc", out, E);
     free(base); free(scale); free(pre); free(flat);
     float *nw = NULL;
     load_tensor(g, need(g, "output_norm.weight"), (void **)&nw);
     ds4f_rms_norm(norm, out, nw, E, 1e-6f);
+    DS4F_HEAD_DUMP("result_norm", norm, E);
     free(nw);
     int rc = ds4f_matvec(g, need(g, "output.weight"), norm, logits);
+    DS4F_HEAD_DUMP("result_output", logits, VOCAB);
     free(norm); free(out);
     (void)n;
     return rc;

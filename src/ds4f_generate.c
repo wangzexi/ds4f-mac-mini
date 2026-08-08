@@ -1,11 +1,34 @@
+#include <stddef.h>
+#include <stdint.h>
+
+static uint32_t gen_active_pos;
+static void gen_dump_f32(const char *name, const float *x, size_t n, uint32_t layer, uint32_t pos);
+
+#define DS4F_FFN_DUMP(name, x, n, layer) gen_dump_f32((name), (x), (n), (uint32_t)(layer), gen_active_pos)
+#define DS4F_HEAD_DUMP(name, x, n) gen_dump_f32((name), (x), (n), LAYERS, gen_active_pos)
+
 /* Reuse the already validated fixed-model math while replacing the one-shot
  * driver with a real token loop and per-layer KV state. */
 #pragma clang diagnostic ignored "-Wunused-function"
 #define main ds4f_first_unused_main
 #include "ds4f_first.c"
 #undef main
+#undef DS4F_FFN_DUMP
+#undef DS4F_HEAD_DUMP
 
 #include "ds4f_tokenizer.h"
+
+/*
+ * The normal executable links this weak CPU fallback.  The Metal executable
+ * overrides it with the raw-KV attention probe in ds4f_attention_metal.m.
+ */
+__attribute__((weak))
+int ds4f_metal_attention_decode(const float *q, const float *raw_kv,
+                                const float *sinks, uint32_t n_raw,
+                                float *out) {
+    (void)q; (void)raw_kv; (void)sinks; (void)n_raw; (void)out;
+    return -1;
+}
 
 #include <stdbool.h>
 #include <sys/time.h>
@@ -50,6 +73,34 @@ static double gen_now_ms(void) {
     return (double)tv.tv_sec * 1000.0 + (double)tv.tv_usec / 1000.0;
 }
 
+static void gen_dump_f32(const char *name, const float *x, size_t n,
+                         uint32_t layer, uint32_t pos) {
+    const char *prefix = getenv("DS4F_DUMP_PREFIX");
+    const char *name_filter = getenv("DS4F_DUMP_NAME");
+    const char *layer_filter = getenv("DS4F_DUMP_LAYER");
+    const char *pos_filter = getenv("DS4F_DUMP_POS");
+    if (!prefix || !prefix[0] || !x || !n) return;
+    if (name_filter && name_filter[0] && !strstr(name_filter, name)) return;
+    if (layer_filter && layer_filter[0] &&
+        (uint32_t)strtoul(layer_filter, NULL, 10) != layer) return;
+    if (pos_filter && pos_filter[0] &&
+        (uint32_t)strtoul(pos_filter, NULL, 10) != pos) return;
+
+    char path[1024];
+    const int written = snprintf(path, sizeof(path), "%s_%s-%u_pos%u.bin",
+                                 prefix, name, layer, pos);
+    if (written < 0 || (size_t)written >= sizeof(path)) return;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return;
+    const size_t done = fwrite(x, sizeof(*x), n, fp);
+    fclose(fp);
+    if (done == n)
+        fprintf(stderr, "ds4f: dumped %s layer %u pos %u to %s\n",
+                name, layer, pos, path);
+}
+
+/* Binary checkpoints for differential testing against DwarfStar's Metal
+ * graph dumps.  They are disabled unless DS4F_DUMP_PREFIX is set. */
 static void gen_cache_init(gen_cache *c, uint32_t max_ctx) {
     memset(c, 0, sizeof(*c));
     if (max_ctx < GEN_RAW) max_ctx = GEN_RAW;
@@ -95,7 +146,9 @@ static void gen_push_raw(gen_layer_cache *c, const float *kv) {
         c->n_raw = GEN_RAW - 1;
     }
     float *dst = c->raw + (size_t)c->n_raw * HD;
-    for (int i = 0; i < HD; ++i) dst[i] = ds4f_f16_to_f32(f32_to_f16(kv[i]));
+    for (int i = 0; i < HD; ++i) {
+        dst[i] = ds4f_f16_to_f32(f32_to_f16(kv[i]));
+    }
     c->n_raw++;
 }
 
@@ -278,8 +331,10 @@ static void gen_attention(const ds4f_gguf *g, int layer, uint32_t pos,
     float *post = malloc(HC * 4), *comb = malloc(HC * HC * 4);
     if (!res || !cur || !norm || !qr || !qrn || !q || !kv || !heads || !low || !aout || !post || !comb) gen_die("attention allocation failed");
     hc_pre(g, layer, "attn", inp, cur, res, post, comb);
+    gen_dump_f32("hc_attn_pre", cur, E, (uint32_t)layer, pos);
     float *nw = NULL; load_tensor(g, layer_tensor(g, layer, "attn_norm", n, sizeof(n)), (void **)&nw);
     ds4f_rms_norm(norm, cur, nw, E, 1e-6f); free(nw);
+    gen_dump_f32("attn_norm", norm, E, (uint32_t)layer, pos);
     ds4f_matvec(g, layer_tensor(g, layer, "attn_q_a", n, sizeof(n)), norm, qr);
     float *qaw = NULL; load_tensor(g, layer_tensor(g, layer, "attn_q_a_norm", n, sizeof(n)), (void **)&qaw);
     ds4f_rms_norm(qrn, qr, qaw, QR, 1e-6f); free(qaw);
@@ -288,7 +343,12 @@ static void gen_attention(const ds4f_gguf *g, int layer, uint32_t pos,
     ds4f_matvec(g, layer_tensor(g, layer, "attn_kv", n, sizeof(n)), norm, kv);
     float *kvw = NULL; load_tensor(g, layer_tensor(g, layer, "attn_kv_a_norm", n, sizeof(n)), (void **)&kvw);
     ds4f_rms_norm(kv, kv, kvw, HD, 1e-6f); free(kvw);
-    gen_rope(q, HEAD, HD, ROT, pos, layer, 0); gen_rope(kv, 1, HD, ROT, pos, layer, 0); fp8_kv_round(kv); gen_push_raw(c, kv);
+    gen_rope(q, HEAD, HD, ROT, pos, layer, 0);
+    gen_dump_f32("Qcur", q, Q, (uint32_t)layer, pos);
+    gen_rope(kv, 1, HD, ROT, pos, layer, 0);
+    fp8_kv_round(kv);
+    gen_dump_f32("KVcur", kv, HD, (uint32_t)layer, pos);
+    gen_push_raw(c, kv);
     if (c->ratio) {
         float *comp_tmp = malloc((size_t)(c->ratio == 4 ? 2 * HD : HD) * sizeof(float));
         if (!comp_tmp) gen_die("attention compressor allocation failed");
@@ -302,6 +362,10 @@ static void gen_attention(const ds4f_gguf *g, int layer, uint32_t pos,
     bool *allow = c->ratio == 4 ? gen_index_allowed(g, layer, norm, qrn, c, pos) : NULL;
     float *sinks = NULL; load_tensor(g, layer_tensor(g, layer, "attn_sinks", n, sizeof(n)), (void **)&sinks);
     float inv = 1.0f / sqrtf((float)HD); uint32_t total = c->n_raw + c->n_comp;
+    int attention_on_gpu =
+        getenv("DS4F_FORCE_CPU_ATTENTION") == NULL && c->n_comp == 0 &&
+        ds4f_metal_attention_decode(q, c->raw, sinks, c->n_raw, heads) == 0;
+    if (!attention_on_gpu) {
     for (int h = 0; h < HEAD; ++h) {
         const float *qh = q + (size_t)h * HD; float maxs = sinks[h];
         for (uint32_t r = 0; r < total; ++r) {
@@ -321,11 +385,16 @@ static void gen_attention(const ds4f_gguf *g, int layer, uint32_t pos,
         }
         for (int j = 0; j < HD; ++j) oh[j] /= den;
     }
+    }
     free(sinks); free(allow);
     gen_rope(heads, HEAD, HD, ROT, pos, layer, 1);
+    gen_dump_f32("kqv_back", heads, Q, (uint32_t)layer, pos);
     ds4f_matvec_group(g, layer_tensor(g, layer, "attn_output_a", n, sizeof(n)), heads, GROUPS, GROUP_IN, LOW, low);
+    gen_dump_f32("attn_low", low, (size_t)GROUPS * LOW, (uint32_t)layer, pos);
     ds4f_matvec(g, layer_tensor(g, layer, "attn_output_b", n, sizeof(n)), low, aout);
+    gen_dump_f32("attn_out", aout, E, (uint32_t)layer, pos);
     hc_post(out, aout, res, post, comb);
+    gen_dump_f32("hc_attn_post", out, (size_t)E * HC, (uint32_t)layer, pos);
     free(comb); free(post); free(aout); free(low); free(heads); free(kv); free(q); free(qrn); free(qr); free(norm); free(cur); free(res);
 }
 
@@ -345,7 +414,9 @@ static int gen_forward(const ds4f_gguf *g, gen_cache *cache, int token,
         gen_attention(g, l, pos, cur, attn, &cache->layer[l]);
         if (profile) attention_ms += gen_now_ms() - t0;
         t0 = profile ? gen_now_ms() : 0.0;
+        gen_active_pos = pos;
         if (ffn_layer(g, l, token, attn, next)) gen_die("FFN failed");
+        gen_dump_f32("hc_ffn_post", next, (size_t)E * HC, (uint32_t)l, pos);
         if (profile) ffn_ms += gen_now_ms() - t0;
         float *tmp = cur; cur = next; next = tmp;
     }
@@ -358,6 +429,13 @@ static int gen_forward(const ds4f_gguf *g, gen_cache *cache, int token,
 }
 
 static int argmax(const float *x) { int best = 0; for (int i = 1; i < VOCAB; ++i) if (x[i] > x[best]) best = i; return best; }
+
+static void trace_top(const char *stage, int step, const float *logits) {
+    if (!getenv("DS4F_TRACE_TOP")) return;
+    printf("trace stage=%s step=%d\n", stage, step);
+    print_top(logits);
+    fflush(stdout);
+}
 
 int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: %s MODEL.gguf PROMPT [new_tokens] [max_ctx]\n", argv[0]); return 2; }
@@ -372,7 +450,7 @@ int main(int argc, char **argv) {
     double prefill_t0 = gen_now_ms();
     for (size_t i = 0; i < prompt.len; ++i) { if (gen_forward(&g, &cache, prompt.v[i], pos++, i + 1 == prompt.len ? logits : NULL)) gen_die("prefill failed"); }
     fprintf(stderr, "prefill_ms=%.3f tokens=%zu\n", gen_now_ms() - prefill_t0, prompt.len);
-    if (getenv("DS4F_TRACE_TOP")) print_top(logits);
+    trace_top("prefill", -1, logits);
     for (int step = 0; step < n_new; ++step) {
         next = argmax(logits); char *text = NULL; size_t text_len = 0;
         ds4f_token_text(&tok, next, &text, &text_len);
@@ -381,6 +459,7 @@ int main(int argc, char **argv) {
         double decode_t0 = gen_now_ms();
         if (gen_forward(&g, &cache, next, pos++, logits)) gen_die("decode failed");
         fprintf(stderr, "decode[%d]_ms=%.3f\n", step, gen_now_ms() - decode_t0);
+        trace_top("decode", step, logits);
     }
     free(logits); gen_cache_free(&cache); ds4f_tokens_free(&prompt); ds4f_tokenizer_close(&tok); ds4f_gguf_close(&g); return 0;
 }

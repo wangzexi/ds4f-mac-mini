@@ -28,8 +28,11 @@ ds4f-dspark-probe: src/ds4f_dspark_probe.o src/ds4f_gguf.o
 ds4f-generate: src/ds4f_generate.o src/ds4f_tokenizer.o src/ds4f_gguf.o src/ds4f_quant.o
 	$(CC) $(CFLAGS) -o $@ $^ -lm
 
-ds4f-generate-metal: src/ds4f_generate.o src/ds4f_tokenizer.o src/ds4f_gguf.o src/ds4f_quant_metal.o src/ds4f_metal.o
+ds4f-generate-metal: src/ds4f_generate.o src/ds4f_tokenizer.o src/ds4f_gguf.o src/ds4f_quant_metal.o src/ds4f_metal.o src/ds4f_attention_metal.o
 	$(CC) $(CFLAGS) -o $@ $^ -framework Foundation -framework Metal -lm
+
+src/ds4f_attention_metal.o: src/ds4f_attention_metal.m
+	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
 
 src/ds4f_quant_metal.o: src/ds4f_quant.c src/ds4f_gguf.h src/ds4f_quant.h
 	$(CC) $(CFLAGS) -DDS4F_USE_METAL -c -o $@ $<
