@@ -49,6 +49,20 @@ make fast
 为这个限定的 Mini 部署，`ds4f-fast` 将 context 固定为 2048 token：这把 KV 预算从约 0.61GiB 降到约 0.18GiB，并将短 prompt 的 prefill 从约 0.33 提升到 0.61 token/s；它不改变连续 greedy 输出，decode 仍主要受 SSD expert streaming 限制。
 
 
+### 16GB 专家缓存的已验证边界
+
+正式路径固定采用 6GiB 总专家预算：其中 3.38GiB 是图预填充保留区，2.62GiB 是 398 个专家的可锁定动态缓存。每个 decode token 最多路由 `43 × 6 = 258` 个专家，因此这个容量小于两个 token 的工作集；持续 decode 的主要瓶颈是 miss 后从内部 SSD 读取权重，而不是算术 kernel。
+
+2026-08-09 的隔离实验均先通过生产 token-ID 回归后再计时，结论如下：
+
+- 预填充后把全部 6GiB 改为 910 个**未锁定**专家，英文和中文回归均正确，但 macOS 大量分页，generation 降为 0.25 token/s；不采用。
+- 将预填充保留区从两层降为一层，虽可请求 654 个专家，但 `mlock` 只能锁约 2.99GiB，保护逻辑最终把运行时缓存降到 151 个，generation 为 0.31 token/s；不采用。
+- 将专家 slab 从 Shared 改为 CPU 可写的 Managed 也不改变 token ID，但 654 槽仅 0.73 token/s、910 槽仅 0.23 token/s；在 M4 统一内存上它不会形成额外的常驻缓存层，不采用。
+- 将 SSD `pread` 并发从默认 9 提至 18 不改变 token ID，但在常驻两请求复测中没有稳定胜过默认值；保持参考默认值。
+- eviction 时的文件页 `DONTNEED` 在参考实现中默认关闭，不是可回收的默认性能损失。
+
+因此当前可部署且数值受回归保护的速度范围是短请求约 1.6–2.6 token/s，具体取决于路由、SSD 页缓存和已有专家 cache。对多条独立请求，应优先使用 `ds4f-reuse`；它保留专家 cache、重建各自的 KV，避免串话。若要跨过这个上限，需要更多可锁定统一内存、更快的外部存储，或实现不需常驻 support 权重的真正层级 speculative verifier；单纯把更大的专家 cache 交给 macOS 分页不会加速。
+
 ### 多请求复用缓存
 
 对于连续的独立请求，使用 `ds4f-reuse` 让 engine 保持常驻；每一行 stdin 都是一个新的 chat prompt，上一条的 KV / 对话历史不会混入下一条，但 Metal SSD 专家 cache 会留下来：
