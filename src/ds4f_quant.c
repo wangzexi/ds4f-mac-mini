@@ -14,6 +14,11 @@ extern int ds4f_metal_matvec_rows(const ds4f_gguf *g, const ds4f_tensor *t,
 extern int ds4f_metal_matvec_q8_pair(const ds4f_gguf *g,
                                      const ds4f_tensor *a, const ds4f_tensor *b,
                                      const float *x, float *ya, float *yb);
+extern int ds4f_metal_matvec_pair_shared_input(const ds4f_gguf *g,
+                                               const ds4f_tensor *a,
+                                               const ds4f_tensor *b,
+                                               const float *x,
+                                               float *ya, float *yb);
 extern int ds4f_metal_matvec_expert_q8k(const ds4f_gguf *g,
                                         const ds4f_tensor *t,
                                         uint32_t expert, const float *x,
@@ -474,8 +479,25 @@ int ds4f_matvec_q8_pair(const ds4f_gguf *g, const ds4f_tensor *a,
         errno = EINVAL;
         return -1;
     }
+
 #ifdef DS4F_USE_METAL
     if (ds4f_metal_matvec_q8_pair(g, a, b, x, ya, yb) == 0) return 0;
+#endif
+    return ds4f_matvec(g, a, x, ya) || ds4f_matvec(g, b, x, yb) ? -1 : 0;
+}
+
+int ds4f_matvec_pair_shared_input(const ds4f_gguf *g, const ds4f_tensor *a,
+                                  const ds4f_tensor *b, const float *x,
+                                  float *ya, float *yb) {
+    if (!g || !a || !b || !x || !ya || !yb || a->n_dims != 2 ||
+        b->n_dims != 2 || a->dims[0] != b->dims[0]) {
+        errno = EINVAL;
+        return -1;
+    }
+#ifdef DS4F_USE_METAL
+    if (a->type == 8 && b->type == 8 &&
+        ds4f_metal_matvec_pair_shared_input(g, a, b, x, ya, yb) == 0)
+        return 0;
 #endif
     return ds4f_matvec(g, a, x, ya) || ds4f_matvec(g, b, x, yb) ? -1 : 0;
 }

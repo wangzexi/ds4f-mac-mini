@@ -11,6 +11,9 @@ int ds4f_matvec(const ds4f_gguf *g, const ds4f_tensor *t, const float *x, float 
 int ds4f_matvec_q8_pair(const ds4f_gguf *g, const ds4f_tensor *a,
                          const ds4f_tensor *b, const float *x,
                          float *ya, float *yb);
+int ds4f_matvec_pair_shared_input(const ds4f_gguf *g, const ds4f_tensor *a,
+                                  const ds4f_tensor *b, const float *x,
+                                  float *ya, float *yb);
 int ds4f_matvec_q8_0_cpu(const ds4f_gguf *g, const ds4f_tensor *t,
                           const float *x, float *y);
 int ds4f_matvec_expert(const ds4f_gguf *g, const ds4f_tensor *t,

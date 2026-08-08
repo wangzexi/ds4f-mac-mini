@@ -684,6 +684,61 @@ int ds4f_metal_matvec_q8_pair(const ds4f_gguf *g,
     return 0;
 }
 
+/* Two Q8_0 matrices with one activation vector but unrelated output widths.
+ * They remain separate dispatches to preserve the established arithmetic, yet
+ * share one command buffer and therefore one CPU/GPU synchronization point. */
+int ds4f_metal_matvec_pair_shared_input(const ds4f_gguf *g,
+                                        const ds4f_tensor *a,
+                                        const ds4f_tensor *b,
+                                        const float *x,
+                                        float *ya, float *yb) {
+    if (!g || !a || !b || !x || !ya || !yb || a->type != 8 || b->type != 8 ||
+        a->n_dims != 2 || b->n_dims != 2 || a->dims[0] != b->dims[0] ||
+        a->dims[0] > UINT32_MAX || a->dims[1] > UINT32_MAX ||
+        b->dims[1] > UINT32_MAX) return -1;
+    @autoreleasepool {
+        if (metal_init() != 0) return -1;
+        const size_t in = (size_t)a->dims[0];
+        const uint32_t rows_a = (uint32_t)a->dims[1];
+        const uint32_t rows_b = (uint32_t)b->dims[1];
+        const uint32_t in32 = (uint32_t)in;
+        const uint32_t row0 = 0;
+        id<MTLBuffer> wa = get_weight(g, a);
+        id<MTLBuffer> wb = get_weight(g, b);
+        id<MTLBuffer> input = [g_device newBufferWithLength:in * sizeof(float)
+                                                     options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outa = [g_device newBufferWithLength:(NSUInteger)rows_a * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
+        id<MTLBuffer> outb = [g_device newBufferWithLength:(NSUInteger)rows_b * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
+        if (!wa || !wb || !input || !outa || !outb) return -1;
+        memcpy(input.contents, x, in * sizeof(float));
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:g_pipeline];
+        [enc setBuffer:wa offset:0 atIndex:0];
+        [enc setBuffer:input offset:0 atIndex:1];
+        [enc setBuffer:outa offset:0 atIndex:2];
+        [enc setBytes:&in32 length:sizeof(in32) atIndex:3];
+        [enc setBytes:&row0 length:sizeof(row0) atIndex:4];
+        [enc setBytes:&rows_a length:sizeof(rows_a) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((rows_a + 3u) / 4u, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc setBuffer:wb offset:0 atIndex:0];
+        [enc setBuffer:outb offset:0 atIndex:2];
+        [enc setBytes:&rows_b length:sizeof(rows_b) atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((rows_b + 3u) / 4u, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) return -1;
+        memcpy(ya, outa.contents, (size_t)rows_a * sizeof(float));
+        memcpy(yb, outb.contents, (size_t)rows_b * sizeof(float));
+    }
+    return 0;
+}
+
 static int metal_expert_rows_batch(const ds4f_gguf *g, const ds4f_tensor *t,
                                    const uint32_t *experts, size_t count,
                                    const float *x, size_t x_stride, size_t in,

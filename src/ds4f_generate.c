@@ -335,12 +335,14 @@ static void gen_attention(const ds4f_gguf *g, int layer, uint32_t pos,
     float *nw = NULL; load_tensor(g, layer_tensor(g, layer, "attn_norm", n, sizeof(n)), (void **)&nw);
     ds4f_rms_norm(norm, cur, nw, E, 1e-6f); free(nw);
     gen_dump_f32("attn_norm", norm, E, (uint32_t)layer, pos);
-    ds4f_matvec(g, layer_tensor(g, layer, "attn_q_a", n, sizeof(n)), norm, qr);
+    const ds4f_tensor *wq_a = layer_tensor(g, layer, "attn_q_a", n, sizeof(n));
+    const ds4f_tensor *wkv = layer_tensor(g, layer, "attn_kv", n, sizeof(n));
+    if (ds4f_matvec_pair_shared_input(g, wq_a, wkv, norm, qr, kv))
+        gen_die("attention Q/KV projection failed");
     float *qaw = NULL; load_tensor(g, layer_tensor(g, layer, "attn_q_a_norm", n, sizeof(n)), (void **)&qaw);
     ds4f_rms_norm(qrn, qr, qaw, QR, 1e-6f); free(qaw);
     ds4f_matvec(g, layer_tensor(g, layer, "attn_q_b", n, sizeof(n)), qrn, q);
     for (int h = 0; h < HEAD; ++h) ds4f_rms_norm(q + h * HD, q + h * HD, NULL, HD, 1e-6f);
-    ds4f_matvec(g, layer_tensor(g, layer, "attn_kv", n, sizeof(n)), norm, kv);
     float *kvw = NULL; load_tensor(g, layer_tensor(g, layer, "attn_kv_a_norm", n, sizeof(n)), (void **)&kvw);
     ds4f_rms_norm(kv, kv, kvw, HD, 1e-6f); free(kvw);
     gen_rope(q, HEAD, HD, ROT, pos, layer, 0);
