@@ -65,7 +65,7 @@ make fast
 - 保持 6GiB 总预算但在 prefill 后只将动态缓存从 398 增至 440 槽（约 2.90GiB）也不可行：首次 decode 的新增 6.75MiB 专家页就 `mlock` 失败并中断生成。这直接验证 398 槽已是完整图在本机的可执行上限，不是保守留量。
 - 在 128K 下临时请求 7GiB 总专家预算（549 个专家）同样在约 2.99GiB `mlock` 处失败，保护逻辑将缓存降至 151 槽；不采用。
 
-因此当前可部署且数值受回归保护的默认 128K 速度，8-token 短请求约 1.4 token/s；256K 约 1.2 token/s。路由、SSD 页缓存和已有专家 cache 会产生波动。对多条独立请求，应优先使用 `ds4f-reuse`；它保留专家 cache、重建各自的 KV，避免串话。若要跨过这个上限，需要更多可锁定统一内存、更快的外部存储，或实现不需常驻 support 权重的真正层级 speculative verifier；单纯把更大的专家 cache 交给 macOS 分页不会加速。
+因此当前可部署且数值受回归保护的默认 128K 速度，8-token 短请求约 1.4 token/s；256K 约 1.2 token/s。路由与 SSD 页缓存会产生波动。`ds4f-reuse` 会保留专家 cache、重建各自的 KV，适合独立请求，但不保证热请求吞吐更高；128K 的同提示词 8-token cold/hot 对照均为 1.44 token/s。若要跨过这个上限，需要更多可锁定统一内存、更快的外部存储，或实现不需常驻 support 权重的真正层级 speculative verifier；单纯把更大的专家 cache 交给 macOS 分页不会加速。
 
 ### 多请求复用缓存
 
@@ -79,7 +79,7 @@ printf '%s\n' '你好' '介绍一下你自己' | ./ds4f-reuse \
   16
 ```
 
-在默认 128K 的实测中，`ds4f-reuse` 对 `Explain one plus one in one word.` 输出 `One word:`，3-token generation 为 2.19 token/s；它不改变输出算术，只减少后续独立请求的 SSD cache 冷启动。
+`ds4f-reuse` 不改变输出算术，也不会混入上一条的 KV。它保留专家 cache，能避免进程重启，但缓存命中取决于后续请求的路由；不要把它当作固定的吞吐加速器。
 
 ## DwarfStar 的 SSD + DSpark 实验
 
