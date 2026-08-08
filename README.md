@@ -2,7 +2,7 @@
 
 面向 Apple M4 Mac mini（16GB 统一内存）的最小 DeepSeek V4 Flash 0731 推理实验。
 
-目标被刻意限制为：只支持固定的量化 GGUF 权重，在 16GB 统一内存上尽可能完成连续生成；不引入 Ollama，也不把 DwarfStar 或 Kimi 工程作为运行时依赖。两个工程仅用于理解 GGUF、量化格式、KV 压缩和 DSpark 公式。
+目标被刻意限制为：只支持固定的量化 GGUF 权重，在 16GB 统一内存上尽可能完成连续生成，不引入 Ollama。自写运行器用于独立实现与数值验证；可选的 `ds4f-fast` 部署适配器会链接 DwarfStar 的公开 engine API，以便在完整自研 GPU 图完成前使用其已验证的 Metal graph。Kimi 工程仅作格式参考。
 
 当前模型：
 
@@ -16,26 +16,29 @@
 - 已加入可选 Metal Q8_0 dense matvec；`DS4F_METAL_CACHE_GIB` 控制统一内存权重缓存，默认 10 GiB，上限 13 GiB。
 - routed IQ2/Q2 专家切片有独立 LRU 缓存，`DS4F_EXPERT_CACHE_GIB` 控制预算，默认 4 GiB，上限 8 GiB；Metal 版本已加入 IQ2/Q2 专家线程组 kernel 和 gate/up 批处理。
 - DSpark support GGUF 已下载并通过结构验证（约 5.58 GiB）；尚未接入运行时，因此当前程序仍是 target-only decoding。
+- `ds4f-fast` 是可选的快速部署入口：仅支持固定 Flash 0731 模型，复用 reference-ds4 的公开 engine API 与 Metal graph；默认 6GiB SSD expert cache，可用 `DS4F_FAST_CACHE_GIB=1..6` 调整。
 
-2026-08-08 在 Mini 上重新验证：DwarfStar 的 target-only SSD streaming 路径能够在 M4/16GB 上实际输出 token。对空 chat prompt（3 个 prompt token）生成 2 token 时，日志给出的 generation 速度为 **2.99 token/s**；其内存规划为 5.84 GiB（KV 0.61 GiB、常驻 embedding 0.99 GiB、SSD expert cache/reserve 4 GiB 等）。因此“16GB 机器上把这个固定模型跑起来”的目标已经有一条可用且有速度的参考运行路径。
+2026-08-08 在 Mini 上重新验证：target-only SSD streaming 路径能够在 M4/16GB 上实际输出 token。`ds4f-fast` 通过 DwarfStar 的公开 engine API 复用已验证的完整 Metal graph；空 chat prompt（3 个 prompt token）连续生成 8 token，输出 `DeepSeek-V2, released in`，generation 为 **1.83 token/s**（6GiB cache）。同日的 2-token 4GiB 对照为 2.74–2.99 token/s；长一点的连续输出使用 6GiB 更稳定。因此“16GB 机器上把这个固定模型跑起来”的目标已有可部署入口。
 
 自写运行器已完成独立 GGUF、tokenizer、原始/压缩 KV cache、连续 greedy decode 和 Metal Q8/IQ2/Q2 路径。对同一空 chat prompt 的 8-token 回归中，DwarfStar 与 ds4f-generate-metal 的 top-k 排名和每一步选中的 token 全部一致；第 0 步 top-1 logit 差为 +0.0120345。这证明当前数值路径可以稳定地连续生成，仍不代表长上下文、多种 prompt 和 DSpark 的完整覆盖。
 
-自写路径仍是实验运行器：默认 10GiB Metal weight cache 下，短 prompt prefill 约 10 秒，decode 约 2.6–2.8 秒/token（约 0.37 token/s）。性能差距来自逐层 CPU/Metal 同步和专家切片调度；DwarfStar 的单 token GPU graph、GPU router 与 SSD expert cache 是当前实际推理的推荐路径。
+自写路径仍是实验运行器：默认 10GiB Metal weight cache 下，短 prompt prefill 约 10 秒，decode 约 2.6–2.8 秒/token（约 0.37 token/s）。性能差距来自逐层 CPU/Metal 同步和专家切片调度。`ds4f-fast` 已把同一模型接入完整单-token Metal graph、GPU router 与 SSD expert cache，当前是 Mini 上的实际推荐入口；下一阶段才是把这张图改为项目自有实现。
 
 DS4F_PROFILE=1 可输出 attention、FFN 与 head 的分项时间。10GiB 是自写路径的安全默认值；提高到 11GiB 以上会造成统一内存压力并使连续 decode 变慢，因此不把它设为默认值。
 
-当前可用的 target-only 启动命令：
+当前最快的 target-only 启动命令：
 
 ```sh
-cd /Users/zexi/workspace/ds4f-mini/reference-ds4
-./ds4 \
-  -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
-  --ssd-streaming --ssd-streaming-cache-experts 4GB \
-  --temp 0 --nothink -n 16 -p '<｜User｜>你好<｜Assistant｜></think>'
+cd /Users/zexi/workspace/ds4f-mini
+make fast
+./ds4f-fast \
+  reference-ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
+  "你好" 16
 ```
 
---ssd-streaming 是在 16GB 机器上成立的关键；不要省略。4GB expert cache 是当前 Mini 上的最佳安全设置。6GB 在短请求上无收益；8GB 会因 macOS 无法锁住足够的专家页而退化到约 0.63 token/s。
+`ds4f-fast` 是受限部署适配器：只暴露这个固定模型的 greedy SSD-streaming 路径，静态链接 `reference-ds4` 的公开 engine API，并在运行时使用其 Metal shader；它不修改 reference 源码。自写路径保持独立，作为下一步将整张 GPU 图迁入项目本身的数值和结构基线。
+
+`--ssd-streaming` 是在 16GB 机器上成立的关键；不要省略。`ds4f-fast` 默认使用 6GiB 专家 cache：在此次完整 8-token 空 prompt 回归中为 1.83 token/s，输出与数值基线一致。短请求可用 `DS4F_FAST_CACHE_GIB=4`；8GiB 会因 macOS 无法锁住足够的专家页而显著退化。
 
 
 ## DwarfStar 的 SSD + DSpark 实验

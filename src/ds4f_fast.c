@@ -1,0 +1,163 @@
+#include "ds4.h"
+
+#include <errno.h>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+/*
+ * Fast deployment adapter for the single supported model.  It deliberately
+ * exposes only the target-only SSD-streaming route, while reusing DwarfStar's
+ * public engine boundary and its verified Metal graph implementation.
+ */
+enum {
+    DS4F_FAST_CONTEXT = 32768,
+    DS4F_FAST_DEFAULT_TOKENS = 16,
+};
+
+static const uint64_t DS4F_FAST_DEFAULT_CACHE_BYTES = 6ull * 1024ull * 1024ull * 1024ull;
+
+typedef struct {
+    ds4_engine *engine;
+    int emitted;
+} output_state;
+
+static void usage(const char *program) {
+    fprintf(stderr,
+            "usage: %s MODEL.gguf [PROMPT] [TOKENS]\n"
+            "Uses a 6GiB SSD expert cache by default; set DS4F_FAST_CACHE_GIB=1..6 to override.\n",
+            program);
+}
+
+static int parse_positive(const char *text, int fallback) {
+    if (!text) return fallback;
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(text, &end, 10);
+    if (errno || end == text || *end || value < 1 || value > INT_MAX) return -1;
+    return (int)value;
+}
+
+static int cache_bytes_from_env(uint64_t *out) {
+    const char *text = getenv("DS4F_FAST_CACHE_GIB");
+    if (!text || !text[0]) {
+        *out = DS4F_FAST_DEFAULT_CACHE_BYTES;
+        return 0;
+    }
+    char *end = NULL;
+    errno = 0;
+    double gib = strtod(text, &end);
+    if (errno || end == text || *end || !(gib >= 1.0 && gib <= 6.0)) return -1;
+    *out = (uint64_t)(gib * 1024.0 * 1024.0 * 1024.0);
+    return *out ? 0 : -1;
+}
+
+static int enter_reference_dir(const char *program) {
+    char executable[PATH_MAX];
+    char reference_dir[PATH_MAX];
+    if (!realpath(program, executable)) return -1;
+    char *slash = strrchr(executable, '/');
+    if (!slash) return -1;
+    *slash = '\0';
+    int written = snprintf(reference_dir, sizeof(reference_dir), "%s/reference-ds4",
+                           executable);
+    if (written < 0 || (size_t)written >= sizeof(reference_dir)) return -1;
+    return chdir(reference_dir);
+}
+
+static void emit_token(void *ud, int token) {
+    output_state *state = ud;
+    size_t len = 0;
+    char *text = ds4_token_text(state->engine, token, &len);
+    if (!text) return;
+    fwrite(text, 1, len, stdout);
+    fflush(stdout);
+    free(text);
+    state->emitted++;
+}
+
+static void finish_output(void *ud) {
+    output_state *state = ud;
+    if (state->emitted) fputc('\n', stdout);
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
+        usage(argv[0]);
+        return 0;
+    }
+    if (argc < 2 || argc > 4) {
+        usage(argv[0]);
+        return 2;
+    }
+    uint64_t cache_bytes = 0;
+    if (cache_bytes_from_env(&cache_bytes)) {
+        fprintf(stderr, "ds4f-fast: DS4F_FAST_CACHE_GIB must be between 1 and 6\n");
+        return 2;
+    }
+
+    char model_path[PATH_MAX];
+    if (!realpath(argv[1], model_path)) {
+        perror(argv[1]);
+        return 2;
+    }
+    const char *prompt = argc >= 3 ? argv[2] : "";
+    const int tokens = parse_positive(argc >= 4 ? argv[3] : NULL,
+                                      DS4F_FAST_DEFAULT_TOKENS);
+    if (tokens < 0) {
+        fprintf(stderr, "ds4f-fast: TOKENS must be a positive integer\n");
+        return 2;
+    }
+
+    const char prefix[] = "<｜User｜>";
+    const char suffix[] = "<｜Assistant｜></think>";
+    const size_t rendered_len = strlen(prefix) + strlen(prompt) + strlen(suffix);
+    char *rendered = malloc(rendered_len + 1u);
+    if (!rendered) {
+        perror("malloc");
+        return 1;
+    }
+    snprintf(rendered, rendered_len + 1u, "%s%s%s", prefix, prompt, suffix);
+
+    if (enter_reference_dir(argv[0])) {
+        fprintf(stderr,
+                "ds4f-fast: cannot locate reference-ds4 next to the executable\n");
+        free(rendered);
+        return 1;
+    }
+
+    ds4_engine_options options = {
+        .model_path = model_path,
+        .backend = DS4_BACKEND_METAL,
+        .context_size = DS4F_FAST_CONTEXT,
+        .mtp_draft_tokens = 1,
+        .mtp_margin = 3.0f,
+        .ssd_streaming = true,
+        .ssd_streaming_cache_bytes = cache_bytes,
+    };
+    ds4_engine *engine = NULL;
+    if (ds4_engine_open(&engine, &options) != 0 || !engine) {
+        fprintf(stderr, "ds4f-fast: failed to initialize the Metal graph\n");
+        free(rendered);
+        return 1;
+    }
+
+    ds4_tokens prompt_tokens = {0};
+    ds4_tokenize_rendered_chat(engine, rendered, &prompt_tokens);
+    free(rendered);
+    if (prompt_tokens.len == 0) {
+        fprintf(stderr, "ds4f-fast: failed to encode the chat prompt\n");
+        ds4_engine_close(engine);
+        return 1;
+    }
+
+    output_state output = { .engine = engine };
+    int rc = ds4_engine_generate_argmax(engine, &prompt_tokens, tokens,
+                                        DS4F_FAST_CONTEXT, emit_token,
+                                        finish_output, &output, NULL, NULL);
+    ds4_tokens_free(&prompt_tokens);
+    ds4_engine_close(engine);
+    return rc == 0 ? 0 : 1;
+}

@@ -23,3 +23,5 @@
 
 # macOS metadata.
 .DS_Store
+
+/ds4f-fast
