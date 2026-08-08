@@ -13,7 +13,7 @@
  * public engine boundary and its verified Metal graph implementation.
  */
 enum {
-    DS4F_FAST_CONTEXT = 32768,
+    DS4F_FAST_CONTEXT = 2048,
     DS4F_FAST_DEFAULT_TOKENS = 16,
 };
 

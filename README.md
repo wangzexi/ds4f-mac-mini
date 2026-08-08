@@ -42,6 +42,8 @@ make fast
 
 `--ssd-streaming` 是在 16GB 机器上成立的关键；不要省略。`ds4f-fast` 默认使用 6GiB 专家 cache：在此次完整 8-token 空 prompt 回归中为 1.83 token/s，输出与数值基线一致。短请求可用 `DS4F_FAST_CACHE_GIB=4`；8GiB 会因 macOS 无法锁住足够的专家页而显著退化。
 
+为这个限定的 Mini 部署，`ds4f-fast` 将 context 固定为 2048 token：这把 KV 预算从约 0.61GiB 降到约 0.18GiB，并将短 prompt 的 prefill 从约 0.33 提升到 0.61 token/s；它不改变连续 greedy 输出，decode 仍主要受 SSD expert streaming 限制。
+
 
 ## DwarfStar 的 SSD + DSpark 实验
 
