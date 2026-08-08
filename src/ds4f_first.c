@@ -361,6 +361,7 @@ static int ffn_layer(const ds4f_gguf *g, int layer, int token,
     for (int i = 0; i < EXPERTS; ++i) probs[i] = sqrtf(softplus(logits[i]));
 
     int sel[USED];
+    float *router_bias = NULL;
     if (layer < 3) {
         int32_t hash[USED];
         const ds4f_tensor *ht = layer_tensor(g, layer, "ffn_gate_tid2eid", n, sizeof(n));
@@ -368,14 +369,12 @@ static int ffn_layer(const ds4f_gguf *g, int layer, int token,
                            sizeof(hash))) return -1;
         for (int i = 0; i < USED; ++i) sel[i] = hash[i];
     } else {
-        float *bias = NULL;
         char bn[96];
         int bn_len = snprintf(bn, sizeof(bn), "blk.%d.exp_probs_b.bias", layer);
         if (bn_len < 0 || (size_t)bn_len >= sizeof(bn)) return -1;
         const ds4f_tensor *bt = ds4f_gguf_find(g, bn);
-        if (bt) load_tensor(g, bt, (void **)&bias);
-        top6(probs, bias, sel);
-        free(bias);
+        if (bt) load_tensor(g, bt, (void **)&router_bias);
+        top6(probs, router_bias, sel);
     }
     float ew[USED], sum = 0.0f;
     for (int i = 0; i < USED; ++i) { ew[i] = probs[sel[i]]; sum += ew[i]; }
@@ -386,6 +385,27 @@ static int ffn_layer(const ds4f_gguf *g, int layer, int token,
         fputc('\n', stderr);
     }
 
+    if (getenv("DS4F_VALIDATE_METAL_ROUTER") && (layer == 0 || layer == 3)) {
+        uint32_t fixed_ids[USED], gpu_ids[USED];
+        float gpu_weights[USED];
+        int mismatch = 0;
+        float max_weight_diff = 0.0f;
+        for (int i = 0; i < USED; ++i) fixed_ids[i] = (uint32_t)sel[i];
+        if (ds4f_metal_router_top6(logits, router_bias, fixed_ids, layer < 3,
+                                   gpu_ids, gpu_weights)) {
+            fprintf(stderr, "ds4f Metal router diagnostic failed\n");
+        } else {
+            for (int i = 0; i < USED; ++i) {
+                if (gpu_ids[i] != fixed_ids[i]) mismatch = 1;
+                float diff = fabsf(gpu_weights[i] - ew[i]);
+                if (diff > max_weight_diff) max_weight_diff = diff;
+            }
+            fprintf(stderr,
+                    "ds4f Metal/CPU router layer %d: ids=%s max_weight_diff=%.8g\n",
+                    layer, mismatch ? "MISMATCH" : "OK", max_weight_diff);
+        }
+    }
+    free(router_bias);
     uint32_t expert_ids[USED];
     for (int s = 0; s < USED; ++s) expert_ids[s] = (uint32_t)sel[s];
     const ds4f_tensor *gt = layer_tensor(g, layer, "ffn_gate_exps", n, sizeof(n));

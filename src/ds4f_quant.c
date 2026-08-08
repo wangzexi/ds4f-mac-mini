@@ -50,6 +50,9 @@ extern int ds4f_metal_matvec_group(const ds4f_gguf *g, const ds4f_tensor *t,
                                    const float *x, uint32_t groups,
                                    uint32_t group_in, uint32_t group_out,
                                    float *y);
+extern int ds4f_metal_router_top6(const float *logits, const float *bias,
+                                  const uint32_t *fixed_ids, int use_fixed,
+                                  uint32_t *out_ids, float *out_weights);
 extern int ds4f_metal_swiglu_weight(const float *gate, const float *up,
                                     const float *weights, size_t count,
                                     size_t width, float *out);
@@ -57,6 +60,13 @@ extern int ds4f_metal_swiglu_weight(const float *gate, const float *up,
 int ds4f_metal_iq2_probe(const ds4f_gguf *g, const ds4f_tensor *t,
                           uint32_t expert, const float *x, size_t n, float *out) {
     (void)g; (void)t; (void)expert; (void)x; (void)n; (void)out;
+    return -1;
+}
+int ds4f_metal_router_top6(const float *logits, const float *bias,
+                           const uint32_t *fixed_ids, int use_fixed,
+                           uint32_t *out_ids, float *out_weights) {
+    (void)logits; (void)bias; (void)fixed_ids; (void)use_fixed;
+    (void)out_ids; (void)out_weights;
     return -1;
 }
 int ds4f_metal_swiglu_weight(const float *gate, const float *up,

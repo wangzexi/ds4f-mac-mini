@@ -46,6 +46,9 @@ int ds4f_matvec_group(const ds4f_gguf *g, const ds4f_tensor *t,
                       uint32_t group_out, float *y);
 void ds4f_rms_norm(float *out, const float *x, const float *w,
                    size_t n, float eps);
+int ds4f_metal_router_top6(const float *logits, const float *bias,
+                           const uint32_t *fixed_ids, int use_fixed,
+                           uint32_t *out_ids, float *out_weights);
 int ds4f_metal_swiglu_weight(const float *gate, const float *up,
                              const float *weights, size_t count, size_t width,
                              float *out);

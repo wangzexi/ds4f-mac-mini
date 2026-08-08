@@ -20,6 +20,7 @@ static id<MTLComputePipelineState> g_iq2_pair_pipeline;
 static id<MTLComputePipelineState> g_iq2_probe_pipeline;
 static id<MTLComputePipelineState> g_q2_pipeline;
 static id<MTLComputePipelineState> g_swiglu_weight_pipeline;
+static id<MTLComputePipelineState> g_router_pipeline;
 static id<MTLBuffer> g_iq2_signed_grid;
 static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_buffers;
 static NSMutableArray<NSString *> *g_order;
@@ -399,6 +400,46 @@ static const char *g_swiglu_kernel_source =
 "  if (u < -10.0f) u = -10.0f;\n"
 "  mid[gid] = (g / (1.0f + exp(-g))) * u * weights[slot];\n"
 "}\n";
+
+static const char *g_router_kernel_source =
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"kernel void ds4f_router_top6(\n"
+"    device const float *logits [[buffer(0)]],\n"
+"    device const float *bias [[buffer(1)]],\n"
+"    device const uint *fixed_ids [[buffer(2)]],\n"
+"    device uint *out_ids [[buffer(3)]],\n"
+"    device float *out_weights [[buffer(4)]],\n"
+"    constant uint &use_fixed [[buffer(5)]],\n"
+"    uint gid [[thread_position_in_grid]]) {\n"
+"  if (gid != 0u) return;\n"
+"  float probs[256];\n"
+"  uint selected[6] = {0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};\n"
+"  for (uint i = 0; i < 256u; ++i) {\n"
+"    float x = logits[i];\n"
+"    float sp = x > 20.0f ? x : (x < -20.0f ? exp(x) : log(1.0f + exp(x)));\n"
+"    probs[i] = sqrt(sp);\n"
+"  }\n"
+"  if (use_fixed != 0u) {\n"
+"    for (uint i = 0; i < 6u; ++i) selected[i] = fixed_ids[i];\n"
+"  } else {\n"
+"    for (uint i = 0; i < 256u; ++i) {\n"
+"      float value = probs[i] + bias[i];\n"
+"      for (uint j = 0; j < 6u; ++j) {\n"
+"        float old = selected[j] == 0xffffffffu ? -INFINITY : probs[selected[j]] + bias[selected[j]];\n"
+"        if (value > old) {\n"
+"          for (uint k = 5u; k > j; --k) selected[k] = selected[k - 1u];\n"
+"          selected[j] = i;\n"
+"          break;\n"
+"        }\n"
+"      }\n"
+"    }\n"
+"  }\n"
+"  float sum = 0.0f;\n"
+"  for (uint i = 0; i < 6u; ++i) { out_ids[i] = selected[i]; sum += probs[selected[i]]; }\n"
+"  float denom = max(sum, 6.103515625e-5f);\n"
+"  for (uint i = 0; i < 6u; ++i) out_weights[i] = probs[selected[i]] / denom * 1.5f;\n"
+"}\n";
 static uint64_t cache_limit_from_env(void) {
     const char *s = getenv("DS4F_METAL_CACHE_GIB");
     double gib = s && s[0] ? strtod(s, NULL) : 10.0;
@@ -409,7 +450,7 @@ static uint64_t cache_limit_from_env(void) {
 
 static int metal_init(void) {
     if (g_initialized) return g_pipeline && g_q8_group_pipeline && g_q8_pair_pipeline && g_iq2_pipeline && g_iq2_pair_pipeline && g_iq2_probe_pipeline &&
-        g_q2_pipeline && g_swiglu_weight_pipeline && g_iq2_signed_grid ? 0 : -1;
+        g_q2_pipeline && g_swiglu_weight_pipeline && g_router_pipeline && g_iq2_signed_grid ? 0 : -1;
     g_initialized = 1;
     @autoreleasepool {
         g_device = MTLCreateSystemDefaultDevice();
@@ -500,6 +541,18 @@ static int metal_init(void) {
         g_swiglu_weight_pipeline = [g_device newComputePipelineStateWithFunction:swiglu_fn error:&error];
         if (!g_swiglu_weight_pipeline) {
             fprintf(stderr, "ds4f: Metal SwiGLU pipeline failed: %s\n", error.localizedDescription.UTF8String);
+            return -1;
+        }
+        NSString *router_source = [NSString stringWithUTF8String:g_router_kernel_source];
+        id<MTLLibrary> router_library = [g_device newLibraryWithSource:router_source options:options error:&error];
+        if (!router_library) {
+            fprintf(stderr, "ds4f: Metal router library compile failed: %s\n", error.localizedDescription.UTF8String);
+            return -1;
+        }
+        id<MTLFunction> router_fn = [router_library newFunctionWithName:@"ds4f_router_top6"];
+        g_router_pipeline = [g_device newComputePipelineStateWithFunction:router_fn error:&error];
+        if (!g_router_pipeline) {
+            fprintf(stderr, "ds4f: Metal router pipeline failed: %s\n", error.localizedDescription.UTF8String);
             return -1;
         }
         build_iq2_signed_grid();
@@ -1145,6 +1198,50 @@ int ds4f_metal_swiglu_weight(const float *gate, const float *up,
         [cb commit]; [cb waitUntilCompleted];
         if (cb.status != MTLCommandBufferStatusCompleted) return -1;
         memcpy(out, [out_buffer contents], total * sizeof(float));
+    }
+    return 0;
+}
+
+int ds4f_metal_router_top6(const float *logits, const float *bias,
+                           const uint32_t *fixed_ids, int use_fixed,
+                           uint32_t *out_ids, float *out_weights) {
+    if (!logits || !out_ids || !out_weights || (use_fixed && !fixed_ids)) return -1;
+    @autoreleasepool {
+        if (metal_init() != 0 || !g_router_pipeline) return -1;
+        id<MTLBuffer> logits_buffer = [g_device newBufferWithLength:256u * sizeof(float)
+                                                              options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bias_buffer = [g_device newBufferWithLength:256u * sizeof(float)
+                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> fixed_buffer = [g_device newBufferWithLength:6u * sizeof(uint32_t)
+                                                             options:MTLResourceStorageModeShared];
+        id<MTLBuffer> ids_buffer = [g_device newBufferWithLength:6u * sizeof(uint32_t)
+                                                           options:MTLResourceStorageModeShared];
+        id<MTLBuffer> weights_buffer = [g_device newBufferWithLength:6u * sizeof(float)
+                                                               options:MTLResourceStorageModeShared];
+        if (!logits_buffer || !bias_buffer || !fixed_buffer || !ids_buffer || !weights_buffer)
+            return -1;
+        memcpy([logits_buffer contents], logits, 256u * sizeof(float));
+        if (bias) memcpy([bias_buffer contents], bias, 256u * sizeof(float));
+        else memset([bias_buffer contents], 0, 256u * sizeof(float));
+        if (fixed_ids) memcpy([fixed_buffer contents], fixed_ids, 6u * sizeof(uint32_t));
+        else memset([fixed_buffer contents], 0, 6u * sizeof(uint32_t));
+        const uint32_t fixed32 = use_fixed ? 1u : 0u;
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:g_router_pipeline];
+        [enc setBuffer:logits_buffer offset:0 atIndex:0];
+        [enc setBuffer:bias_buffer offset:0 atIndex:1];
+        [enc setBuffer:fixed_buffer offset:0 atIndex:2];
+        [enc setBuffer:ids_buffer offset:0 atIndex:3];
+        [enc setBuffer:weights_buffer offset:0 atIndex:4];
+        [enc setBytes:&fixed32 length:sizeof(fixed32) atIndex:5];
+        [enc dispatchThreads:MTLSizeMake(1, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [enc endEncoding];
+        [cb commit]; [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) return -1;
+        memcpy(out_ids, [ids_buffer contents], 6u * sizeof(uint32_t));
+        memcpy(out_weights, [weights_buffer contents], 6u * sizeof(float));
     }
     return 0;
 }
