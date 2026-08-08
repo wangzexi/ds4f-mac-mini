@@ -708,6 +708,8 @@ static int metal_expert_rows_batch(const ds4f_gguf *g, const ds4f_tensor *t,
         if (!input || !out) return -1;
         memcpy([input contents], x, input_floats * sizeof(float));
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pipeline];
         uint32_t in32 = (uint32_t)in, rows32 = (uint32_t)rows;
         const NSUInteger tg = 32;
         const NSUInteger groups = (rows + 3) / 4;
@@ -717,8 +719,6 @@ static int metal_expert_rows_batch(const ds4f_gguf *g, const ds4f_tensor *t,
             slice.nbytes = expert_bytes;
             id<MTLBuffer> weight = get_weight(g, &slice);
             if (!weight) return -1;
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            [enc setComputePipelineState:pipeline];
             [enc setBuffer:weight offset:0 atIndex:0];
             NSUInteger input_offset = (NSUInteger)(x_stride ? i * x_stride : 0) * sizeof(float);
             [enc setBuffer:input offset:input_offset atIndex:1];
@@ -728,8 +728,8 @@ static int metal_expert_rows_batch(const ds4f_gguf *g, const ds4f_tensor *t,
             [enc setBytes:&rows32 length:sizeof(rows32) atIndex:5];
             [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
-            [enc endEncoding];
         }
+        [enc endEncoding];
         [cb commit]; [cb waitUntilCompleted];
         if (cb.status != MTLCommandBufferStatusCompleted) return -1;
         const float *out_data = (const float *)[out contents];
@@ -852,6 +852,8 @@ static int metal_iq2_rows_pair(const ds4f_gguf *g,
         if (!input || !out_a || !out_b) return -1;
         memcpy([input contents], x, input_floats * sizeof(float));
         id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:g_iq2_pair_pipeline];
         uint32_t in32 = (uint32_t)in, rows32 = (uint32_t)rows;
         NSUInteger groups = (rows + 3) / 4;
         for (size_t i = 0; i < count; ++i) {
@@ -865,8 +867,6 @@ static int metal_iq2_rows_pair(const ds4f_gguf *g,
             id<MTLBuffer> weight_a = get_weight(g, &slice_a);
             id<MTLBuffer> weight_b = get_weight(g, &slice_b);
             if (!weight_a || !weight_b) return -1;
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            [enc setComputePipelineState:g_iq2_pair_pipeline];
             [enc setBuffer:weight_a offset:0 atIndex:0];
             [enc setBuffer:weight_b offset:0 atIndex:1];
             NSUInteger input_offset = (NSUInteger)(x_stride ? i * x_stride : 0) * sizeof(float);
@@ -878,8 +878,8 @@ static int metal_iq2_rows_pair(const ds4f_gguf *g,
             [enc setBytes:&rows32 length:sizeof(rows32) atIndex:7];
             [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
                   threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-            [enc endEncoding];
         }
+        [enc endEncoding];
         [cb commit]; [cb waitUntilCompleted];
         if (cb.status != MTLCommandBufferStatusCompleted) return -1;
         const float *pa = (const float *)[out_a contents];
