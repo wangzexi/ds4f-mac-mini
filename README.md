@@ -92,6 +92,12 @@ DS4_DSPARK_STATS=1 \
 因此默认仍使用 target-only 命令；DSpark 留作正确性验证和后续实现真正的层级
 streaming verifier 的基础。
 
+2026-08-09 的 Mini 复验表明，这条正确性实验不能作为部署加速器：即使主模型
+cache 设为 4GiB，DSpark support 映射仍会触发明显 swap；36 秒只生成到 `Deep`，
+故已主动终止。它没有数值错误，但 16GiB M4 上的支持模型常驻和 target SSD
+streaming 无法同时满足低延迟。除非实现真正的层级 streaming verifier 并显著降低
+support 模型常驻页，否则不要把 `ds4-dspark-ssd` 用于实际服务。
+
 在 Mini 上运行：
 
 ```sh
