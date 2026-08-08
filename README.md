@@ -60,6 +60,7 @@ make fast
 - 将专家 slab 从 Shared 改为 CPU 可写的 Managed 也不改变 token ID，但 654 槽仅 0.73 token/s、910 槽仅 0.23 token/s；在 M4 统一内存上它不会形成额外的常驻缓存层，不采用。
 - 将 SSD `pread` 并发从默认 9 提至 18 不改变 token ID，但在常驻两请求复测中没有稳定胜过默认值；保持参考默认值。
 - eviction 时的文件页 `DONTNEED` 在参考实现中默认关闭，不是可回收的默认性能损失。
+- 保持 6GiB 总预算但在 prefill 后只将动态缓存从 398 增至 440 槽（约 2.90GiB）也不可行：首次 decode 的新增 6.75MiB 专家页就 `mlock` 失败并中断生成。这直接验证 398 槽已是完整图在本机的可执行上限，不是保守留量。
 
 因此当前可部署且数值受回归保护的速度范围是短请求约 1.6–2.6 token/s，具体取决于路由、SSD 页缓存和已有专家 cache。对多条独立请求，应优先使用 `ds4f-reuse`；它保留专家 cache、重建各自的 KV，避免串话。若要跨过这个上限，需要更多可锁定统一内存、更快的外部存储，或实现不需常驻 support 权重的真正层级 speculative verifier；单纯把更大的专家 cache 交给 macOS 分页不会加速。
 
