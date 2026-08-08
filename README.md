@@ -45,6 +45,20 @@ make fast
 为这个限定的 Mini 部署，`ds4f-fast` 将 context 固定为 2048 token：这把 KV 预算从约 0.61GiB 降到约 0.18GiB，并将短 prompt 的 prefill 从约 0.33 提升到 0.61 token/s；它不改变连续 greedy 输出，decode 仍主要受 SSD expert streaming 限制。
 
 
+### 多请求复用缓存
+
+对于连续的独立请求，使用 `ds4f-reuse` 让 engine 保持常驻；每一行 stdin 都是一个新的 chat prompt，上一条的 KV / 对话历史不会混入下一条，但 Metal SSD 专家 cache 会留下来：
+
+```sh
+cd /Users/zexi/workspace/ds4f-mini
+make fast
+printf '%s\n' '你好' '介绍一下你自己' | ./ds4f-reuse \
+  reference-ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
+  16
+```
+
+Mini 上两条 4-token 空请求的验证中，首条 cold generation 为 0.85 token/s，第二条在已保留专家 cache 下为 2.17 token/s；它不改变输出算术，只减少后续独立请求的 SSD cache 冷启动。
+
 ## DwarfStar 的 SSD + DSpark 实验
 
 patches/ 与 scripts/build-dwarfstar-dspark-ssd-experiment.sh 提供一个**不修改**

@@ -7,7 +7,7 @@ all: ds4f-probe ds4f-layer0 ds4f-first-token ds4f-tokenize ds4f-generate
 
 metal: ds4f-generate-metal ds4f-first-token-metal
 
-fast: ds4f-fast
+fast: ds4f-fast ds4f-reuse
 dspark: ds4f-dspark-probe
 
 ds4f-probe: src/ds4f_probe.o src/ds4f_gguf.o
@@ -34,10 +34,16 @@ ds4f-generate: src/ds4f_generate.o src/ds4f_tokenizer.o src/ds4f_gguf.o src/ds4f
 ds4f-fast: src/ds4f_fast.o ds4f-fast-reference
 	$(CC) $(CFLAGS) -o $@ src/ds4f_fast.o $(DS4F_FAST_CORE_OBJS) -framework Foundation -framework Metal -lm -pthread
 
+ds4f-reuse: src/ds4f_reuse.o ds4f-fast-reference
+	$(CC) $(CFLAGS) -o $@ src/ds4f_reuse.o $(DS4F_FAST_CORE_OBJS) -framework Foundation -framework Metal -lm -pthread
+
 ds4f-fast-reference:
 	$(MAKE) -C reference-ds4 ds4
 ds4f-generate-metal: src/ds4f_generate.o src/ds4f_tokenizer.o src/ds4f_gguf.o src/ds4f_quant_metal.o src/ds4f_metal.o src/ds4f_attention_metal.o
 	$(CC) $(CFLAGS) -o $@ $^ -framework Foundation -framework Metal -lm
+
+src/ds4f_reuse.o: src/ds4f_reuse.c reference-ds4/ds4.h
+	$(CC) $(CFLAGS) -Ireference-ds4 -c -o $@ $<
 
 src/ds4f_fast.o: src/ds4f_fast.c reference-ds4/ds4.h
 	$(CC) $(CFLAGS) -Ireference-ds4 -c -o $@ $<
@@ -49,10 +55,9 @@ src/ds4f_quant_metal.o: src/ds4f_quant.c src/ds4f_gguf.h src/ds4f_quant.h
 	$(CC) $(CFLAGS) -DDS4F_USE_METAL -c -o $@ $<
 src/ds4f_metal.o: src/ds4f_metal.m src/ds4f_gguf.h
 	$(CC) $(CFLAGS) -fobjc-arc -c -o $@ $<
-
 src/%.o: src/%.c src/ds4f_gguf.h
 	@mkdir -p src
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f ds4f-probe ds4f-layer0 ds4f-first-token ds4f-first-token-metal ds4f-tokenize ds4f-generate ds4f-generate-metal ds4f-dspark-probe ds4f-fast src/*.o
+	rm -f ds4f-probe ds4f-layer0 ds4f-first-token ds4f-first-token-metal ds4f-tokenize ds4f-generate ds4f-generate-metal ds4f-dspark-probe ds4f-fast ds4f-reuse src/*.o
