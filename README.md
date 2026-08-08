@@ -94,7 +94,7 @@ cd /Users/zexi/workspace/ds4f-mini
 ./scripts/build-dwarfstar-dspark-ssd-experiment.sh
 
 cd reference-ds4
-  --dspark --ssd-streaming --ssd-streaming-cache-experts 6GB \\
+env DS4_DSPARK_SSD_NONRESIDENT=1 DS4_DSPARK_SCHEDULER=0 DS4_DSPARK_STATS=1 DS4_DSPARK_SPEC_LOG=1 ../bin/ds4-dspark-ssd -m gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf --mtp gguf/DeepSeek-V4-Flash-DSpark-support-0731.gguf --dspark --ssd-streaming --ssd-streaming-cache-experts 6GB -c 2048 --temp 0 -p "Explain one plus one in one word." -n 2
 ~~~
 
 完整 support 映射与 0.52GiB 非驻留路径的同一审计都得到 `proposal0=1309`、`confidence0=2.114`；因此默认 confidence 0.7 会保留草稿前缀。`-n 2` 回归会提交一个草稿 token，最终输出 `We need` 与同一 `--temp 0` 的 target-only 输出完全一致。`-n 6` 的确定性复验中两次各提出并接受 2 个草稿；但 sequential verifier 总计约 6506ms，generation 约 0.65 token/s，仍**不加速**。它的价值是把实验从“全量 support 映射会挤压 16GB”推进到可运行的按专家读取、且与完整 support proposal 数值对齐的闭环；默认部署仍使用上文 `ds4f-fast` target-only 路径。
