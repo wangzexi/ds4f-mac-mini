@@ -13,7 +13,7 @@
  * remain alive so independent later requests avoid cache cold-start cost.
  */
 enum {
-    DS4F_FAST_CONTEXT = 2048,
+    DS4F_FAST_CONTEXT_DEFAULT = 131072,
     DS4F_FAST_DEFAULT_TOKENS = 16,
 };
 
@@ -27,7 +27,8 @@ typedef struct {
 static void usage(const char *program) {
     fprintf(stderr,
             "usage: %s MODEL.gguf [TOKENS]\n"
-            "Reads one prompt per stdin line. Each request gets a fresh context while the 6GiB SSD expert cache stays resident.\n",
+            "Reads one prompt per stdin line. Each request gets a fresh context while the 6GiB SSD expert cache stays resident. "
+            "Defaults to 128K context; set DS4F_FAST_CONTEXT_K=128 or 256.\n",
             program);
 }
 
@@ -52,6 +53,21 @@ static int cache_bytes_from_env(uint64_t *out) {
     if (errno || end == text || *end || !(gib >= 1.0 && gib <= 6.0)) return -1;
     *out = (uint64_t)(gib * 1024.0 * 1024.0 * 1024.0);
     return *out ? 0 : -1;
+}
+
+static int context_tokens_from_env(int *out) {
+    if (!out) return -1;
+    const char *text = getenv("DS4F_FAST_CONTEXT_K");
+    if (!text || !text[0]) {
+        *out = DS4F_FAST_CONTEXT_DEFAULT;
+        return 0;
+    }
+    char *end = NULL;
+    errno = 0;
+    long kib = strtol(text, &end, 10);
+    if (errno || end == text || *end || (kib != 128 && kib != 256)) return -1;
+    *out = (int)kib * 1024;
+    return 0;
 }
 
 static int enter_reference_dir(const char *program) {
@@ -82,7 +98,8 @@ static void finish_output(void *ud) {
     output_state *state = ud;
     if (state->emitted) fputc('\n', stdout);
 }
-static int generate_prompt(ds4_engine *engine, const char *prompt, int tokens) {
+static int generate_prompt(ds4_engine *engine, const char *prompt, int tokens,
+                           int context_size) {
 
     const char prefix[] = "<｜User｜>";
     const char suffix[] = "<｜Assistant｜></think>";
@@ -100,7 +117,7 @@ static int generate_prompt(ds4_engine *engine, const char *prompt, int tokens) {
 
     output_state output = { .engine = engine };
     int rc = ds4_engine_generate_argmax(engine, &prompt_tokens, tokens,
-                                        DS4F_FAST_CONTEXT, emit_token,
+                                        context_size, emit_token,
                                         finish_output, &output, NULL, NULL);
     ds4_tokens_free(&prompt_tokens);
     return rc;
@@ -118,6 +135,11 @@ int main(int argc, char **argv) {
     uint64_t cache_bytes = 0;
     if (cache_bytes_from_env(&cache_bytes)) {
         fprintf(stderr, "ds4f-reuse: DS4F_FAST_CACHE_GIB must be between 1 and 6\n");
+        return 2;
+    }
+    int context_size = 0;
+    if (context_tokens_from_env(&context_size)) {
+        fprintf(stderr, "ds4f-reuse: DS4F_FAST_CONTEXT_K must be 128 or 256\n");
         return 2;
     }
     char model_path[PATH_MAX];
@@ -139,7 +161,7 @@ int main(int argc, char **argv) {
     ds4_engine_options options = {
         .model_path = model_path,
         .backend = DS4_BACKEND_METAL,
-        .context_size = DS4F_FAST_CONTEXT,
+        .context_size = context_size,
         .mtp_draft_tokens = 1,
         .mtp_margin = 3.0f,
         .ssd_streaming = true,
@@ -158,7 +180,7 @@ int main(int argc, char **argv) {
         size_t line_len = strlen(line);
         while (line_len && (line[line_len - 1u] == '\n' || line[line_len - 1u] == '\r'))
             line[--line_len] = '\0';
-        if (generate_prompt(engine, line, tokens) != 0) {
+        if (generate_prompt(engine, line, tokens, context_size) != 0) {
             fprintf(stderr, "ds4f-reuse: generation failed\n");
             rc = 1;
             break;

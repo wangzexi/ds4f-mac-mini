@@ -18,7 +18,7 @@
 - Metal 权重 cache 对专家 buffer 命中会刷新 LRU 次序；默认 10GiB 的空 prompt 8-token 回归中，专家 SSD 读取从 11.85GiB 降至 10.75GiB（miss 5739→5238），greedy token 不变。
 - 路由结果确定后，会在 gate/up Metal command buffer 执行期间预取同一批专家的 down 权重；8-token 空 prompt 对照中 decode 从约 2.75 秒/token 降至约 2.59 秒/token，`DS4F_DISABLE_DOWN_PREFETCH=1` 可作诊断开关。
 - DSpark support GGUF 已下载并通过结构验证（约 5.58 GiB）；尚未接入运行时，因此当前程序仍是 target-only decoding。
-- `ds4f-fast` 是可选的快速部署入口：仅支持固定 Flash 0731 模型，复用 reference-ds4 的公开 engine API 与 Metal graph；默认 6GiB SSD expert cache，可用 `DS4F_FAST_CACHE_GIB=1..6` 调整。
+- `ds4f-fast` 是可选的快速部署入口：仅支持固定 Flash 0731 模型，复用 reference-ds4 的公开 engine API 与 Metal graph；默认 128K context，设 `DS4F_FAST_CONTEXT_K=256` 可切换至 256K；默认 6GiB SSD expert cache，可用 `DS4F_FAST_CACHE_GIB=1..6` 调整。
 
 2026-08-08/09 在 Mini 上重新验证：target-only SSD streaming 路径能够在 M4/16GB 上实际输出 token。`ds4f-fast` 通过 DwarfStar 的公开 engine API 复用已验证的完整 Metal graph；空 chat prompt（3 个 prompt token）连续生成 8 token，输出 `DeepSeek-V2, released in`，generation 为 **1.83 token/s**（6GiB cache）。在同一 16-token 对照中，6GiB 为 **1.86 token/s**，4GiB 为 **1.67 token/s**；连续生成应保持 6GiB 默认。因此“16GB 机器上把这个固定模型跑起来”的目标已有可部署入口。
 
@@ -46,7 +46,9 @@ make fast
 
 `--ssd-streaming` 是在 16GB 机器上成立的关键；不要省略。`ds4f-fast` 默认使用 6GiB 专家 cache：完整 8-token 空 prompt 回归为 1.83 token/s，输出与数值基线一致；最新相同 16-token 请求对照中，6GiB 为 **1.86 token/s**，4GiB 为 **1.67 token/s**，因此保持默认 6GiB。8GiB 会因 macOS 无法锁住足够的专家页而显著退化。
 
-为这个限定的 Mini 部署，`ds4f-fast` 将 context 固定为 2048 token：这把 KV 预算从约 0.61GiB 降到约 0.18GiB，并将短 prompt 的 prefill 从约 0.33 提升到 0.61 token/s；它不改变连续 greedy 输出，decode 仍主要受 SSD expert streaming 限制。
+为这个限定的 Mini 部署，`ds4f-fast` 默认分配 **128K context**；`DS4F_FAST_CONTEXT_K=256` 启用 **256K context**。只接受这两个档位，避免把通用配置面带入 target-only 部署。
+
+2026-08-09 在 M4/16GB 的实测中，128K 内存计划为 9.35GiB（KV 1.36GiB、图 buffer 1.00GiB、398 个动态专家 2.62GiB）；256K 为 10.35GiB（KV 2.36GiB、buffer 2.00GiB）。256K 会触发图工作集保护，把总专家预算从 6GiB 降至 5GiB，只保留 246 个动态专家，因此连续 8-token generation 实测约 **1.21 token/s**；128K 保留 398 个专家，实测约 **1.42 token/s**，是推荐默认值。两档均通过英文和中文 token-ID 回归；512 个重复片段的 batch prefill 均完成 43/43 层并输出 token（128K 22.65 t/s，256K 24.81 t/s）。
 
 
 ### 16GB 专家缓存的已验证边界
@@ -61,8 +63,9 @@ make fast
 - 将 SSD `pread` 并发从默认 9 提至 18 不改变 token ID，但在常驻两请求复测中没有稳定胜过默认值；保持参考默认值。
 - eviction 时的文件页 `DONTNEED` 在参考实现中默认关闭，不是可回收的默认性能损失。
 - 保持 6GiB 总预算但在 prefill 后只将动态缓存从 398 增至 440 槽（约 2.90GiB）也不可行：首次 decode 的新增 6.75MiB 专家页就 `mlock` 失败并中断生成。这直接验证 398 槽已是完整图在本机的可执行上限，不是保守留量。
+- 在 128K 下临时请求 7GiB 总专家预算（549 个专家）同样在约 2.99GiB `mlock` 处失败，保护逻辑将缓存降至 151 槽；不采用。
 
-因此当前可部署且数值受回归保护的速度范围是短请求约 1.6–2.6 token/s，具体取决于路由、SSD 页缓存和已有专家 cache。对多条独立请求，应优先使用 `ds4f-reuse`；它保留专家 cache、重建各自的 KV，避免串话。若要跨过这个上限，需要更多可锁定统一内存、更快的外部存储，或实现不需常驻 support 权重的真正层级 speculative verifier；单纯把更大的专家 cache 交给 macOS 分页不会加速。
+因此当前可部署且数值受回归保护的默认 128K 速度，8-token 短请求约 1.4 token/s；256K 约 1.2 token/s。路由、SSD 页缓存和已有专家 cache 会产生波动。对多条独立请求，应优先使用 `ds4f-reuse`；它保留专家 cache、重建各自的 KV，避免串话。若要跨过这个上限，需要更多可锁定统一内存、更快的外部存储，或实现不需常驻 support 权重的真正层级 speculative verifier；单纯把更大的专家 cache 交给 macOS 分页不会加速。
 
 ### 多请求复用缓存
 
@@ -76,7 +79,7 @@ printf '%s\n' '你好' '介绍一下你自己' | ./ds4f-reuse \
   16
 ```
 
-Mini 上两条 4-token 空请求的验证中，首条 cold generation 为 0.85 token/s，第二条在已保留专家 cache 下为 2.17 token/s；它不改变输出算术，只减少后续独立请求的 SSD cache 冷启动。
+在默认 128K 的实测中，`ds4f-reuse` 对 `Explain one plus one in one word.` 输出 `One word:`，3-token generation 为 2.19 token/s；它不改变输出算术，只减少后续独立请求的 SSD cache 冷启动。
 
 ## DwarfStar 的 SSD + DSpark 实验
 

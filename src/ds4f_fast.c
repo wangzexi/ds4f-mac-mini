@@ -13,7 +13,7 @@
  * public engine boundary and its verified Metal graph implementation.
  */
 enum {
-    DS4F_FAST_CONTEXT = 2048,
+    DS4F_FAST_CONTEXT_DEFAULT = 131072,
     DS4F_FAST_DEFAULT_TOKENS = 16,
 };
 
@@ -27,6 +27,7 @@ typedef struct {
 static void usage(const char *program) {
     fprintf(stderr,
             "usage: %s MODEL.gguf [PROMPT] [TOKENS]\n"
+            "Defaults to 128K context; set DS4F_FAST_CONTEXT_K=128 or 256. "
             "Uses a 6GiB SSD expert cache by default; set DS4F_FAST_CACHE_GIB=1..6 to override.\n",
             program);
 }
@@ -52,6 +53,21 @@ static int cache_bytes_from_env(uint64_t *out) {
     if (errno || end == text || *end || !(gib >= 1.0 && gib <= 6.0)) return -1;
     *out = (uint64_t)(gib * 1024.0 * 1024.0 * 1024.0);
     return *out ? 0 : -1;
+}
+
+static int context_tokens_from_env(int *out) {
+    if (!out) return -1;
+    const char *text = getenv("DS4F_FAST_CONTEXT_K");
+    if (!text || !text[0]) {
+        *out = DS4F_FAST_CONTEXT_DEFAULT;
+        return 0;
+    }
+    char *end = NULL;
+    errno = 0;
+    long kib = strtol(text, &end, 10);
+    if (errno || end == text || *end || (kib != 128 && kib != 256)) return -1;
+    *out = (int)kib * 1024;
+    return 0;
 }
 
 static int enter_reference_dir(const char *program) {
@@ -102,6 +118,11 @@ int main(int argc, char **argv) {
         return 2;
     }
 
+    int context_size = 0;
+    if (context_tokens_from_env(&context_size)) {
+        fprintf(stderr, "ds4f-fast: DS4F_FAST_CONTEXT_K must be 128 or 256\n");
+        return 2;
+    }
     char model_path[PATH_MAX];
     if (!realpath(argv[1], model_path)) {
         perror(argv[1]);
@@ -135,7 +156,7 @@ int main(int argc, char **argv) {
     ds4_engine_options options = {
         .model_path = model_path,
         .backend = DS4_BACKEND_METAL,
-        .context_size = DS4F_FAST_CONTEXT,
+        .context_size = context_size,
         .mtp_draft_tokens = 1,
         .mtp_margin = 3.0f,
         .ssd_streaming = true,
@@ -159,7 +180,7 @@ int main(int argc, char **argv) {
 
     output_state output = { .engine = engine };
     int rc = ds4_engine_generate_argmax(engine, &prompt_tokens, tokens,
-                                        DS4F_FAST_CONTEXT, emit_token,
+                                        context_size, emit_token,
                                         finish_output, &output, NULL, NULL);
     ds4_tokens_free(&prompt_tokens);
     ds4_engine_close(engine);
