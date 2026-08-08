@@ -19,6 +19,7 @@ static id<MTLComputePipelineState> g_iq2_pipeline;
 static id<MTLComputePipelineState> g_iq2_pair_pipeline;
 static id<MTLComputePipelineState> g_iq2_probe_pipeline;
 static id<MTLComputePipelineState> g_q2_pipeline;
+static id<MTLComputePipelineState> g_swiglu_weight_pipeline;
 static id<MTLBuffer> g_iq2_signed_grid;
 static NSMutableDictionary<NSString *, id<MTLBuffer>> *g_buffers;
 static NSMutableArray<NSString *> *g_order;
@@ -380,6 +381,24 @@ static const char *g_expert_kernel_source =
 "    }\n"
 "}\n";
 
+static const char *g_swiglu_kernel_source =
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"kernel void ds4f_swiglu_weight(\n"
+"    device const float *gate [[buffer(0)]],\n"
+"    device const float *up [[buffer(1)]],\n"
+"    device const float *weights [[buffer(2)]],\n"
+"    device float *mid [[buffer(3)]],\n"
+"    constant uint &width [[buffer(4)]],\n"
+"    uint gid [[thread_position_in_grid]]) {\n"
+"  uint slot = gid / width;\n"
+"  float g = gate[gid];\n"
+"  float u = up[gid];\n"
+"  if (g > 10.0f) g = 10.0f;\n"
+"  if (u > 10.0f) u = 10.0f;\n"
+"  if (u < -10.0f) u = -10.0f;\n"
+"  mid[gid] = (g / (1.0f + exp(-g))) * u * weights[slot];\n"
+"}\n";
 static uint64_t cache_limit_from_env(void) {
     const char *s = getenv("DS4F_METAL_CACHE_GIB");
     double gib = s && s[0] ? strtod(s, NULL) : 10.0;
@@ -390,7 +409,7 @@ static uint64_t cache_limit_from_env(void) {
 
 static int metal_init(void) {
     if (g_initialized) return g_pipeline && g_q8_group_pipeline && g_q8_pair_pipeline && g_iq2_pipeline && g_iq2_pair_pipeline && g_iq2_probe_pipeline &&
-        g_q2_pipeline && g_iq2_signed_grid ? 0 : -1;
+        g_q2_pipeline && g_swiglu_weight_pipeline && g_iq2_signed_grid ? 0 : -1;
     g_initialized = 1;
     @autoreleasepool {
         g_device = MTLCreateSystemDefaultDevice();
@@ -469,6 +488,18 @@ static int metal_init(void) {
         g_q2_pipeline = [g_device newComputePipelineStateWithFunction:q2_fn error:&error];
         if (!g_q2_pipeline) {
             fprintf(stderr, "ds4f: Metal Q2 pipeline failed: %s\n", error.localizedDescription.UTF8String);
+            return -1;
+        }
+        NSString *swiglu_source = [NSString stringWithUTF8String:g_swiglu_kernel_source];
+        id<MTLLibrary> swiglu_library = [g_device newLibraryWithSource:swiglu_source options:options error:&error];
+        if (!swiglu_library) {
+            fprintf(stderr, "ds4f: Metal SwiGLU library compile failed: %s\n", error.localizedDescription.UTF8String);
+            return -1;
+        }
+        id<MTLFunction> swiglu_fn = [swiglu_library newFunctionWithName:@"ds4f_swiglu_weight"];
+        g_swiglu_weight_pipeline = [g_device newComputePipelineStateWithFunction:swiglu_fn error:&error];
+        if (!g_swiglu_weight_pipeline) {
+            fprintf(stderr, "ds4f: Metal SwiGLU pipeline failed: %s\n", error.localizedDescription.UTF8String);
             return -1;
         }
         build_iq2_signed_grid();
@@ -1074,6 +1105,46 @@ int ds4f_metal_iq2_probe(const ds4f_gguf *g, const ds4f_tensor *t,
             return -1;
         }
         *out_value = *(const float *)[output contents];
+    }
+    return 0;
+}
+
+int ds4f_metal_swiglu_weight(const float *gate, const float *up,
+                             const float *weights, size_t count, size_t width,
+                             float *out) {
+    if (!gate || !up || !weights || !out || !count || !width ||
+        count > UINT32_MAX || width > UINT32_MAX || count > SIZE_MAX / width)
+        return -1;
+    const size_t total = count * width;
+    @autoreleasepool {
+        if (metal_init() != 0 || !g_swiglu_weight_pipeline) return -1;
+        id<MTLBuffer> gate_buffer = [g_device newBufferWithLength:total * sizeof(float)
+                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> up_buffer = [g_device newBufferWithLength:total * sizeof(float)
+                                                          options:MTLResourceStorageModeShared];
+        id<MTLBuffer> weight_buffer = [g_device newBufferWithLength:count * sizeof(float)
+                                                              options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_buffer = [g_device newBufferWithLength:total * sizeof(float)
+                                                           options:MTLResourceStorageModeShared];
+        if (!gate_buffer || !up_buffer || !weight_buffer || !out_buffer) return -1;
+        memcpy([gate_buffer contents], gate, total * sizeof(float));
+        memcpy([up_buffer contents], up, total * sizeof(float));
+        memcpy([weight_buffer contents], weights, count * sizeof(float));
+        const uint32_t width32 = (uint32_t)width;
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:g_swiglu_weight_pipeline];
+        [enc setBuffer:gate_buffer offset:0 atIndex:0];
+        [enc setBuffer:up_buffer offset:0 atIndex:1];
+        [enc setBuffer:weight_buffer offset:0 atIndex:2];
+        [enc setBuffer:out_buffer offset:0 atIndex:3];
+        [enc setBytes:&width32 length:sizeof(width32) atIndex:4];
+        [enc dispatchThreads:MTLSizeMake(total, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [enc endEncoding];
+        [cb commit]; [cb waitUntilCompleted];
+        if (cb.status != MTLCommandBufferStatusCompleted) return -1;
+        memcpy(out, [out_buffer contents], total * sizeof(float));
     }
     return 0;
 }

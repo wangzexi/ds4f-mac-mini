@@ -413,6 +413,23 @@ static int ffn_layer(const ds4f_gguf *g, int layer, int token,
         }
         free(single_gate); free(cpu_up); free(cpu_gate);
     }
+    if (getenv("DS4F_VALIDATE_METAL_SWIGLU") && layer == 0) {
+        const size_t moe_width = (size_t)USED * FF;
+        float *gpu_mid = malloc(moe_width * sizeof(*gpu_mid));
+        float *cpu_mid = malloc(moe_width * sizeof(*cpu_mid));
+        if (!gpu_mid || !cpu_mid ||
+            ds4f_metal_swiglu_weight(gate_batch, up_batch, ew, USED, FF, gpu_mid)) {
+            fprintf(stderr, "ds4f Metal SwiGLU diagnostic failed\n");
+        } else {
+            ds4f_swiglu(cpu_mid, gate_batch, up_batch, moe_width, 10.0f);
+            for (int s = 0; s < USED; ++s)
+                for (int i = 0; i < FF; ++i)
+                    cpu_mid[(size_t)s * FF + i] *= ew[s];
+            print_compare("ds4f Metal/CPU weighted SwiGLU", gpu_mid, cpu_mid, moe_width);
+        }
+        free(cpu_mid);
+        free(gpu_mid);
+    }
     for (int s = 0; s < USED; ++s) {
         float *expert_gate = gate_batch + (size_t)s * FF;
         float *expert_up = up_batch + (size_t)s * FF;
