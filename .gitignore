@@ -1,0 +1,25 @@
+# Model weights and third-party reference checkouts are intentionally local-only.
+*.gguf
+/reference-ds4/
+/reference-deepspec/
+/reference-kimi-k3-in-c/
+
+# Generated model inventories.
+/0731-q2-inventory-summary.json
+/0731-q2-inventory.json
+/0731-q2-manifest.json
+
+# Build artifacts and experimental binaries.
+*.o
+/bin/
+/ds4f-dspark-probe
+/ds4f-first-token
+/ds4f-first-token-metal
+/ds4f-generate
+/ds4f-generate-metal
+/ds4f-layer0
+/ds4f-probe
+/ds4f-tokenize
+
+# macOS metadata.
+.DS_Store
