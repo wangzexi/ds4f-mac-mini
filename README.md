@@ -99,6 +99,8 @@ env DS4_DSPARK_SSD_NONRESIDENT=1 DS4_DSPARK_SCHEDULER=0 DS4_DSPARK_STATS=1 DS4_D
 
 该命令实际生成了 5-token Markov draft，首 token 为 target 的 `1309`，sequential verifier 提交 1 个 token；最终输出 `We need` 与同一 `--temp 0` 的 target-only 输出完全一致。当前 proposal 约 603ms、逐 token verifier 约 2240ms、总 generation 约 0.59 token/s，仍**不加速**。它的价值是把实验从“全量 support 映射会挤压 16GB”推进到可运行的按专家读取正确性闭环；默认部署仍使用上文 `ds4f-fast` target-only 路径。
 
+随后在 `/tmp` 做的 target batch-verifier 探针会先重装 target 静态 views，再以 SSD expert cache 验证整段草稿并回滚/replay；6-token 输出也逐字节等于 target-only。然而一次 5-token 草稿只接受 2 个 draft token，batch verify 为约 7685ms、精确 replay 为约 2630ms、总 generation 约 0.33 token/s，慢于顺序 verifier。该探针没有进入 `patches/` 或部署二进制；在 16GB SSD 约束下，只有能同时提高 acceptance 且避免 replay 的 verifier 才有加速可能。
+
 在 Mini 上运行：
 
 ```sh
