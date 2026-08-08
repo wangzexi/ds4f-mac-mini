@@ -24,9 +24,10 @@ static void gen_dump_f32(const char *name, const float *x, size_t n, uint32_t la
  */
 __attribute__((weak))
 int ds4f_metal_attention_decode(const float *q, const float *raw_kv,
-                                const float *sinks, uint32_t n_raw,
-                                float *out) {
-    (void)q; (void)raw_kv; (void)sinks; (void)n_raw; (void)out;
+                                const float *comp_kv, const float *sinks,
+                                uint32_t n_raw, uint32_t n_comp, float *out) {
+    (void)q; (void)raw_kv; (void)comp_kv; (void)sinks;
+    (void)n_raw; (void)n_comp; (void)out;
     return -1;
 }
 
@@ -101,6 +102,46 @@ static void gen_dump_f32(const char *name, const float *x, size_t n,
 
 /* Binary checkpoints for differential testing against DwarfStar's Metal
  * graph dumps.  They are disabled unless DS4F_DUMP_PREFIX is set. */
+/* Optional exact-input injection for one differential-attention checkpoint.
+ * The prefix names dumps as PREFIX_Qcur-L_posP.bin, PREFIX_KVcur-L_posR.bin,
+ * and PREFIX_KVcompress-L_posR.bin.  It is inactive unless all three
+ * DS4F_ATTN_OVERRIDE_* variables are set. */
+static int gen_read_dump_f32(const char *prefix, const char *name,
+                             int layer, uint32_t pos, float *dst, size_t n) {
+    char path[1024];
+    const int written = snprintf(path, sizeof(path), "%s_%s-%d_pos%u.bin",
+                                 prefix, name, layer, pos);
+    if (written < 0 || (size_t)written >= sizeof(path)) return -1;
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+    const size_t got = fread(dst, sizeof(*dst), n, fp);
+    const int closed = fclose(fp);
+    return got == n && closed == 0 ? 0 : -1;
+}
+
+static int gen_override_attention_inputs(int layer, uint32_t pos,
+                                         float *q, gen_layer_cache *c) {
+    const char *prefix = getenv("DS4F_ATTN_OVERRIDE_PREFIX");
+    const char *layer_env = getenv("DS4F_ATTN_OVERRIDE_LAYER");
+    const char *pos_env = getenv("DS4F_ATTN_OVERRIDE_POS");
+    if (!prefix || !prefix[0] || !layer_env || !pos_env) return 0;
+    if ((int)strtol(layer_env, NULL, 10) != layer ||
+        (uint32_t)strtoul(pos_env, NULL, 10) != pos) return 0;
+    if (gen_read_dump_f32(prefix, "Qcur", layer, pos, q, Q) != 0) return -1;
+    if (c->n_raw != pos + 1u) return -1;
+    for (uint32_t r = 0; r < c->n_raw; ++r) {
+        if (gen_read_dump_f32(prefix, "KVcur", layer, r,
+                              c->raw + (size_t)r * HD, HD) != 0) return -1;
+    }
+    for (uint32_t r = 0; r < c->n_comp; ++r) {
+        const uint32_t comp_pos = (r + 1u) * c->ratio - 1u;
+        if (gen_read_dump_f32(prefix, "KVcompress", layer, comp_pos,
+                              c->comp + (size_t)r * HD, HD) != 0) return -1;
+    }
+    fprintf(stderr, "ds4f: injected reference attention inputs at layer %d pos %u\n",
+            layer, pos);
+    return 1;
+}
 static void gen_cache_init(gen_cache *c, uint32_t max_ctx) {
     memset(c, 0, sizeof(*c));
     if (max_ctx < GEN_RAW) max_ctx = GEN_RAW;
@@ -279,6 +320,7 @@ static int gen_compress(const ds4f_gguf *g, int layer, const float *x,
         gen_rope(out, 1, dim, ROT, pos + 1 - ratio, layer, 0);
         if (index) { gen_hadamard128(out); gen_fp4(out); }
         else fp8_kv_round(out);
+        if (!index) gen_dump_f32("KVcompress", out, dim, (uint32_t)layer, pos);
         free(pooled);
         if (ratio == 4) {
             for (uint32_t r = 0; r < ratio; ++r) {
@@ -339,6 +381,7 @@ static void gen_attention(const ds4f_gguf *g, int layer, uint32_t pos,
     const ds4f_tensor *wkv = layer_tensor(g, layer, "attn_kv", n, sizeof(n));
     if (ds4f_matvec_pair_shared_input(g, wq_a, wkv, norm, qr, kv))
         gen_die("attention Q/KV projection failed");
+    gen_dump_f32("KVraw", kv, HD, (uint32_t)layer, pos);
     float *qaw = NULL; load_tensor(g, layer_tensor(g, layer, "attn_q_a_norm", n, sizeof(n)), (void **)&qaw);
     ds4f_rms_norm(qrn, qr, qaw, QR, 1e-6f); free(qaw);
     ds4f_matvec(g, layer_tensor(g, layer, "attn_q_b", n, sizeof(n)), qrn, q);
@@ -346,8 +389,10 @@ static void gen_attention(const ds4f_gguf *g, int layer, uint32_t pos,
     float *kvw = NULL; load_tensor(g, layer_tensor(g, layer, "attn_kv_a_norm", n, sizeof(n)), (void **)&kvw);
     ds4f_rms_norm(kv, kv, kvw, HD, 1e-6f); free(kvw);
     gen_rope(q, HEAD, HD, ROT, pos, layer, 0);
+    gen_dump_f32("KVnorm", kv, HD, (uint32_t)layer, pos);
     gen_dump_f32("Qcur", q, Q, (uint32_t)layer, pos);
     gen_rope(kv, 1, HD, ROT, pos, layer, 0);
+    gen_dump_f32("KVrope", kv, HD, (uint32_t)layer, pos);
     fp8_kv_round(kv);
     gen_dump_f32("KVcur", kv, HD, (uint32_t)layer, pos);
     gen_push_raw(c, kv);
@@ -361,12 +406,15 @@ static void gen_attention(const ds4f_gguf *g, int layer, uint32_t pos,
         }
         free(comp_tmp);
     }
+    if (gen_override_attention_inputs(layer, pos, q, c) < 0)
+        gen_die("reference attention input injection failed");
     bool *allow = c->ratio == 4 ? gen_index_allowed(g, layer, norm, qrn, c, pos) : NULL;
     float *sinks = NULL; load_tensor(g, layer_tensor(g, layer, "attn_sinks", n, sizeof(n)), (void **)&sinks);
     float inv = 1.0f / sqrtf((float)HD); uint32_t total = c->n_raw + c->n_comp;
     int attention_on_gpu =
-        getenv("DS4F_FORCE_CPU_ATTENTION") == NULL && c->n_comp == 0 &&
-        ds4f_metal_attention_decode(q, c->raw, sinks, c->n_raw, heads) == 0;
+        getenv("DS4F_FORCE_CPU_ATTENTION") == NULL && !allow &&
+        ds4f_metal_attention_decode(q, c->raw, c->comp, sinks,
+                                    c->n_raw, c->n_comp, heads) == 0;
     if (!attention_on_gpu) {
     for (int h = 0; h < HEAD; ++h) {
         const float *qh = q + (size_t)h * HD; float maxs = sinks[h];
@@ -389,6 +437,7 @@ static void gen_attention(const ds4f_gguf *g, int layer, uint32_t pos,
     }
     }
     free(sinks); free(allow);
+    gen_dump_f32("kqv_out", heads, Q, (uint32_t)layer, pos);
     gen_rope(heads, HEAD, HD, ROT, pos, layer, 1);
     gen_dump_f32("kqv_back", heads, Q, (uint32_t)layer, pos);
     ds4f_matvec_group(g, layer_tensor(g, layer, "attn_output_a", n, sizeof(n)), heads, GROUPS, GROUP_IN, LOW, low);

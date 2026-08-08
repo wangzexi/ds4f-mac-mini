@@ -2,12 +2,16 @@ CC ?= cc
 CFLAGS ?= -O2 -Wall -Wextra -Werror -std=c11
 
 DS4F_FAST_CORE_OBJS = reference-ds4/ds4.o reference-ds4/ds4_distributed.o reference-ds4/ds4_tp.o reference-ds4/ds4_ssd.o reference-ds4/ds4_metal.o reference-ds4/ds4_layer_pack.o
-.PHONY: all metal fast dspark clean ds4f-fast-reference
+.PHONY: all metal fast check-production dspark clean ds4f-fast-reference
 all: ds4f-probe ds4f-layer0 ds4f-first-token ds4f-tokenize ds4f-generate
 
 metal: ds4f-generate-metal ds4f-first-token-metal
 
 fast: ds4f-fast ds4f-reuse
+check-production: ds4f-fast
+	@test -n "$(MODEL)" || { echo "usage: make check-production MODEL=/path/to/Flash-0731.gguf" >&2; exit 2; }
+	./scripts/check-production-regression.sh ./ds4f-fast "$(MODEL)"
+
 dspark: ds4f-dspark-probe
 
 ds4f-probe: src/ds4f_probe.o src/ds4f_gguf.o

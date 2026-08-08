@@ -14,10 +14,10 @@ static id<MTLComputePipelineState> g_attention_pipeline;
 static int g_attention_initialized;
 
 /*
- * Short-context raw-KV decode kernel.  The threadgroup layout deliberately
- * follows the model's 64 x 512 head geometry: lane zero forms the softmax
- * scores, then all 32 lanes accumulate independent output dimensions.
- * This is a narrow numerical probe before the full prefill kernel is moved.
+ * The <=32-row path mirrors DwarfStar's raw decode FlashAttention exactly:
+ * F16 Q/K/V conversion, one SIMD group, four float4 dot partials per lane,
+ * and its online softmax/sink ordering.  Longer contexts retain the former
+ * probe until the split-workgroup reduction is brought over as well.
  */
 static const char *g_attention_source =
 "#include <metal_stdlib>\n"
@@ -31,6 +31,53 @@ static const char *g_attention_source =
 "    constant uint &round_q [[buffer(5)]],\n"
 "    uint head [[threadgroup_position_in_grid]],\n"
 "    uint lane [[thread_index_in_threadgroup]]) {\n"
+"  if (nrows <= 32u) {\n"
+"    const uint qoff = head * 512u;\n"
+"    device const float4 *q4 = (device const float4 *)(q + qoff);\n"
+"    device const float4 *kv4 = (device const float4 *)kv;\n"
+"    float score = -65504.0f;\n"
+"    for (uint cc = 0u; cc < 32u; ++cc) {\n"
+"      float partial = 0.0f;\n"
+"      if (cc < nrows) {\n"
+"        for (uint ii = 0u; ii < 4u; ++ii) {\n"
+"          const float4 qq = (float4)(half4)q4[ii * 32u + lane];\n"
+"          const float4 kk = (float4)(half4)kv4[cc * 128u + ii * 32u + lane];\n"
+"          partial += dot(kk, qq);\n"
+"        }\n"
+"      }\n"
+"      const float dotv = simd_sum(partial);\n"
+"      if (cc == lane && cc < nrows) score = dotv * 0.04419417382415922f;\n"
+"    }\n"
+"    threadgroup float ss[32];\n"
+"    ss[lane] = score;\n"
+"    simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    float M = simd_max(max(-FLT_MAX/2.0f, score));\n"
+"    const float vs = exp(score - M);\n"
+"    float S = simd_sum(vs);\n"
+"    ss[lane] = vs;\n"
+"    simdgroup_barrier(mem_flags::mem_threadgroup);\n"
+"    float4 o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;\n"
+"    for (uint cc = 0u; cc < nrows; ++cc) {\n"
+"      const float w = ss[cc];\n"
+"      o0 += (float4)(half4)kv4[cc * 128u + 0u * 32u + lane] * w;\n"
+"      o1 += (float4)(half4)kv4[cc * 128u + 1u * 32u + lane] * w;\n"
+"      o2 += (float4)(half4)kv4[cc * 128u + 2u * 32u + lane] * w;\n"
+"      o3 += (float4)(half4)kv4[cc * 128u + 3u * 32u + lane] * w;\n"
+"    }\n"
+"    const float m = M;\n"
+"    const float sink = lane == 0u ? sinks[head] : -FLT_MAX/2.0f;\n"
+"    M = simd_max(max(M, sink));\n"
+"    const float ms = exp(m - M);\n"
+"    const float sinkv = exp(sink - M);\n"
+"    S = S * ms + simd_sum(sinkv);\n"
+"    o0 *= ms; o1 *= ms; o2 *= ms; o3 *= ms;\n"
+"    const float invs = S == 0.0f ? 0.0f : 1.0f / S;\n"
+"    ((device float4 *)(out + qoff))[0u * 32u + lane] = o0 * invs;\n"
+"    ((device float4 *)(out + qoff))[1u * 32u + lane] = o1 * invs;\n"
+"    ((device float4 *)(out + qoff))[2u * 32u + lane] = o2 * invs;\n"
+"    ((device float4 *)(out + qoff))[3u * 32u + lane] = o3 * invs;\n"
+"    return;\n"
+"  }\n"
 "  threadgroup float logits[128];\n"
 "  threadgroup float maxv;\n"
 "  threadgroup float den;\n"
@@ -97,18 +144,28 @@ static int attention_init(void) {
 }
 
 int ds4f_metal_attention_decode(const float *q, const float *raw_kv,
-                                const float *sinks, uint32_t n_raw,
-                                float *out) {
-    if (!q || !raw_kv || !sinks || !out || n_raw == 0 || n_raw > DS4F_ATTN_RAW_MAX)
+                                const float *comp_kv, const float *sinks,
+                                uint32_t n_raw, uint32_t n_comp, float *out) {
+    const uint32_t n_keys = n_raw + n_comp;
+    if (!q || !raw_kv || !sinks || !out || n_raw == 0 || n_keys > DS4F_ATTN_RAW_MAX ||
+        (n_comp && !comp_kv))
         return -1;
     @autoreleasepool {
         if (attention_init() != 0) return -1;
         const NSUInteger q_bytes = DS4F_ATTN_HEADS * DS4F_ATTN_HEAD_DIM * sizeof(float);
-        const NSUInteger kv_bytes = (NSUInteger)n_raw * DS4F_ATTN_HEAD_DIM * sizeof(float);
+        const NSUInteger kv_bytes = (NSUInteger)n_keys * DS4F_ATTN_HEAD_DIM * sizeof(float);
+        float *joined_kv = malloc(kv_bytes);
+        if (!joined_kv) return -1;
+        memcpy(joined_kv, raw_kv, (size_t)n_raw * DS4F_ATTN_HEAD_DIM * sizeof(float));
+        if (n_comp) {
+            memcpy(joined_kv + (size_t)n_raw * DS4F_ATTN_HEAD_DIM, comp_kv,
+                   (size_t)n_comp * DS4F_ATTN_HEAD_DIM * sizeof(float));
+        }
         id<MTLBuffer> qb = [g_attention_device newBufferWithBytes:q length:q_bytes
                                                            options:MTLResourceStorageModeShared];
-        id<MTLBuffer> kvb = [g_attention_device newBufferWithBytes:raw_kv length:kv_bytes
+        id<MTLBuffer> kvb = [g_attention_device newBufferWithBytes:joined_kv length:kv_bytes
                                                             options:MTLResourceStorageModeShared];
+        free(joined_kv);
         id<MTLBuffer> sb = [g_attention_device newBufferWithBytes:sinks
                                                             length:DS4F_ATTN_HEADS * sizeof(float)
                                                            options:MTLResourceStorageModeShared];
@@ -122,7 +179,7 @@ int ds4f_metal_attention_decode(const float *q, const float *raw_kv,
         [enc setBuffer:kvb offset:0 atIndex:1];
         [enc setBuffer:sb offset:0 atIndex:2];
         [enc setBuffer:ob offset:0 atIndex:3];
-        [enc setBytes:&n_raw length:sizeof(n_raw) atIndex:4];
+        [enc setBytes:&n_keys length:sizeof(n_keys) atIndex:4];
         const uint32_t round_q = getenv("DS4F_METAL_ATTENTION_F32_Q") == NULL;
         [enc setBytes:&round_q length:sizeof(round_q) atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake(DS4F_ATTN_HEADS, 1, 1)

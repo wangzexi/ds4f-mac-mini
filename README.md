@@ -25,6 +25,8 @@
 自写运行器已完成独立 GGUF、tokenizer、原始/压缩 KV cache、连续 greedy decode 和 Metal Q8/IQ2/Q2 路径。空 chat prompt 的 8-token 历史回归只能证明这一条极小输入可连续运行，不能外推为通用数值正确性。
 
 2026-08-09 实际生成审计：同一渲染 chat 输入下，自写 Metal 与 `ds4f-fast` 在中文短提示词前 4 个 token ID 一致；但英文 `Explain one plus one in one word.` 在共同首 token `One` 后分叉为自写 Metal 的 `.` 与部署路径的 ` word`。同一自写代码的 CPU 路径输出 `One word`，因此问题在自写 Metal 数值累积，而非模型、tokenizer 或硬件随机性。`ds4f-generate-metal` 仅作研究/差分工具，**不得作为部署或数值基线**；部署只使用 `ds4f-fast` 的参考完整 Metal graph。设置 `DS4F_FAST_TRACE_IDS=1` 可输出部署路径 token ID 以做回归。
+同日的差分定位进一步确认：将参考图导出的 Q、raw KV 与 compressed KV 注入自写的短上下文合并 FlashAttention 后，`kqv_back` 相对误差为 `5.0e-8`；attention 规约已足够接近。剩余分叉来自自写通用 Q8 图在前序层留下约 `1e-5` 的状态差，少数值跨过 E4M3/FP8 舍入中点后放大。因此不能以自写 runner 的速度或输出作部署结论。生产路径的实际 token-ID 回归由 `make check-production MODEL=/path/to/Flash-0731.gguf` 固定：英文 `6111 2004 28`，中文 `28669 8570 988 819`；所有速度改动都必须通过它。
+
 
 自写路径仍是实验运行器：默认 10GiB Metal weight cache 下，短 prompt prefill 约 10 秒，decode 约 2.6–2.8 秒/token（约 0.37 token/s）。性能差距来自逐层 CPU/Metal 同步和专家切片调度。`ds4f-fast` 已把同一模型接入完整单-token Metal graph、GPU router 与 SSD expert cache，当前是 Mini 上的实际推荐入口；下一阶段才是把这张图改为项目自有实现。
 
