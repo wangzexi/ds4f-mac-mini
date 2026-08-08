@@ -264,17 +264,23 @@ static const char *g_expert_kernel_source =
 "    }\n"
 "    y[0] = sum;\n"
 "}\n"
-"kernel void iq2_pair(device const char *wa [[buffer(0)]],\n"
-"                     device const char *wb [[buffer(1)]],\n"
-"                     device const float *x [[buffer(2)]],\n"
+"kernel void iq2_pair(device const ulong *addrs_a [[buffer(0)]],\n"
+"                     device const ulong *addrs_b [[buffer(1)]],\n"
+"                     device const float *x_base [[buffer(2)]],\n"
 "                     device const int *signed_grid [[buffer(3)]],\n"
 "                     device float *ya [[buffer(4)]],\n"
 "                     device float *yb [[buffer(5)]],\n"
 "                     constant uint &in_dim [[buffer(6)]],\n"
 "                     constant uint &rows [[buffer(7)]],\n"
-"                     uint tg [[threadgroup_position_in_grid]],\n"
+"                     constant uint &input_stride [[buffer(8)]],\n"
+"                     uint3 tgpig [[threadgroup_position_in_grid]],\n"
 "                     uint lane [[thread_index_in_threadgroup]]) {\n"
-"    const uint first_row = tg * 4u;\n"
+"    const uint expert_slot = tgpig.z;\n"
+"    if (addrs_a[expert_slot] == 0ul || addrs_b[expert_slot] == 0ul) return;\n"
+"    device const char *wa = reinterpret_cast<device const char *>(addrs_a[expert_slot]);\n"
+"    device const char *wb = reinterpret_cast<device const char *>(addrs_b[expert_slot]);\n"
+"    device const float *x = x_base + expert_slot * input_stride;\n"
+"    const uint first_row = tgpig.x * 4u;\n"
 "    if (first_row >= rows) return;\n"
 "    const uint blocks = in_dim / 256u;\n"
 "    const uint row_bytes = 66u * blocks;\n"
@@ -327,7 +333,7 @@ static const char *g_expert_kernel_source =
 "        for (uint r = 0; r < 4u; ++r) {\n"
 "            float suma = 0.0f, sumb = 0.0f;\n"
 "            for (uint i = 0; i < 32u; ++i) { suma += pa[r][i]; sumb += pb[r][i]; }\n"
-"            if (first_row + r < rows) { ya[first_row + r] = suma; yb[first_row + r] = sumb; }\n"
+"            if (first_row + r < rows) { ya[expert_slot * rows + first_row + r] = suma; yb[expert_slot * rows + first_row + r] = sumb; }\n"
 "        }\n"
 "    }\n"
 "}\n"
@@ -994,13 +1000,13 @@ static int metal_iq2_rows_pair(const ds4f_gguf *g,
                                float *ya, size_t ya_stride,
                                float *yb, size_t yb_stride,
                                const ds4f_tensor *prefetch) {
-    if (!g || !a || !b || !experts || !count || !x || !ya || !yb ||
+    if (!g || !a || !b || !experts || !count || count > 6u || !x || !ya || !yb ||
         a->type != 16 || b->type != 16 || a->n_dims != 3 || b->n_dims != 3 ||
         a->dims[0] != b->dims[0] || a->dims[1] != b->dims[1] ||
         a->dims[2] != b->dims[2] || in != a->dims[0] ||
-        (x_stride && x_stride < in) || ya_stride < a->dims[1] ||
-        yb_stride < b->dims[1] || a->nbytes % a->dims[2] ||
-        b->nbytes % b->dims[2]) return -1;
+        (x_stride && x_stride < in) || x_stride > UINT32_MAX ||
+        ya_stride < a->dims[1] || yb_stride < b->dims[1] ||
+        a->nbytes % a->dims[2] || b->nbytes % b->dims[2]) return -1;
     @autoreleasepool {
         if (metal_init() != 0 || !g_iq2_pair_pipeline) return -1;
         size_t rows = (size_t)a->dims[1];
@@ -1013,13 +1019,16 @@ static int metal_iq2_rows_pair(const ds4f_gguf *g,
                                                      options:MTLResourceStorageModeShared];
         id<MTLBuffer> out_b = [g_device newBufferWithLength:count * rows * sizeof(float)
                                                      options:MTLResourceStorageModeShared];
-        if (!input || !out_a || !out_b) return -1;
+        id<MTLBuffer> addresses_a = [g_device newBufferWithLength:count * sizeof(uint64_t)
+                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> addresses_b = [g_device newBufferWithLength:count * sizeof(uint64_t)
+                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> weights_a[6] = { nil, nil, nil, nil, nil, nil };
+        id<MTLBuffer> weights_b[6] = { nil, nil, nil, nil, nil, nil };
+        if (!input || !out_a || !out_b || !addresses_a || !addresses_b) return -1;
         memcpy([input contents], x, input_floats * sizeof(float));
-        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        [enc setComputePipelineState:g_iq2_pair_pipeline];
-        uint32_t in32 = (uint32_t)in, rows32 = (uint32_t)rows;
-        NSUInteger groups = (rows + 3) / 4;
+        uint64_t *table_a = [addresses_a contents];
+        uint64_t *table_b = [addresses_b contents];
         for (size_t i = 0; i < count; ++i) {
             if (experts[i] >= a->dims[2]) return -1;
             ds4f_tensor slice_a = *a;
@@ -1028,21 +1037,36 @@ static int metal_iq2_rows_pair(const ds4f_gguf *g,
             slice_b.file_offset += (uint64_t)experts[i] * expert_bytes_b;
             slice_a.nbytes = expert_bytes_a;
             slice_b.nbytes = expert_bytes_b;
-            id<MTLBuffer> weight_a = get_weight(g, &slice_a);
-            id<MTLBuffer> weight_b = get_weight(g, &slice_b);
-            if (!weight_a || !weight_b) return -1;
-            [enc setBuffer:weight_a offset:0 atIndex:0];
-            [enc setBuffer:weight_b offset:0 atIndex:1];
-            NSUInteger input_offset = (NSUInteger)(x_stride ? i * x_stride : 0) * sizeof(float);
-            [enc setBuffer:input offset:input_offset atIndex:2];
-            [enc setBuffer:g_iq2_signed_grid offset:0 atIndex:3];
-            [enc setBuffer:out_a offset:i * rows * sizeof(float) atIndex:4];
-            [enc setBuffer:out_b offset:i * rows * sizeof(float) atIndex:5];
-            [enc setBytes:&in32 length:sizeof(in32) atIndex:6];
-            [enc setBytes:&rows32 length:sizeof(rows32) atIndex:7];
-            [enc dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
-                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            weights_a[i] = get_weight(g, &slice_a);
+            weights_b[i] = get_weight(g, &slice_b);
+            if (!weights_a[i] || !weights_b[i]) return -1;
+            table_a[i] = (uint64_t)[weights_a[i] gpuAddress];
+            table_b[i] = (uint64_t)[weights_b[i] gpuAddress];
+            if (!table_a[i] || !table_b[i]) return -1;
         }
+        [addresses_a didModifyRange:NSMakeRange(0, count * sizeof(uint64_t))];
+        [addresses_b didModifyRange:NSMakeRange(0, count * sizeof(uint64_t))];
+        id<MTLCommandBuffer> cb = [g_queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:g_iq2_pair_pipeline];
+        uint32_t in32 = (uint32_t)in, rows32 = (uint32_t)rows;
+        uint32_t input_stride32 = (uint32_t)x_stride;
+        NSUInteger groups = (rows + 3) / 4;
+        [enc setBuffer:addresses_a offset:0 atIndex:0];
+        [enc setBuffer:addresses_b offset:0 atIndex:1];
+        [enc setBuffer:input offset:0 atIndex:2];
+        [enc setBuffer:g_iq2_signed_grid offset:0 atIndex:3];
+        [enc setBuffer:out_a offset:0 atIndex:4];
+        [enc setBuffer:out_b offset:0 atIndex:5];
+        [enc setBytes:&in32 length:sizeof(in32) atIndex:6];
+        [enc setBytes:&rows32 length:sizeof(rows32) atIndex:7];
+        [enc setBytes:&input_stride32 length:sizeof(input_stride32) atIndex:8];
+        for (size_t i = 0; i < count; ++i) {
+            [enc useResource:weights_a[i] usage:MTLResourceUsageRead];
+            [enc useResource:weights_b[i] usage:MTLResourceUsageRead];
+        }
+        [enc dispatchThreadgroups:MTLSizeMake(groups, 1, count)
+              threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         [enc endEncoding];
         [cb commit];
         if (prefetch && !getenv("DS4F_DISABLE_DOWN_PREFETCH"))
