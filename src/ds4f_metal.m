@@ -536,7 +536,7 @@ static id<MTLBuffer> get_weight(const ds4f_gguf *g, const ds4f_tensor *t) {
         (void)old;
     }
     id<MTLBuffer> buffer = nil;
-    if (getenv("DS4F_METAL_NO_COPY")) {
+    if (getenv("DS4F_METAL_FORCE_COPY") == NULL) {
         /* The payload is 16 KiB-aligned and remains owned by the MTLBuffer
          * until LRU eviction.  This avoids a second copy for SSD-streamed
          * weight slices on Apple unified memory. */
