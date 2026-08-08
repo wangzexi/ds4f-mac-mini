@@ -507,6 +507,13 @@ static id<MTLBuffer> get_weight(const ds4f_gguf *g, const ds4f_tensor *t) {
     id<MTLBuffer> existing = g_buffers[key];
     if (existing) {
         ++g_cache_hits;
+        if (g_buffer_is_expert[key].boolValue) {
+            const NSUInteger index = [g_order indexOfObject:key];
+            if (index != NSNotFound) {
+                [g_order removeObjectAtIndex:index];
+                [g_order addObject:key];
+            }
+        }
         return existing;
     }
     if (t->nbytes > g_cache_limit || t->nbytes > SIZE_MAX) return nil;
