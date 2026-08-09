@@ -15,6 +15,8 @@
 enum {
     DS4F_FAST_CONTEXT_DEFAULT = 131072,
     DS4F_FAST_DEFAULT_TOKENS = 16,
+    DS4F_FAST_COMPACT_DIRECT_CACHE_EXPERTS = 440,
+    DS4F_FAST_COMPACT_CONTEXT_MAX = 32 * 1024,
 };
 
 static const uint64_t DS4F_FAST_DEFAULT_CACHE_BYTES = 6ull * 1024ull * 1024ull * 1024ull;
@@ -27,8 +29,9 @@ typedef struct {
 static void usage(const char *program) {
     fprintf(stderr,
             "usage: %s MODEL.gguf [PROMPT] [TOKENS]\n"
-            "Defaults to 128K context; set DS4F_FAST_CONTEXT_K=32, 128, or 256. "
-            "Uses a 6GiB SSD expert cache by default; set DS4F_FAST_CACHE_GIB=1..6 to override.\n",
+            "Defaults to 128K context; set DS4F_FAST_CONTEXT_K=8, 16, 24, 32, 128, or 256. "
+            "At contexts up to 32K, the default is a direct 440-expert cache; setting DS4F_FAST_CACHE_GIB forces the legacy total-budget mode. "
+            "At 128K or 256K, the default is a 6GiB SSD expert cache; set DS4F_FAST_CACHE_GIB=1..6 to override.\n",
             program);
 }
 
@@ -65,7 +68,7 @@ static int context_tokens_from_env(int *out) {
     char *end = NULL;
     errno = 0;
     long kib = strtol(text, &end, 10);
-    if (errno || end == text || *end || (kib != 32 && kib != 128 && kib != 256)) return -1;
+    if (errno || end == text || *end || (kib != 8 && kib != 16 && kib != 24 && kib != 32 && kib != 128 && kib != 256)) return -1;
     *out = (int)kib * 1024;
     return 0;
 }
@@ -120,9 +123,12 @@ int main(int argc, char **argv) {
 
     int context_size = 0;
     if (context_tokens_from_env(&context_size)) {
-        fprintf(stderr, "ds4f-fast: DS4F_FAST_CONTEXT_K must be 32, 128, or 256\n");
+        fprintf(stderr, "ds4f-fast: DS4F_FAST_CONTEXT_K must be 8, 16, 24, 32, 128, or 256\n");
         return 2;
     }
+    const char *cache_override = getenv("DS4F_FAST_CACHE_GIB");
+    const bool use_compact_direct_expert_cache =
+        context_size <= DS4F_FAST_COMPACT_CONTEXT_MAX && (!cache_override || !cache_override[0]);
     char model_path[PATH_MAX];
     if (!realpath(argv[1], model_path)) {
         perror(argv[1]);
@@ -160,7 +166,9 @@ int main(int argc, char **argv) {
         .mtp_draft_tokens = 1,
         .mtp_margin = 3.0f,
         .ssd_streaming = true,
-        .ssd_streaming_cache_bytes = cache_bytes,
+        .ssd_streaming_cache_experts = use_compact_direct_expert_cache ?
+            DS4F_FAST_COMPACT_DIRECT_CACHE_EXPERTS : 0,
+        .ssd_streaming_cache_bytes = use_compact_direct_expert_cache ? 0 : cache_bytes,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &options) != 0 || !engine) {
