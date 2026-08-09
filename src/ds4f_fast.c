@@ -36,16 +36,6 @@ static void enable_exact_cpu_router(void) {
     (void)setenv("DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER", "1", 0);
 }
 
-#ifdef DS4F_SPEED_BUILD
-static int prepare_anchored_route_speed(size_t prompt_token_count) {
-    char after_token[32];
-    const int written = snprintf(after_token, sizeof(after_token), "%zu", prompt_token_count);
-    if (written < 0 || (size_t)written >= sizeof(after_token)) return -1;
-    if (setenv("DS4F_SPEED_ANCHORED_ROUTE", "1", 1) != 0) return -1;
-    return setenv("DS4F_SPEED_ROUTE_AFTER_TOKEN", after_token, 1);
-}
-#endif
-
 static void usage(const char *program) {
     fprintf(stderr,
             "usage: %s MODEL.gguf [PROMPT] [TOKENS]\n"
@@ -221,15 +211,6 @@ int main(int argc, char **argv) {
         ds4_engine_close(engine);
         return 1;
     }
-#ifdef DS4F_SPEED_BUILD
-    if (prepare_anchored_route_speed(prompt_tokens.len) != 0) {
-        fprintf(stderr, "ds4f-speed: failed to configure anchored-route mode\n");
-        ds4_tokens_free(&prompt_tokens);
-        ds4_engine_close(engine);
-        return 1;
-    }
-#endif
-
     output_state output = { .engine = engine };
     int rc = ds4_engine_generate_argmax(engine, &prompt_tokens, tokens,
                                         context_size, emit_token,

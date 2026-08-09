@@ -1,0 +1,158 @@
+--- a/ds4.c
++++ b/ds4.c
+@@ -20940,6 +20940,70 @@
+     }
+     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+         selected_i32[i] = (int32_t)selected[i];
++    }
++    const char *cache_mass_text = getenv("DS4F_SPEED_CACHE_AWARE_MASS_PCT");
++    if (cache_mass_text && cache_mass_text[0] && g->ssd_streaming &&
++        DS4_N_EXPERT_USED <= 32u) {
++        char *mass_end = NULL;
++        const long mass_pct = strtol(cache_mass_text, &mass_end, 10);
++        uint64_t gate_expert_bytes = 0;
++        uint64_t down_expert_bytes = 0;
++        if (mass_end != cache_mass_text && *mass_end == '\0' &&
++            mass_pct >= 1 && mass_pct <= 100 &&
++            streaming_layer_gate_down_expert_bytes(layer,
++                                                   &gate_expert_bytes,
++                                                   &down_expert_bytes)) {
++            const ds4_gpu_stream_expert_table table =
++                graph_stream_expert_table_make(model,
++                                               layer,
++                                               il,
++                                               gate_expert_bytes,
++                                               down_expert_bytes);
++            const uint32_t resident_mask =
++                ds4_gpu_stream_expert_cache_resident_mask(&table,
++                                                          selected_i32,
++                                                          DS4_N_EXPERT_USED);
++            bool keep[DS4_MAX_EXPERT_USED] = {0};
++            float total_mass = 0.0f;
++            float kept_mass = 0.0f;
++            uint32_t kept = 0;
++            for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
++                if (weights[i] > 0.0f) total_mass += weights[i];
++                if ((resident_mask & (1u << i)) != 0) {
++                    keep[i] = true;
++                    kept_mass += weights[i];
++                    kept++;
++                }
++            }
++            const float target_mass = total_mass * (float)mass_pct / 100.0f;
++            while (kept == 0 || kept_mass < target_mass) {
++                uint32_t best = UINT32_MAX;
++                float best_weight = -1.0f;
++                for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
++                    if (!keep[i] && weights[i] > best_weight) {
++                        best = i;
++                        best_weight = weights[i];
++                    }
++                }
++                if (best == UINT32_MAX) break;
++                keep[best] = true;
++                kept_mass += weights[best];
++                kept++;
++            }
++            if (kept != 0 && kept < DS4_N_EXPERT_USED && kept_mass > 0.0f) {
++                uint32_t fallback = 0;
++                while (fallback < DS4_N_EXPERT_USED && !keep[fallback]) fallback++;
++                const float renorm = total_mass / kept_mass;
++                for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
++                    if (keep[i]) {
++                        weights[i] *= renorm;
++                    } else {
++                        selected_i32[i] = selected_i32[fallback];
++                        weights[i] = 0.0f;
++                    }
++                }
++            }
++        }
+     }
+     const double t_cpu = profile ? now_sec() : 0.0;
+ 
+--- a/ds4_gpu.h
++++ b/ds4_gpu.h
+@@ -163,6 +163,10 @@
+     uint64_t    gate_expert_bytes;
+     uint64_t    down_expert_bytes;
+ } ds4_gpu_stream_expert_table;
++uint32_t ds4_gpu_stream_expert_cache_resident_mask(
++        const ds4_gpu_stream_expert_table *table,
++        const int32_t                     *selected_ids,
++        uint32_t                           n_selected);
+ /* Reset only the prompt-local eviction heuristic.  The resident SSD expert
+  * cache itself is intentionally kept warm across sessions. */
+ void ds4_gpu_stream_expert_cache_reset_route_hotness(void);
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -10539,11 +10539,68 @@
+     }
+     return budget;
+ }
++
++static int ds4_gpu_stream_expert_cache_entry_matches(
++        const ds4_gpu_stream_expert_cache_entry *e,
++        const void *model_map,
++        uint64_t    model_size,
++        uint64_t    gate_abs_offset,
++        uint64_t    up_abs_offset,
++        uint64_t    down_abs_offset,
++        uint64_t    gate_expert_bytes,
++        uint64_t    down_expert_bytes);
+ 
+ uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
+     return g_stream_expert_cache_entry_count;
+ }
++
++uint32_t ds4_gpu_stream_expert_cache_resident_mask(
++        const ds4_gpu_stream_expert_table *table,
++        const int32_t                     *selected_ids,
++        uint32_t                           n_selected) {
++    if (!g_ssd_streaming_mode || !table || !selected_ids ||
++        table->layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
++        n_selected == 0 || n_selected > 32u ||
++        table->n_total_expert == 0 ||
++        table->n_total_expert > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
++        return 0;
++    }
+ 
++    uint32_t mask = 0;
++    for (uint32_t i = 0; i < n_selected; i++) {
++        if (selected_ids[i] < 0 ||
++            (uint32_t)selected_ids[i] >= table->n_total_expert) {
++            continue;
++        }
++        const uint64_t expert = (uint64_t)(uint32_t)selected_ids[i];
++        if (expert > UINT64_MAX / table->gate_expert_bytes ||
++            expert > UINT64_MAX / table->down_expert_bytes) {
++            continue;
++        }
++        const uint64_t gate_rel = expert * table->gate_expert_bytes;
++        const uint64_t down_rel = expert * table->down_expert_bytes;
++        if (gate_rel > UINT64_MAX - table->gate_offset ||
++            gate_rel > UINT64_MAX - table->up_offset ||
++            down_rel > UINT64_MAX - table->down_offset) {
++            continue;
++        }
++        const ds4_gpu_stream_expert_cache_entry *entry =
++            &g_stream_expert_cache[table->layer][(uint32_t)selected_ids[i]];
++        if (ds4_gpu_stream_expert_cache_entry_matches(
++                    entry,
++                    table->model_map,
++                    table->model_size,
++                    table->gate_offset + gate_rel,
++                    table->up_offset + gate_rel,
++                    table->down_offset + down_rel,
++                    table->gate_expert_bytes,
++                    table->down_expert_bytes)) {
++            mask |= 1u << i;
++        }
++    }
++    return mask;
++}
++
+ uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
+         uint64_t gate_expert_bytes,
+         uint64_t down_expert_bytes) {
+
