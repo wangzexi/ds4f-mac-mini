@@ -27,7 +27,7 @@ typedef struct {
 static void usage(const char *program) {
     fprintf(stderr,
             "usage: %s MODEL.gguf [PROMPT] [TOKENS]\n"
-            "Defaults to 128K context; set DS4F_FAST_CONTEXT_K=128 or 256. "
+            "Defaults to 128K context; set DS4F_FAST_CONTEXT_K=32, 128, or 256. "
             "Uses a 6GiB SSD expert cache by default; set DS4F_FAST_CACHE_GIB=1..6 to override.\n",
             program);
 }
@@ -65,7 +65,7 @@ static int context_tokens_from_env(int *out) {
     char *end = NULL;
     errno = 0;
     long kib = strtol(text, &end, 10);
-    if (errno || end == text || *end || (kib != 128 && kib != 256)) return -1;
+    if (errno || end == text || *end || (kib != 32 && kib != 128 && kib != 256)) return -1;
     *out = (int)kib * 1024;
     return 0;
 }
@@ -120,7 +120,7 @@ int main(int argc, char **argv) {
 
     int context_size = 0;
     if (context_tokens_from_env(&context_size)) {
-        fprintf(stderr, "ds4f-fast: DS4F_FAST_CONTEXT_K must be 128 or 256\n");
+        fprintf(stderr, "ds4f-fast: DS4F_FAST_CONTEXT_K must be 32, 128, or 256\n");
         return 2;
     }
     char model_path[PATH_MAX];

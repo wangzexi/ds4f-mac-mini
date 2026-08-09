@@ -18,7 +18,7 @@
 - Metal 权重 cache 对专家 buffer 命中会刷新 LRU 次序；默认 10GiB 的空 prompt 8-token 回归中，专家 SSD 读取从 11.85GiB 降至 10.75GiB（miss 5739→5238），greedy token 不变。
 - 路由结果确定后，会在 gate/up Metal command buffer 执行期间预取同一批专家的 down 权重；8-token 空 prompt 对照中 decode 从约 2.75 秒/token 降至约 2.59 秒/token，`DS4F_DISABLE_DOWN_PREFETCH=1` 可作诊断开关。
 - `ds4f-fast` 的部署路径仍是 target-only；DSpark 仅在下文隔离的 DwarfStar 实验中接入，不能作为部署默认值。
-- `ds4f-fast` 是可选的快速部署入口：仅支持固定 Flash 0731 模型，复用 reference-ds4 的公开 engine API 与 Metal graph；默认 128K context，设 `DS4F_FAST_CONTEXT_K=256` 可切换至 256K；默认 6GiB SSD expert cache，可用 `DS4F_FAST_CACHE_GIB=1..6` 调整。
+- `ds4f-fast` 是可选的快速部署入口：仅支持固定 Flash 0731 模型，复用 reference-ds4 的公开 engine API 与 Metal graph；默认 128K context；设 `DS4F_FAST_CONTEXT_K=32` 启用 32K，设 `DS4F_FAST_CONTEXT_K=256` 启用 256K；默认 6GiB SSD expert cache，可用 `DS4F_FAST_CACHE_GIB=1..6` 调整。
 
 2026-08-08/09 在 Mini 上重新验证：target-only SSD streaming 路径能够在 M4/16GB 上实际输出 token。`ds4f-fast` 通过 DwarfStar 的公开 engine API 复用已验证的完整 Metal graph；空 chat prompt（3 个 prompt token）连续生成 8 token，输出 `DeepSeek-V2, released in`，generation 为 **1.83 token/s**（6GiB cache）。在同一 16-token 对照中，6GiB 为 **1.86 token/s**，4GiB 为 **1.67 token/s**；连续生成应保持 6GiB 默认。因此“16GB 机器上把这个固定模型跑起来”的目标已有可部署入口。
 
@@ -46,8 +46,9 @@ make fast
 
 `--ssd-streaming` 是在 16GB 机器上成立的关键；不要省略。`ds4f-fast` 默认使用 6GiB 专家 cache：完整 8-token 空 prompt 回归为 1.83 token/s，输出与数值基线一致；最新相同 16-token 请求对照中，6GiB 为 **1.86 token/s**，4GiB 为 **1.67 token/s**，因此保持默认 6GiB。8GiB 会因 macOS 无法锁住足够的专家页而显著退化。
 
-为这个限定的 Mini 部署，`ds4f-fast` 默认分配 **128K context**；`DS4F_FAST_CONTEXT_K=256` 启用 **256K context**。只接受这两个档位，避免把通用配置面带入 target-only 部署。
+为这个限定的 Mini 部署，`ds4f-fast` 默认分配 **128K context**；`DS4F_FAST_CONTEXT_K=32` 启用 **32K context**，`DS4F_FAST_CONTEXT_K=256` 启用 **256K context**。只接受这三个档位，避免把通用配置面带入 target-only 部署。
 
+2026-08-09 的真实 32K 满载验证：在 M4/16GB、6GiB SSD expert cache 下，32,024-token 输入完成预填充并输出 `Bob=34`、`Alice=52`；预填充为 **27.58 t/s**，但满 32K 历史上的 generation 仅 **0.16 t/s**。同一 32K 配置下，33-token 的中文不可逆删除决策正确输出“先备份再确认”，prefill 为 **2.09 t/s**、generation 为 **0.90 t/s**。32K 的内存计划为 7.84GiB（KV 0.61GiB、图 buffer 0.25GiB、398 个动态专家 2.62GiB）。增加总专家预算反而会使 macOS 内存压力造成 generation 退化：7GiB/549 experts 为 0.41 t/s，8GiB/701 experts 为 0.16 t/s；因此 32K 仍固定 6GiB cache。
 2026-08-09 在 M4/16GB 的实测中，128K 内存计划为 9.35GiB（KV 1.36GiB、图 buffer 1.00GiB、398 个动态专家 2.62GiB）；256K 为 10.35GiB（KV 2.36GiB、buffer 2.00GiB）。256K 会触发图工作集保护，把总专家预算从 6GiB 降至 5GiB，只保留 246 个动态专家，因此连续 8-token generation 实测约 **1.21 token/s**；128K 保留 398 个专家，实测约 **1.42 token/s**，是推荐默认值。两档均通过英文和中文 token-ID 回归；512 个重复片段的 batch prefill 均完成 43/43 层并输出 token（128K 22.65 t/s，256K 24.81 t/s）。
 
 
