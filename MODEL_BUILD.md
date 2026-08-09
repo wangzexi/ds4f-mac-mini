@@ -23,6 +23,21 @@ be random.
 - Quantizer base: `antirez/ds4` plus `tools/deepseek4-quantize.c`
 - Context target: 32768 tokens
 
+## Dry-run contract
+
+For the verified 0731 template, the build must report exactly 346 type changes:
+
+- 1 token embedding: F16 to Q4_K
+- 215 main attention projections: 43 layers times 5, Q8_0 to Q4_K
+- 129 shared-expert projections: 43 layers times 3, Q8_0 to Q4_K
+- 1 output projection: Q8_0 to Q4_K
+
+Expected output size is 82,853,553,024 bytes (77.163 GiB), saving 3.601
+GiB from the 86,720,111,488-byte template. The 21 indexer attention
+projections remain F16. Any different type-change count or unexpected router,
+indexer, normalization, mHC, compressor, or routed-expert change aborts the
+build.
+
 ## Required validation gates
 
 1. Source and backup GGUF sizes and SHA-256 hashes match their origins.
