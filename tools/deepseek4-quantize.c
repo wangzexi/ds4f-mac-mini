@@ -1147,6 +1147,7 @@ typedef struct {
 } quant_policy;
 
 static bool is_attention_projection(const char *name) {
+    if (strstr(name, ".indexer.") || strstr(name, "indexer_")) return false;
     return strstr(name, ".attn_kv.weight") || strstr(name, ".attn_q_a.weight") ||
            strstr(name, ".attn_q_b.weight") || strstr(name, ".attn_output_a.weight") ||
            strstr(name, ".attn_output_b.weight");
