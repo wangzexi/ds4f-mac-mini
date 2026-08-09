@@ -1669,7 +1669,7 @@ static void write_imatrix_kvs(FILE *fp, const imatrix_store *im) {
     }
 }
 
-static gguf_file load_gguf_metadata(const char *path) {
+static gguf_file load_gguf_metadata(const char *path, bool keep_imatrix_kv) {
     gguf_file g = {0};
     g.path = xstrdup(path);
     FILE *fp = fopen(path, "rb");
@@ -1713,7 +1713,7 @@ static gguf_file load_gguf_metadata(const char *path) {
          * otherwise the output can contain duplicate GGUF metadata with stale
          * and new values.
          */
-        if (!is_imatrix_kv_key(key)) {
+        if (keep_imatrix_kv || !is_imatrix_kv_key(key)) {
             kv_keep[n_kv_keep++] = (byte_span){
                 .start = (size_t)(rec_start - kv_start),
                 .end = (size_t)(rec_end - kv_start),
@@ -2853,6 +2853,9 @@ static params parse_args(int argc, char **argv) {
         return p;
     }
     if (!p.template_gguf) die("--template is required");
+    if (p.preserve_routed_template && p.imatrix_file) {
+        die("--preserve-routed-template cannot be combined with --imatrix");
+    }
     if (!p.dry_run && !p.compare_tensor && !p.out_gguf) die("--out is required unless --dry-run or --compare-tensor is used");
     if (p.compare_tensor && !p.compare_gguf) p.compare_gguf = p.template_gguf;
     if (p.out_gguf && file_exists(p.out_gguf) && !p.overwrite) die("output exists; use --overwrite");
@@ -2902,7 +2905,7 @@ static void compare_one_tensor(st_db *db, const gguf_file *tmpl, const output_co
             p->compare_tensor, ds4q_type_name(out_ctx->tensors[idx].type));
     byte_buf generated = generate_tensor(db, p->compare_tensor, &tmpl->tensors[idx],
                                          out_ctx->tensors[idx].type, p->n_experts, p->n_threads, imatrix);
-    gguf_file ref = load_gguf_metadata(p->compare_gguf);
+    gguf_file ref = load_gguf_metadata(p->compare_gguf, false);
     byte_buf reference = read_gguf_tensor_data(&ref, p->compare_gguf, p->compare_tensor);
     printf("tensor: %s\n", p->compare_tensor);
     printf("type: %s\n", ds4q_type_name(out_ctx->tensors[idx].type));
@@ -2945,7 +2948,7 @@ static void compare_dspark_support_tensor(st_db *db, const dspark_support_plan *
            fnv1a64_bytes(generated.data, generated.size));
 
     if (p->compare_gguf) {
-        gguf_file ref = load_gguf_metadata(p->compare_gguf);
+        gguf_file ref = load_gguf_metadata(p->compare_gguf, false);
         byte_buf reference = read_gguf_tensor_data(&ref, p->compare_gguf, p->compare_tensor);
         printf("reference_bytes: %zu\n", reference.size);
         printf("reference_fnv1a64: %016" PRIx64 "\n",
@@ -2999,7 +3002,8 @@ int main(int argc, char **argv) {
         return 0;
     }
 
-    gguf_file tmpl = load_gguf_metadata(p.template_gguf);
+    gguf_file tmpl = load_gguf_metadata(p.template_gguf,
+                                        p.preserve_routed_template);
     if (p.n_experts <= 0) {
         if (tmpl.n_experts > 0) {
             p.n_experts = tmpl.n_experts;
