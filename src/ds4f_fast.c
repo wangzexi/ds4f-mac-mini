@@ -40,9 +40,24 @@ static void usage(const char *program) {
     fprintf(stderr,
             "usage: %s MODEL.gguf [PROMPT] [TOKENS]\n"
             "Defaults to 128K context; set DS4F_FAST_CONTEXT_K=8, 16, 24, 32, 128, or 256. "
-            "At contexts up to 32K, the default is a direct 440-expert cache; setting DS4F_FAST_CACHE_GIB forces the legacy total-budget mode. "
+            "At contexts up to 32K, the default is a direct 440-expert cache; set DS4F_FAST_CACHE_EXPERTS=1..1200 for measured Q4 experiments, or DS4F_FAST_CACHE_GIB for the legacy total-budget mode. "
             "At 128K or 256K, the default is a 6GiB SSD expert cache; set DS4F_FAST_CACHE_GIB=1..6 to override.\n",
             program);
+}
+
+static int cache_experts_from_env(uint32_t *out) {
+    if (!out) return -1;
+    const char *text = getenv("DS4F_FAST_CACHE_EXPERTS");
+    if (!text || !text[0]) {
+        *out = DS4F_FAST_COMPACT_DIRECT_CACHE_EXPERTS;
+        return 0;
+    }
+    char *end = NULL;
+    errno = 0;
+    unsigned long value = strtoul(text, &end, 10);
+    if (errno || end == text || *end || value < 1 || value > 1200) return -1;
+    *out = (uint32_t)value;
+    return 0;
 }
 
 static int parse_positive(const char *text, int fallback) {
@@ -135,6 +150,11 @@ int main(int argc, char **argv) {
         fprintf(stderr, "ds4f-fast: DS4F_FAST_CACHE_GIB must be between 1 and 6\n");
         return 2;
     }
+    uint32_t direct_cache_experts = 0;
+    if (cache_experts_from_env(&direct_cache_experts)) {
+        fprintf(stderr, "ds4f-fast: DS4F_FAST_CACHE_EXPERTS must be between 1 and 1200\n");
+        return 2;
+    }
 
     int context_size = 0;
     if (context_tokens_from_env(&context_size)) {
@@ -142,9 +162,19 @@ int main(int argc, char **argv) {
         return 2;
     }
     const char *cache_override = getenv("DS4F_FAST_CACHE_GIB");
+    const char *expert_override = getenv("DS4F_FAST_CACHE_EXPERTS");
+    if (cache_override && cache_override[0] && expert_override && expert_override[0]) {
+        fprintf(stderr, "ds4f-fast: choose DS4F_FAST_CACHE_EXPERTS or DS4F_FAST_CACHE_GIB, not both\n");
+        return 2;
+    }
+    if (context_size > DS4F_FAST_COMPACT_CONTEXT_MAX &&
+        expert_override && expert_override[0]) {
+        fprintf(stderr, "ds4f-fast: DS4F_FAST_CACHE_EXPERTS is limited to 8K-32K contexts\n");
+        return 2;
+    }
 #ifdef DS4F_SPEED_BUILD
     if (context_size != DS4F_FAST_COMPACT_CONTEXT_MAX || (cache_override && cache_override[0])) {
-        fprintf(stderr, "ds4f-speed: only the tested 32K default-cache configuration is supported\n");
+        fprintf(stderr, "ds4f-speed: only 32K direct-expert-cache configurations are supported\n");
         return 2;
     }
 #endif
@@ -193,7 +223,7 @@ int main(int argc, char **argv) {
         .mtp_margin = 3.0f,
         .ssd_streaming = true,
         .ssd_streaming_cache_experts = use_compact_direct_expert_cache ?
-            DS4F_FAST_COMPACT_DIRECT_CACHE_EXPERTS : 0,
+            direct_cache_experts : 0,
         .ssd_streaming_cache_bytes = use_compact_direct_expert_cache ? 0 : cache_bytes,
     };
     ds4_engine *engine = NULL;
