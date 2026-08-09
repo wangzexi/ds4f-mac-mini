@@ -26,6 +26,12 @@ typedef struct {
     int emitted;
 } output_state;
 
+/* Keep the target model exact while avoiding per-layer router-ID readback. */
+static void enable_exact_cpu_router(void) {
+    if (getenv("DS4_METAL_DISABLE_STREAMING_IQ2_CPU_ROUTER")) return;
+    (void)setenv("DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER", "1", 0);
+}
+
 static void usage(const char *program) {
     fprintf(stderr,
             "usage: %s MODEL.gguf [TOKENS]\n"
@@ -148,6 +154,7 @@ int main(int argc, char **argv) {
     const char *cache_override = getenv("DS4F_FAST_CACHE_GIB");
     const bool use_compact_direct_expert_cache =
         context_size <= DS4F_FAST_COMPACT_CONTEXT_MAX && (!cache_override || !cache_override[0]);
+    enable_exact_cpu_router();
     char model_path[PATH_MAX];
     if (!realpath(argv[1], model_path)) {
         perror(argv[1]);

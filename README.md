@@ -69,7 +69,7 @@ make fast
 - 在旧 128K 布局中，prefill 后把动态缓存从 398 增至 440 槽（约 2.90GiB）会在首次 decode 的新增 6.75MiB 专家页上 `mlock` 失败并中断生成；这是旧布局无法采用 440 槽的原因。紧凑 8–32K 布局不分配该 prefill 保留区，因而可以从启动时直接锁定 440 槽。
 - 在 128K 下临时请求 7GiB 总专家预算（549 个专家）同样在约 2.99GiB `mlock` 处失败，保护逻辑将缓存降至 151 槽；不采用。
 
-因此，若目标是隐私优先的短任务子代理，推荐 `DS4F_FAST_CONTEXT_K=32` 的紧凑布局与 `ds4f-reuse` 常驻进程：它能正确完成很短的独立请求，第一条约 **0.90 token/s**，同提示词连续三条的第二、三条约 **1.01/1.07 token/s**。这仍远低于 5 token/s；缓存 profile 显示每层平均仍缺失 3.76 个所选专家，单纯把 context 上限从 32K 再降到 8K 不会解决问题。若需要跨过该上限，必须增加可锁定统一内存、提高存储吞吐，或实现能避免 target 精确 replay 的有效 speculative verifier。
+因此，若目标是隐私优先的短任务子代理，推荐 DS4F_FAST_CONTEXT_K=32 的紧凑布局与 ds4f-reuse 常驻进程。2026-08-09 的 exact CPU-router 变体会自动启用：它在 CPU 上对同一量化 gate 做完整 top-6 路由，再把相同专家 ID 与权重写回 Metal；没有减少专家或采用近似。英文、中文固定 token-ID 回归均通过；同一短中文请求连续两次各生成 8 token 为 **1.82 / 1.77 token/s**，约为原 GPU-router SSD 路径的两倍。设置 DS4_METAL_DISABLE_STREAMING_IQ2_CPU_ROUTER=1 可退回旧路径。它仍低于 5 token/s：profile 显示每层平均仍缺失约 3.76 个所选专家，单纯再降低 context 上限并不能解决 SSD expert miss。
 
 ### 多请求复用缓存
 
