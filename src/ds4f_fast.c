@@ -13,7 +13,11 @@
  * public engine boundary and its verified Metal graph implementation.
  */
 enum {
+#ifdef DS4F_SPEED_BUILD
+    DS4F_FAST_CONTEXT_DEFAULT = 32 * 1024,
+#else
     DS4F_FAST_CONTEXT_DEFAULT = 131072,
+#endif
     DS4F_FAST_DEFAULT_TOKENS = 16,
     DS4F_FAST_COMPACT_DIRECT_CACHE_EXPERTS = 440,
     DS4F_FAST_COMPACT_CONTEXT_MAX = 32 * 1024,
@@ -31,6 +35,16 @@ static void enable_exact_cpu_router(void) {
     if (getenv("DS4_METAL_DISABLE_STREAMING_IQ2_CPU_ROUTER")) return;
     (void)setenv("DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER", "1", 0);
 }
+
+#ifdef DS4F_SPEED_BUILD
+static int prepare_anchored_route_speed(size_t prompt_token_count) {
+    char after_token[32];
+    const int written = snprintf(after_token, sizeof(after_token), "%zu", prompt_token_count);
+    if (written < 0 || (size_t)written >= sizeof(after_token)) return -1;
+    if (setenv("DS4F_SPEED_ANCHORED_ROUTE", "1", 1) != 0) return -1;
+    return setenv("DS4F_SPEED_ROUTE_AFTER_TOKEN", after_token, 1);
+}
+#endif
 
 static void usage(const char *program) {
     fprintf(stderr,
@@ -82,12 +96,17 @@ static int context_tokens_from_env(int *out) {
 static int enter_reference_dir(const char *program) {
     char executable[PATH_MAX];
     char reference_dir[PATH_MAX];
+#ifdef DS4F_SPEED_BUILD
+    const char *engine_dir_name = "speed-ds4";
+#else
+    const char *engine_dir_name = "reference-ds4";
+#endif
     if (!realpath(program, executable)) return -1;
     char *slash = strrchr(executable, '/');
     if (!slash) return -1;
     *slash = '\0';
-    int written = snprintf(reference_dir, sizeof(reference_dir), "%s/reference-ds4",
-                           executable);
+    int written = snprintf(reference_dir, sizeof(reference_dir), "%s/%s",
+                           executable, engine_dir_name);
     if (written < 0 || (size_t)written >= sizeof(reference_dir)) return -1;
     return chdir(reference_dir);
 }
@@ -133,6 +152,12 @@ int main(int argc, char **argv) {
         return 2;
     }
     const char *cache_override = getenv("DS4F_FAST_CACHE_GIB");
+#ifdef DS4F_SPEED_BUILD
+    if (context_size != DS4F_FAST_COMPACT_CONTEXT_MAX || (cache_override && cache_override[0])) {
+        fprintf(stderr, "ds4f-speed: only the tested 32K default-cache configuration is supported\n");
+        return 2;
+    }
+#endif
     const bool use_compact_direct_expert_cache =
         context_size <= DS4F_FAST_COMPACT_CONTEXT_MAX && (!cache_override || !cache_override[0]);
     enable_exact_cpu_router();
@@ -170,7 +195,11 @@ int main(int argc, char **argv) {
         .model_path = model_path,
         .backend = DS4_BACKEND_METAL,
         .context_size = context_size,
+#ifdef DS4F_SPEED_BUILD
+        .mtp_draft_tokens = 0,
+#else
         .mtp_draft_tokens = 1,
+#endif
         .mtp_margin = 3.0f,
         .ssd_streaming = true,
         .ssd_streaming_cache_experts = use_compact_direct_expert_cache ?
@@ -192,6 +221,14 @@ int main(int argc, char **argv) {
         ds4_engine_close(engine);
         return 1;
     }
+#ifdef DS4F_SPEED_BUILD
+    if (prepare_anchored_route_speed(prompt_tokens.len) != 0) {
+        fprintf(stderr, "ds4f-speed: failed to configure anchored-route mode\n");
+        ds4_tokens_free(&prompt_tokens);
+        ds4_engine_close(engine);
+        return 1;
+    }
+#endif
 
     output_state output = { .engine = engine };
     int rc = ds4_engine_generate_argmax(engine, &prompt_tokens, tokens,

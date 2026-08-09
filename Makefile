@@ -7,7 +7,7 @@ all: ds4f-probe ds4f-layer0 ds4f-first-token ds4f-tokenize ds4f-generate
 
 metal: ds4f-generate-metal ds4f-first-token-metal
 
-fast: ds4f-fast ds4f-reuse
+fast: ds4f-fast ds4f-reuse ds4f-speed
 check-production: ds4f-fast
 	@test -n "$(MODEL)" || { echo "usage: make check-production MODEL=/path/to/Flash-0731.gguf" >&2; exit 2; }
 	./scripts/check-production-regression.sh ./ds4f-fast "$(MODEL)"
@@ -64,4 +64,16 @@ src/%.o: src/%.c src/ds4f_gguf.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f ds4f-probe ds4f-layer0 ds4f-first-token ds4f-first-token-metal ds4f-tokenize ds4f-generate ds4f-generate-metal ds4f-dspark-probe ds4f-fast ds4f-reuse src/*.o
+	rm -f ds4f-probe ds4f-layer0 ds4f-first-token ds4f-first-token-metal ds4f-tokenize ds4f-generate ds4f-generate-metal ds4f-dspark-probe ds4f-fast ds4f-reuse src/*.o ds4f-speed src/ds4f_fast_speed.o
+
+DS4F_SPEED_CORE_OBJS = speed-ds4/ds4.o speed-ds4/ds4_distributed.o speed-ds4/ds4_tp.o speed-ds4/ds4_ssd.o speed-ds4/ds4_metal.o speed-ds4/ds4_layer_pack.o
+
+ds4f-speed: src/ds4f_fast_speed.o ds4f-speed-reference
+	$(CC) $(CFLAGS) -o $@ src/ds4f_fast_speed.o $(DS4F_SPEED_CORE_OBJS) -framework Foundation -framework Metal -lm -pthread
+
+ds4f-speed-reference: scripts/prepare-speed-engine.sh
+	./scripts/prepare-speed-engine.sh
+	$(MAKE) -C speed-ds4 ds4
+
+src/ds4f_fast_speed.o: src/ds4f_fast.c ds4f-speed-reference
+	$(CC) $(CFLAGS) -DDS4F_SPEED_BUILD -Ispeed-ds4 -c -o $@ $<
