@@ -11,9 +11,10 @@ host=${DS4F_SERVER_HOST:-0.0.0.0}
 port=${DS4F_SERVER_PORT:-8000}
 context=${DS4F_SERVER_CONTEXT:-32768}
 tokens=${DS4F_SERVER_TOKENS:-4096}
-cache_experts=${DS4F_SERVER_CACHE_EXPERTS:-900}
-working_set_mib=${DS4F_SERVER_WORKING_SET_MIB:-8192}
+cache_experts=${DS4F_SERVER_CACHE_EXPERTS:-1000}
+working_set_mib=${DS4F_SERVER_WORKING_SET_MIB:-11776}
 pinned_mib=${DS4F_SERVER_PINNED_MIB:-4096}
+decode_pinned_mib=${DS4F_SERVER_DECODE_PINNED_MIB:-6144}
 reserve_mib=${DS4F_SERVER_MEMORY_RESERVE_MIB:-512}
 kv_cache_dir=${DS4F_SERVER_KV_CACHE_DIR:-$project_dir/cache/kv}
 kv_cache_mib=${DS4F_SERVER_KV_CACHE_MIB:-10240}
@@ -35,6 +36,7 @@ exec env \
     DS4_METAL_PREFILL_STAGE_ALIAS=1 \
     DS4_SERVER_WORKING_SET_MIB="$working_set_mib" \
     DS4_SERVER_PINNED_MIB="$pinned_mib" \
+    DS4_SERVER_DECODE_PINNED_MIB="$decode_pinned_mib" \
     DS4_SERVER_MEMORY_RESERVE_MIB="$reserve_mib" \
     DS4_KVSTORE_STRICT_LRU=1 \
     "$project_dir/ds4f-server" \

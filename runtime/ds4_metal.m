@@ -659,6 +659,8 @@ static id<MTLBuffer> g_stream_compact_selected_buffers[DS4_METAL_STREAM_EXPERT_C
 static id<MTLBuffer> g_stream_selected_id_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_validate_status_buffer;
 
+static uint32_t ds4_gpu_stream_expert_cache_apply_mlock_budget(void);
+
 @interface DS4MetalTensor : NSObject
 @property(nonatomic, strong) id<MTLBuffer> buffer;
 @property(nonatomic, assign) uint64_t offset;
@@ -3617,8 +3619,18 @@ uint32_t ds4_gpu_resize_streaming_expert_cache_budget(
     }
     if (pinned_experts > experts) pinned_experts = experts;
     const uint32_t old_budget = g_stream_expert_cache_budget_override;
+    const uint32_t old_mlock_budget =
+        g_stream_expert_cache_mlock_budget_override;
+    const int shrinking_total = experts < old_budget;
     g_stream_expert_cache_budget_override = experts;
     g_stream_expert_cache_mlock_budget_override = pinned_experts;
+    if (pinned_experts > old_mlock_budget) {
+        /* A larger phase follows a smaller prefill phase after its purgeable
+         * workspace has been discarded. A cap learned while that workspace
+         * was resident is stale, so allow one fresh kernel-accounted attempt. */
+        g_stream_expert_cache_mlock_budget_cap = 0;
+        g_stream_expert_cache_mlock_warned = 0;
+    }
     if (release_resident && experts < old_budget &&
         g_stream_expert_cache_entry_count > experts) {
         /* Entries may share multi-GiB virtual slabs.  Pruning entries alone
@@ -3626,6 +3638,14 @@ uint32_t ds4_gpu_resize_streaming_expert_cache_budget(
          * request memory planner needs the stronger operation so munlock and
          * slab release happen before large prefill scratch is touched. */
         ds4_gpu_stream_expert_cache_clear_all(0);
+    }
+    /* Lowering only the phase lock target must not throw away hot wired
+     * experts when the total cache still fits (the common short-prefill
+     * case). The lower target governs newly allocated slots. A real total
+     * shrink does unlock/release excess slots, while every growth applies the
+     * larger target immediately after prefill workspace purge. */
+    if (shrinking_total || pinned_experts >= old_mlock_budget) {
+        (void)ds4_gpu_stream_expert_cache_apply_mlock_budget();
     }
     return ds4_gpu_stream_expert_cache_configured_count();
 }
@@ -8074,7 +8094,7 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
 }
 
 uint64_t ds4_gpu_tensor_set_reusable(ds4_gpu_tensor *tensor, bool reusable) {
-#if TARGET_OS_OSX && defined(MADV_FREE_REUSABLE) && defined(MADV_FREE_REUSE)
+#if TARGET_OS_OSX
     if (!tensor) return 0;
     DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
     /* Views can overlap an owning allocation.  The workspace walker visits
@@ -8092,8 +8112,22 @@ uint64_t ds4_gpu_tensor_set_reusable(ds4_gpu_tensor *tensor, bool reusable) {
     if (leading >= obj.bytes) return 0;
     uint64_t bytes = (obj.bytes - leading) & ~(page - 1u);
     if (bytes == 0 || bytes > (uint64_t)SIZE_MAX) return 0;
-    const int advice = reusable ? MADV_FREE_REUSABLE : MADV_FREE_REUSE;
-    if (madvise((void *)aligned, (size_t)bytes, advice) != 0) return 0;
+    /* VM reusable advice alone may leave the shared Metal resource resident
+     * in the driver's allocator. These buffers are prefill-only scratch and
+     * are fully overwritten on every use, so Empty is the correct stronger
+     * phase boundary: discard physical backing while retaining the stable
+     * MTLBuffer object and virtual address. */
+    if (reusable) {
+#if defined(MADV_FREE_REUSABLE)
+        (void)madvise((void *)aligned, (size_t)bytes, MADV_FREE_REUSABLE);
+#endif
+        (void)[obj.buffer setPurgeableState:MTLPurgeableStateEmpty];
+    } else {
+        (void)[obj.buffer setPurgeableState:MTLPurgeableStateNonVolatile];
+#if defined(MADV_FREE_REUSE)
+        (void)madvise((void *)aligned, (size_t)bytes, MADV_FREE_REUSE);
+#endif
+    }
     obj.reusable = reusable ? 1 : 0;
     return bytes;
 #else
@@ -11689,18 +11723,10 @@ static void ds4_gpu_stream_expert_cache_cap_budget_to_locked(void) {
     uint32_t cap = g_stream_expert_cache_entry_count;
     const uint32_t locked_slots = ds4_gpu_stream_expert_slab_locked_slot_count();
     if (locked_slots != 0 && locked_slots < cap) cap = locked_slots;
-    const uint64_t gib = 1024ull * 1024ull * 1024ull;
-    uint64_t safe_gib = g_stream_expert_cache_mlock_bytes / gib;
-    if (safe_gib > 1) safe_gib--;
-    if (safe_gib != 0 && g_stream_expert_cache_expert_bytes != 0) {
-        uint64_t safe_bytes =
-            safe_gib > UINT64_MAX / gib ? UINT64_MAX : safe_gib * gib;
-        uint64_t safe_cap64 = safe_bytes / g_stream_expert_cache_expert_bytes;
-        if (safe_cap64 > UINT32_MAX) safe_cap64 = UINT32_MAX;
-        if (safe_cap64 != 0 && safe_cap64 < cap) {
-            cap = (uint32_t)safe_cap64;
-        }
-    }
+    /* Every currently locked slot has already passed the kernel's exact
+     * accounting check. Preserve that proven tier after the first rejected
+     * slot; subtracting a whole GiB here used to turn a successful 606-slot
+     * tier into an artificial 303-slot cap on the next request. */
     if (cap == 0) return;
     if (g_stream_expert_cache_mlock_budget_cap == 0 ||
         cap < g_stream_expert_cache_mlock_budget_cap) {
@@ -11966,6 +11992,42 @@ static int ds4_gpu_stream_expert_slab_unlock_slot(uint32_t slot) {
         g_stream_expert_cache_mlock_bytes = 0;
     }
     return 1;
+}
+
+static uint32_t ds4_gpu_stream_expert_cache_apply_mlock_budget(void) {
+    uint32_t total = g_stream_expert_cache_slab_total_slots;
+    if (total > DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES) {
+        total = DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES;
+    }
+    const uint32_t target = ds4_gpu_stream_expert_cache_configured_mlock_budget();
+    const uint32_t old_locked = ds4_gpu_stream_expert_slab_locked_slot_count();
+
+    if (target < total) {
+        for (uint32_t slot = target; slot < total; slot++) {
+            (void)ds4_gpu_stream_expert_slab_unlock_slot(slot);
+        }
+    }
+    const uint32_t lock_end = target < total ? target : total;
+    for (uint32_t slot = 0; slot < lock_end; slot++) {
+        (void)ds4_gpu_stream_expert_slab_lock_slot(slot);
+    }
+
+    const uint32_t locked = ds4_gpu_stream_expert_slab_locked_slot_count();
+    if (locked != old_locked) {
+        fprintf(stderr,
+                "ds4: streaming expert wired tier %u -> %u slots "
+                "(target=%u, allocated=%u, %.2f GiB locked)\n",
+                old_locked,
+                locked,
+                target,
+                total,
+                ds4_gpu_gib(g_stream_expert_cache_mlock_bytes));
+    }
+    return locked;
+}
+
+uint32_t ds4_gpu_stream_expert_cache_locked_count(void) {
+    return ds4_gpu_stream_expert_slab_locked_slot_count();
 }
 
 static int ds4_gpu_stream_expert_slab_slot_buffers(

@@ -57477,6 +57477,16 @@ uint32_t ds4_engine_resize_streaming_expert_cache(
 #endif
 }
 
+uint32_t ds4_engine_streaming_expert_cache_locked_count(ds4_engine *e) {
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+    if (!e || !e->ssd_streaming || e->backend != DS4_BACKEND_METAL) return 0;
+    return ds4_gpu_stream_expert_cache_locked_count();
+#else
+    (void)e;
+    return 0;
+#endif
+}
+
 int ds4_engine_tp_vocab_split(ds4_engine *e) {
     return e && e->tp.active && e->tp.vocab_split;
 }

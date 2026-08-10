@@ -8478,7 +8478,8 @@ struct server {
     int last_prefill_slot;
     bool dynamic_memory_planner;
     uint64_t memory_working_set_bytes;
-    uint64_t memory_pinned_bytes;
+    uint64_t memory_prefill_pinned_bytes;
+    uint64_t memory_decode_pinned_bytes;
     uint64_t memory_reserve_bytes;
     pthread_mutex_t mu;
     pthread_cond_t cv;
@@ -8579,11 +8580,11 @@ static uint32_t server_plan_expert_budget(
 }
 
 static uint32_t server_plan_pinned_expert_budget(
-        const server                     *s,
         const ds4_request_memory_profile *profile,
-        uint32_t                          total_experts) {
-    if (!s || !profile || profile->per_expert_bytes == 0) return 0;
-    uint64_t experts = s->memory_pinned_bytes / profile->per_expert_bytes;
+        uint32_t                          total_experts,
+        uint64_t                          pinned_bytes) {
+    if (!profile || profile->per_expert_bytes == 0) return 0;
+    uint64_t experts = pinned_bytes / profile->per_expert_bytes;
     if (experts > total_experts) experts = total_experts;
     if (experts > UINT32_MAX) experts = UINT32_MAX;
     return (uint32_t)experts;
@@ -8629,10 +8630,14 @@ static server_request_memory_plan server_build_request_memory_plan(
             &plan.prefill,
             DS4_SERVER_PREFILL_GRAPH_RESIDENCY_MULTIPLIER);
     plan.prefill_pinned_experts = server_plan_pinned_expert_budget(
-            s, &plan.prefill, plan.prefill_experts);
+            &plan.prefill,
+            plan.prefill_experts,
+            s->memory_prefill_pinned_bytes);
     plan.decode_experts = server_plan_expert_budget(s, &plan.decode, 1u);
     plan.decode_pinned_experts = server_plan_pinned_expert_budget(
-            s, &plan.decode, plan.decode_experts);
+            &plan.decode,
+            plan.decode_experts,
+            s->memory_decode_pinned_bytes);
     return plan;
 }
 
@@ -8647,6 +8652,8 @@ static void server_memory_plan_begin_prefill(
             plan->prefill_experts,
             plan->prefill_pinned_experts,
             true);
+    uint32_t locked =
+        ds4_engine_streaming_expert_cache_locked_count(s->engine);
     uint64_t reacquired = ds4_session_prepare_prefill_workspace(slot->session);
     pthread_mutex_unlock(&s->inference_mu);
     const uint64_t base = server_plan_base_bytes(
@@ -8654,7 +8661,7 @@ static void server_memory_plan_begin_prefill(
             &plan->prefill,
             DS4_SERVER_PREFILL_GRAPH_RESIDENCY_MULTIPLIER);
     server_log(DS4_LOG_PREFILL,
-               "ds4-server: memory plan prefill uncached=%d prompt=%d output=%d ctx=%d rows=%u base=%.2f GiB graph_scale=%u cache=%u/%.2f GiB pinned=%u/%.2f GiB workspace_reacquired=%.2f GiB",
+               "ds4-server: memory plan prefill uncached=%d prompt=%d output=%d ctx=%d rows=%u base=%.2f GiB graph_scale=%u cache=%u/%.2f GiB pinned_target=%u/%.2f GiB locked_now=%u workspace_reacquired=%.2f GiB",
                plan->uncached_tokens,
                plan->prompt_tokens,
                plan->output_tokens,
@@ -8668,6 +8675,7 @@ static void server_memory_plan_begin_prefill(
                plan->prefill_pinned_experts,
                (double)plan->prefill_pinned_experts *
                    (double)plan->prefill.per_expert_bytes / 1073741824.0,
+               locked,
                (double)reacquired / 1073741824.0);
 }
 
@@ -8683,9 +8691,11 @@ static void server_memory_plan_finish_prefill(
             plan->decode_experts,
             plan->decode_pinned_experts,
             false);
+    uint32_t locked =
+        ds4_engine_streaming_expert_cache_locked_count(s->engine);
     pthread_mutex_unlock(&s->inference_mu);
     server_log(DS4_LOG_PREFILL,
-               "ds4-server: memory plan decode ctx=%d cache=%u/%.2f GiB pinned=%u/%.2f GiB prefill_workspace_reusable=%.2f GiB",
+               "ds4-server: memory plan decode ctx=%d cache=%u/%.2f GiB pinned_target=%u/%.2f GiB locked_now=%u prefill_workspace_purged=%.2f GiB",
                plan->planned_context_tokens,
                applied,
                (double)applied * (double)plan->decode.per_expert_bytes /
@@ -8693,6 +8703,7 @@ static void server_memory_plan_finish_prefill(
                plan->decode_pinned_experts,
                (double)plan->decode_pinned_experts *
                    (double)plan->decode.per_expert_bytes / 1073741824.0,
+               locked,
                (double)released / 1073741824.0);
 }
 
@@ -13370,16 +13381,19 @@ int main(int argc, char **argv) {
         slot_count == 1 &&
         (!dynamic_memory || strcmp(dynamic_memory, "0") != 0);
     s.memory_working_set_bytes =
-        server_env_mib("DS4_SERVER_WORKING_SET_MIB", 8192);
-    s.memory_pinned_bytes =
+        server_env_mib("DS4_SERVER_WORKING_SET_MIB", 11776);
+    s.memory_prefill_pinned_bytes =
         server_env_mib("DS4_SERVER_PINNED_MIB", 4096);
+    s.memory_decode_pinned_bytes =
+        server_env_mib("DS4_SERVER_DECODE_PINNED_MIB", 6144);
     s.memory_reserve_bytes =
         server_env_mib("DS4_SERVER_MEMORY_RESERVE_MIB", 512);
     if (s.dynamic_memory_planner) {
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: per-request memory planner enabled working_set=%.2f GiB expert_lock_budget=%.2f GiB reserve=%.2f GiB prefill_graph_scale=%u",
+                   "ds4-server: per-request memory planner enabled working_set=%.2f GiB prefill_lock_budget=%.2f GiB decode_lock_budget=%.2f GiB reserve=%.2f GiB prefill_graph_scale=%u",
                    (double)s.memory_working_set_bytes / 1073741824.0,
-                   (double)s.memory_pinned_bytes / 1073741824.0,
+                   (double)s.memory_prefill_pinned_bytes / 1073741824.0,
+                   (double)s.memory_decode_pinned_bytes / 1073741824.0,
                    (double)s.memory_reserve_bytes / 1073741824.0,
                    DS4_SERVER_PREFILL_GRAPH_RESIDENCY_MULTIPLIER);
     } else if (cfg.engine.ssd_streaming && slot_count > 1) {

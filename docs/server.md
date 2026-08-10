@@ -20,7 +20,7 @@ make server
 scripts/run-server.sh
 ```
 
-默认监听 `0.0.0.0:8000`，使用 32K context、最多 900 个专家缓存槽；固定的
+默认监听 `0.0.0.0:8000`，使用 32K context、最多 1000 个专家缓存槽；固定的
 `deepseek-v4-flash` 模型 ID 默认直接回答，不进入 thinking。服务保留一个常驻
 session，并启用精确 CPU router、packed expert sidecar 和 Metal
 attention/FFN workspace 复用。可通过以下变量覆盖：
@@ -33,6 +33,7 @@ DS4F_SERVER_TOKENS
 DS4F_SERVER_CACHE_EXPERTS
 DS4F_SERVER_WORKING_SET_MIB
 DS4F_SERVER_PINNED_MIB
+DS4F_SERVER_DECODE_PINNED_MIB
 DS4F_SERVER_MEMORY_RESERVE_MIB
 DS4F_SERVER_KV_CACHE_DIR
 DS4F_SERVER_KV_CACHE_MIB
@@ -66,34 +67,45 @@ prefill 新增后缀。生产配置把最小保存长度设为 1 token，短对�
 - 固定模型常驻页、预计 KV、精确 prefill graph 行数和 512MiB 安全余量先扣除；
 - M4 实测 Metal prefill 物理驻留约为静态 graph 估计的 4 倍，因此 prefill
   规划按 `graph_bytes * 4` 计价，decode 仍按精确的单行 graph 计价；
-- 剩余的 8GiB 工作集预算决定总专家槽数，最多 900 槽；4GiB 锁页预算只决定
-  一级 wired cache（当前为 606 槽），额外槽构成可分页的二级缓存。
+- 剩余的 11.5GiB 工作集预算决定总专家槽数，最多1000槽。冷启动 prefill 先锁
+  4GiB（约606槽），草稿清空后 decode 扩到6GiB并补锁约910槽，因此900个热点
+  专家在系统wired余量充足时可以全部进入一级缓存，另约90槽作为可分页二级缓存；
+  余量不足时则保留内核已确认锁定的槽，其余槽仍可驻留但允许分页。后续短 prefill
+  不再机械地解锁910→606。只有 graph 估算真的挤占空间时，总专家槽才按精确
+  方案缩小并同步解锁，decode 再扩回1000槽。
 
 总槽数和锁页槽数已经解耦。macOS 拒绝继续 `mlock` 时只缩小 wired tier，不能再
 把整个专家缓存从 1000 槽误降到 455 槽。planner-driven 缩容会逐槽 `munlock`，
 并在释放旧 Metal slab 前设置 `MTLPurgeableStateEmpty`，避免驱动缓存旧物理后备、
 再与新 slab 和 prefill workspace 叠加。
 
-预填充结束后，约 2.91GiB 的 batch-only Metal workspace 会通过 macOS
-`MADV_FREE_REUSABLE` 标为可回收；tensor 地址和 KV 不变，下次 prefill 前再用
-`MADV_FREE_REUSE` 重新取得。因此 decode 可以继续使用专家缓存，而不会把上一轮
-预填充草稿永久作为不可回收内存保留。
+预填充结束后，约 2.91GiB 的 batch-only Metal workspace 会先通过 macOS
+`MADV_FREE_REUSABLE` 标为可回收，再把对应 Metal resource 设置为
+`MTLPurgeableStateEmpty`，立即丢弃物理后备但保留 tensor 地址；下次 prefill 前
+恢复为 `MTLPurgeableStateNonVolatile`。释放完成后，server 会把已有的可分页专家槽
+补锁进解码 wired tier；反向进入下一轮 prefill 时则按预算逐槽 `munlock`。
 
-默认预算为 8GiB 动态工作集、4GiB专家锁页、512MiB余量和900总槽。这不是简单
+默认预算为11.5GiB动态工作集、冷预填充4GiB/解码6GiB专家锁页、512MiB余量和1000总槽。这不是简单
 追求最大的 footprint；实机存在明确的 VM 性能悬崖：
 
 | 总槽 | 短提示 decode | `phys_footprint` | 结果 |
 |---:|---:|---:|---|
 | 600 | 约 2.32 t/s | 约 4.8GB | 原始稳定基线 |
-| 900 | 2.54–2.58 t/s | 约 6.8GB | 当前最优稳定点 |
-| 1000 | 约 2.52 t/s | 约 7.47GB | 无额外收益 |
+| 900 | 2.33–2.58 t/s | 约 6.8GB | 最小高性能点；全锁受启动时系统 wired 压力影响 |
+| 1000 | 2.19–2.52 t/s；热态实测2.38–2.49 | 约7.5GB | 当前生产点；实测wired tier为606–910槽 |
 | 1050 | 约 1.97 t/s | 约 7.81GB | 开始 VM 抖动 |
-| 1200 | 约 0.31 t/s | 约 8.82GB | 不可用 |
+| 1200 | purge前约0.31、purge后约1.23 t/s | 约8.8GB | 仍明显慢于1000槽 |
 
-阶段性规划实测：605-token prompt 使用844槽，prefill约36.2秒（16.7 t/s）；
-1005-token prompt 使用682槽，prefill约98.2秒（10.2 t/s）。连续缩容/扩容没有
-`mlock` 失败。修改 `*_WORKING_SET_MIB`、`*_PINNED_MIB` 或总槽上限后必须同时检查
-速度、`phys_footprint`、memory pressure 和日志，不能只以占用更大作为优化成功。
+这里的11.5GiB是动态安全上限，不是要求 `phys_footprint` 永久显示11.5GiB。
+decode 时被清空的2.91GiB草稿不应为了数字好看重新占满；未归属进程的余量会由
+macOS文件缓存吸收专家sidecar读取，并保留系统要求的不可用户锁页空间。实测1000槽
+时进程footprint约7.5GB，而整机空闲页已接近零，说明统一内存仍被有效利用。
+
+早期8GiB预算实测：605-token prompt 使用844槽，prefill约36.2秒（16.7 t/s）；
+1005-token prompt 使用682槽，prefill约98.2秒（10.2 t/s）。`mlock`仍受整机全局
+wired压力约束，失败时只保留已经被内核确认锁定的一级缓存，不影响额外可分页槽。
+修改 `*_WORKING_SET_MIB`、`*_PINNED_MIB` 或总槽上限后必须同时检查速度、
+`phys_footprint`、memory pressure 和日志，不能只以占用更大作为优化成功。
 
 服务器不提供身份验证；只应通过可信局域网或 Tailscale 暴露，不要直接映射到
 公网。

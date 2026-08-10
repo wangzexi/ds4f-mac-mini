@@ -259,6 +259,7 @@ uint32_t ds4_engine_resize_streaming_expert_cache(
         uint32_t    experts,
         uint32_t    pinned_experts,
         bool        release_resident);
+uint32_t ds4_engine_streaming_expert_cache_locked_count(ds4_engine *e);
 int ds4_engine_tp_vocab_split(ds4_engine *e);
 bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
                                         uint32_t layer,
