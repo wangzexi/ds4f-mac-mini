@@ -10,5 +10,7 @@ project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
     "$project_dir/q4-speed-ds4"
 patch -s -d "$project_dir/q4-speed-ds4" -p1 \
     < "$project_dir/patches/packed-expert-sidecar.patch"
+patch -s -d "$project_dir/q4-speed-ds4" -p1 \
+    < "$project_dir/patches/prefill-stage-workspace-alias.patch"
 
 echo "$project_dir/q4-speed-ds4"

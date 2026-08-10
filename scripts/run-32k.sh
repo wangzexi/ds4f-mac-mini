@@ -9,6 +9,7 @@ fi
 mode=$1
 prompt_input=$2
 max_tokens=${3:-32}
+cache_experts=${DS4F_FAST_CACHE_EXPERTS:-600}
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 model="$project_dir/reference-ds4/gguf/DeepSeek-V4-Flash-0731-Mini-Q4Trunk-IQ2Experts.gguf"
@@ -59,7 +60,7 @@ fi
 
 exec env \
     DS4F_FAST_CONTEXT_K=32 \
-    DS4F_FAST_CACHE_EXPERTS=600 \
+    DS4F_FAST_CACHE_EXPERTS="$cache_experts" \
     DS4F_SPEED_CACHE_AWARE_MASS_PCT="$mass" \
     DS4F_SPEED_CACHE_AWARE_MAX_ENTROPY_PCT="$max_entropy" \
     DS4_METAL_STREAMING_EXPERT_PACK_PATH="$pack" \
