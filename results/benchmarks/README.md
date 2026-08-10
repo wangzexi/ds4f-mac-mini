@@ -25,12 +25,25 @@ Without workspace aliasing, `8192` chunk + 256 expert slots failed to lock the c
 | 4096 chunk, old baseline, 600 slots | historical report incomplete | 27.36 t/s | `I` |
 | 8192 chunk, 256 slots, no alias | cannot lock; falls to 12 slots | not completed | — |
 | 8192 chunk, 256 slots, stage alias | 8.72GiB | **41.55 t/s** | `I` |
+| automatic 8192/256 + stage alias | runtime-selected after startup guard | **41.61 t/s** | `I` |
 
-The corrected 8.72GiB plan consists of 0.92GiB KV, 5.84GiB complete graph buffers, 0.28GiB resident model spans, and 1.69GiB expert cache. No `mlock` degradation occurred. The speedup over the old long-prompt baseline is about 51.9%. A 3,977-token one-chunk alias run measured 38.80 t/s, so doubling the chunk beyond 4096 adds only about 7% over the already-optimized one-chunk path; the 8192 mode remains opt-in because its memory margin is much smaller.
+The corrected 8.72GiB plan consists of 0.92GiB KV, 5.84GiB complete graph buffers, 0.28GiB resident model spans, and 1.69GiB expert cache. No `mlock` degradation occurred. The speedup over the old long-prompt baseline is about 52.1%. A 3,977-token one-chunk alias run measured 38.80 t/s, so doubling the chunk beyond 4096 adds only about 7% over the already-optimized one-chunk path.
+
+The fixed 32K runner now enables stage aliasing automatically. On the first request of a cold engine, prompts above 4,096 tokens automatically select an 8,192-token workspace and cap the cache to one full routed layer (256 experts). Warm reusable engines retain their existing cache instead of discarding useful expert pages. `DS4_METAL_DISABLE_PREFILL_AUTO_MEMORY=1` disables this policy; explicit prefill/cache environment variables remain available for diagnostics. The startup memory line is a conservative guard computed before the prompt is known; the later `prefill runtime plan` line reports the actual prompt-sized workspace and expert path.
 
 Exact 1,001-token regression with 4096 chunk produced `你好` both with and without alias (24.83 vs 24.97 t/s). This checks that the buffer views do not change that greedy result.
 
 KV-to-SSD is not the next optimization target. Even the 8192 plan has only 0.92GiB of KV, so offloading it recovers less than 1GiB while adding writes, reads, and synchronization to every layer. Batch workspace reuse and a 256-slot current-layer expert cache provide substantially more useful memory leverage.
+
+## Rejected pipeline experiments
+
+The production path keeps the original exact full-layer batch kernel above 760 prompt tokens. Raising the packed selected-address path to 8K changed the 992-token greedy output from `你好` to `#`, so it is not a valid optimization even though throughput was similar. The prototype and its asynchronous loader were removed from the build chain.
+
+Additional adjacent A/B tests did not justify more scheduling complexity:
+
+- two-layer preparation lookahead reduced the 992-token exact run from 11.22 to 9.95 t/s;
+- asynchronous selected-expert staging measured 2.73 t/s versus 2.87 t/s synchronously on the same short prompt;
+- after removing that prototype, the 992-token exact regression again produced `你好`, and the automatic 14,735-token run produced the historical first token `I`.
 
 Run a file directly by prefixing its path with `@`:
 
@@ -38,7 +51,13 @@ Run a file directly by prefixing its path with `@`:
 scripts/run-32k.sh exact @results/benchmarks/long-prompt-4k.txt 1
 ```
 
-Run the validated 8192 experiment with:
+The normal command now selects the validated long-prompt plan automatically:
+
+```sh
+scripts/run-32k.sh exact @results/benchmarks/long-prompt-15k.txt 1
+```
+
+The equivalent explicit diagnostic command is:
 
 ```sh
 env \

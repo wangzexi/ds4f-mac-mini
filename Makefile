@@ -60,7 +60,7 @@ ds4f-q4-reference: scripts/prepare-q4-engine.sh patches/q4-embedding-hc.patch pa
 ds4f-q4-speed: src/ds4f_fast_speed.o ds4f-q4-speed-reference
 	$(CC) $(CFLAGS) -o $@ src/ds4f_fast_speed.o $(DS4F_Q4_SPEED_CORE_OBJS) -framework Foundation -framework Metal -lm -pthread
 
-ds4f-q4-speed-reference: scripts/prepare-q4-speed-engine.sh patches/packed-expert-sidecar.patch patches/prefill-stage-workspace-alias.patch patches/q4-embedding-dspark-calls.patch patches/decode-only-cache-aware.patch patches/cache-aware-entropy-guard.patch
+ds4f-q4-speed-reference: scripts/prepare-q4-speed-engine.sh patches/packed-expert-sidecar.patch patches/prefill-stage-workspace-alias.patch patches/prefill-runtime-plan.patch patches/prefill-auto-memory.patch patches/q4-embedding-dspark-calls.patch patches/decode-only-cache-aware.patch patches/cache-aware-entropy-guard.patch
 	./scripts/prepare-q4-speed-engine.sh
 	$(MAKE) -C q4-speed-ds4 ds4
 ds4f-generate-metal: src/ds4f_generate.o src/ds4f_tokenizer.o src/ds4f_gguf.o src/ds4f_quant_metal.o src/ds4f_metal.o src/ds4f_attention_metal.o

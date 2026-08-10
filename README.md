@@ -10,7 +10,7 @@
 
 16GB Mini 的当前优化模型是 `DeepSeek-V4-Flash-0731-Mini-Q4Trunk-IQ2Experts.gguf`：保持 routed IQ2 专家不变，把 embedding、attention、shared expert 与 output trunk 从 Q8 改为 Q4_K。32K 的构建、启动、质量与性能数据见 [`docs/32k-q4-runtime.md`](docs/32k-q4-runtime.md)。
 
-当前 Q4 预填充实验可用 `DS4_METAL_PREFILL_STAGE_ALIAS=1` 复用 attention/FFN 的非重叠 batch workspace。M4/16GB 上，8192 chunk + 256 expert slots 已完整处理 14,735-token prompt，exact prefill 为 **41.55 t/s**，首 token 与旧 4096 基线同为 `I`；修正后的总计划内存为 8.72GiB。旧日志中只显示 0.25GiB graph buffer 的数字漏算了多数 batch tensor，不能用于新的内存规划。
+当前 Q4 预填充会按真实 prompt 长度分配工作区，并自动复用 attention/FFN 生命周期不重叠的 batch workspace。冷 engine 首次处理超过 4096 token 时，会自动选择 8192 chunk 和 256 个当前层 expert slots；M4/16GB 上已完整处理 14,735-token prompt，exact prefill 为 **41.61 t/s**，首 token 与旧 4096 基线同为 `I`，相对旧 27.36 t/s 提升约 52.1%。显式内存计划为 8.72GiB；启动时日志是 prompt 尚未知时的保守上限，后续 `prefill runtime plan` 才是本次真实分配。数值不一致的 8K selected-address 与无收益的异步读取原型均未进入正式路径。
 
 当前状态：
 

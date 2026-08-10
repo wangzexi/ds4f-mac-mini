@@ -12,5 +12,9 @@ patch -s -d "$project_dir/q4-speed-ds4" -p1 \
     < "$project_dir/patches/packed-expert-sidecar.patch"
 patch -s -d "$project_dir/q4-speed-ds4" -p1 \
     < "$project_dir/patches/prefill-stage-workspace-alias.patch"
+patch -s -d "$project_dir/q4-speed-ds4" -p1 \
+    < "$project_dir/patches/prefill-runtime-plan.patch"
+patch -s -d "$project_dir/q4-speed-ds4" -p1 \
+    < "$project_dir/patches/prefill-auto-memory.patch"
 
 echo "$project_dir/q4-speed-ds4"

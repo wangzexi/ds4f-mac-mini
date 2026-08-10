@@ -1,0 +1,54 @@
+--- a/ds4.c
++++ b/ds4.c
+@@ -52229,0 +52230,16 @@
++
++static void ds4_engine_configure_target_prefill_for_prompt(
++        ds4_engine *e,
++        uint32_t    prompt_tokens) {
++#if defined(DS4_NO_GPU)
++    (void)e;
++    (void)prompt_tokens;
++#else
++    if (!e ||
++        e->backend != DS4_BACKEND_METAL ||
++        !e->ssd_streaming ||
++        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4 ||
++        DS4_MODEL_VARIANT != DS4_VARIANT_FLASH ||
++        getenv("DS4_METAL_DISABLE_PREFILL_AUTO_MEMORY") != NULL) {
++        return;
++    }
+@@ -52230,0 +52247,29 @@
++    /* Attention and FFN batch workspaces have disjoint lifetimes.  The alias
++     * is exact and gives the page cache more of unified memory at every prompt
++     * length.  An explicit caller value still wins. */
++    if (getenv("DS4_METAL_PREFILL_STAGE_ALIAS") == NULL) {
++        (void)setenv("DS4_METAL_PREFILL_STAGE_ALIAS", "1", 0);
++    }
++
++    /* The measured 8K plan fits only with one current-layer (256 expert)
++     * cache.  Cache slabs are lazy, so this remains a metadata-only resize
++     * before the first prefill.  A warm reusable engine keeps its existing
++     * cache and the validated 4K chunk instead of discarding useful pages. */
++    if (prompt_tokens > 4096u &&
++        e->prefill_chunk == 0 &&
++        ds4_gpu_stream_expert_cache_current_count() == 0) {
++        e->prefill_chunk = 8192u;
++        if (e->ssd_streaming_cache_experts > DS4_N_EXPERT) {
++            e->ssd_streaming_cache_experts = DS4_N_EXPERT;
++            e->ssd_streaming_cache_bytes = 0;
++            ds4_gpu_set_streaming_expert_cache_budget(DS4_N_EXPERT);
++        }
++        fprintf(stderr,
++                "ds4: prefill auto memory: 8K aliased workspace + %u-expert "
++                "current-layer cache for %u prompt tokens\n",
++                e->ssd_streaming_cache_experts,
++                prompt_tokens);
++    }
++#endif
++}
++
+@@ -52240,0 +52286,4 @@
++    if (e && prompt && prompt->len > 0) {
++        ds4_engine_configure_target_prefill_for_prompt(e,
++                                                       (uint32_t)prompt->len);
++    }
