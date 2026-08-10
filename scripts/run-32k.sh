@@ -2,17 +2,34 @@
 set -eu
 
 if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
-    echo "usage: $0 exact|balanced|turbo PROMPT [MAX_TOKENS]" >&2
+    echo "usage: $0 exact|balanced|turbo PROMPT|@FILE [MAX_TOKENS]" >&2
     exit 2
 fi
 
 mode=$1
-prompt=$2
+prompt_input=$2
 max_tokens=${3:-32}
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 model="$project_dir/reference-ds4/gguf/DeepSeek-V4-Flash-0731-Mini-Q4Trunk-IQ2Experts.gguf"
 pack="$project_dir/reference-ds4/gguf/DeepSeek-V4-Flash-0731-IQ2Experts-packed.bin"
+
+case "$prompt_input" in
+    @*)
+        prompt_file=${prompt_input#@}
+        if [ ! -r "$prompt_file" ]; then
+            echo "prompt file is not readable: $prompt_file" >&2
+            exit 1
+        fi
+        prompt_bytes=$(wc -c < "$prompt_file" | tr -d ' ')
+        if [ "$prompt_bytes" -gt 500000 ]; then
+            echo "prompt file exceeds the 500000-byte argv safety limit" >&2
+            exit 2
+        fi
+        prompt=$(cat -- "$prompt_file")
+        ;;
+    *) prompt=$prompt_input ;;
+esac
 
 case "$mode" in
     exact) mass=100; max_entropy=100 ;;

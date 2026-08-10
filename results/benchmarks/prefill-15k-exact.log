@@ -1,0 +1,11 @@
+ds4: Metal device Apple M4, 16.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped
+ds4: SSD streaming initial metal model map restricted to token embedding (1 spans, 0.28 GiB tensor span)
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 0.61 GiB (raw 0.36 + compressed 0.25) + buffers 0.25 GiB + resident model 0.28 GiB + expert cache 3.96 GiB = 5.09 GiB planned
+ds4: memory detail: ctx=32768 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=8194 backend=metal
+ds4: using GPU graph generation with graph prefill
+ds4: using chunked GPU prefill (4096-token chunks for 14735 prompt tokens)
+Ids4: prefill: 27.36 t/s, generation: 1497.01 t/s
