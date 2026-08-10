@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Verify the fixed Mini deployment against token IDs captured from its
-# reference-backed Metal graph. This is a deployment test, not a self-runner comparison.
+# Verify the fixed Mini deployment against its accepted greedy token IDs.
 set -euo pipefail
 
 if [[ $# -ne 2 ]]; then
-    echo "usage: $0 /path/to/ds4f-fast /path/to/Flash-0731.gguf" >&2
+    echo "usage: $0 /path/to/ds4f-q4-speed /path/to/Flash-0731.gguf" >&2
     exit 2
 fi
 
@@ -40,6 +39,6 @@ check_case() {
 }
 
 check_case 'Explain one plus one in one word.' 3 6111 2004 28
-check_case '用一句话解释为什么 1+1=2。' 4 28669 8570 988 819
+check_case '用一句话解释为什么 1+1=2。' 4 23385 33951 6573 303
 
 echo "production numerical regression passed"

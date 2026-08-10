@@ -7,57 +7,24 @@
 #include <string.h>
 #include <unistd.h>
 
-/*
- * Fast deployment adapter for the single supported model.  It deliberately
- * exposes only the target-only SSD-streaming route, while reusing DwarfStar's
- * public engine boundary and its verified Metal graph implementation.
- */
 enum {
-#ifdef DS4F_SPEED_BUILD
-    DS4F_FAST_CONTEXT_DEFAULT = 32 * 1024,
-#else
-    DS4F_FAST_CONTEXT_DEFAULT = 131072,
-#endif
-    DS4F_FAST_DEFAULT_TOKENS = 16,
-    DS4F_FAST_COMPACT_DIRECT_CACHE_EXPERTS = 440,
-    DS4F_FAST_COMPACT_CONTEXT_MAX = 32 * 1024,
+    CONTEXT_TOKENS = 32 * 1024,
+    DEFAULT_OUTPUT_TOKENS = 16,
+    DEFAULT_CACHE_EXPERTS = 440,
+    MAX_CACHE_EXPERTS = 1200,
 };
-
-static const uint64_t DS4F_FAST_DEFAULT_CACHE_BYTES = 6ull * 1024ull * 1024ull * 1024ull;
 
 typedef struct {
     ds4_engine *engine;
     int emitted;
 } output_state;
 
-/* Keep the target model exact while avoiding per-layer router-ID readback. */
-static void enable_exact_cpu_router(void) {
-    if (getenv("DS4_METAL_DISABLE_STREAMING_IQ2_CPU_ROUTER")) return;
-    (void)setenv("DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER", "1", 0);
-}
-
 static void usage(const char *program) {
     fprintf(stderr,
             "usage: %s MODEL.gguf [PROMPT] [TOKENS]\n"
-            "Defaults to 128K context; set DS4F_FAST_CONTEXT_K=8, 16, 24, 32, 128, or 256. "
-            "At contexts up to 32K, the default is a direct 440-expert cache; set DS4F_FAST_CACHE_EXPERTS=1..1200 for measured Q4 experiments, or DS4F_FAST_CACHE_GIB for the legacy total-budget mode. "
-            "At 128K or 256K, the default is a 6GiB SSD expert cache; set DS4F_FAST_CACHE_GIB=1..6 to override.\n",
+            "Fixed configuration: Metal, 32K context, greedy decode, no MTP. "
+            "Set DS4F_FAST_CACHE_EXPERTS=1..1200 to override the 440-expert cache.\n",
             program);
-}
-
-static int cache_experts_from_env(uint32_t *out) {
-    if (!out) return -1;
-    const char *text = getenv("DS4F_FAST_CACHE_EXPERTS");
-    if (!text || !text[0]) {
-        *out = DS4F_FAST_COMPACT_DIRECT_CACHE_EXPERTS;
-        return 0;
-    }
-    char *end = NULL;
-    errno = 0;
-    unsigned long value = strtoul(text, &end, 10);
-    if (errno || end == text || *end || value < 1 || value > 1200) return -1;
-    *out = (uint32_t)value;
-    return 0;
 }
 
 static int parse_positive(const char *text, int fallback) {
@@ -69,32 +36,15 @@ static int parse_positive(const char *text, int fallback) {
     return (int)value;
 }
 
-static int cache_bytes_from_env(uint64_t *out) {
-    const char *text = getenv("DS4F_FAST_CACHE_GIB");
+static int cache_experts_from_env(uint32_t *out) {
+    const char *text = getenv("DS4F_FAST_CACHE_EXPERTS");
     if (!text || !text[0]) {
-        *out = DS4F_FAST_DEFAULT_CACHE_BYTES;
+        *out = DEFAULT_CACHE_EXPERTS;
         return 0;
     }
-    char *end = NULL;
-    errno = 0;
-    double gib = strtod(text, &end);
-    if (errno || end == text || *end || !(gib >= 1.0 && gib <= 6.0)) return -1;
-    *out = (uint64_t)(gib * 1024.0 * 1024.0 * 1024.0);
-    return *out ? 0 : -1;
-}
-
-static int context_tokens_from_env(int *out) {
-    if (!out) return -1;
-    const char *text = getenv("DS4F_FAST_CONTEXT_K");
-    if (!text || !text[0]) {
-        *out = DS4F_FAST_CONTEXT_DEFAULT;
-        return 0;
-    }
-    char *end = NULL;
-    errno = 0;
-    long kib = strtol(text, &end, 10);
-    if (errno || end == text || *end || (kib != 8 && kib != 16 && kib != 24 && kib != 32 && kib != 128 && kib != 256)) return -1;
-    *out = (int)kib * 1024;
+    int value = parse_positive(text, -1);
+    if (value < 1 || value > MAX_CACHE_EXPERTS) return -1;
+    *out = (uint32_t)value;
     return 0;
 }
 
@@ -110,6 +60,16 @@ static int enter_runtime_dir(const char *program) {
     return chdir(runtime_dir);
 }
 
+static char *render_prompt(const char *prompt) {
+    static const char prefix[] = "<｜User｜>";
+    static const char suffix[] = "<｜Assistant｜></think>";
+    size_t size = strlen(prefix) + strlen(prompt) + strlen(suffix) + 1;
+    char *rendered = malloc(size);
+    if (!rendered) return NULL;
+    snprintf(rendered, size, "%s%s%s", prefix, prompt, suffix);
+    return rendered;
+}
+
 static void emit_token(void *ud, int token) {
     output_state *state = ud;
     size_t len = 0;
@@ -119,8 +79,7 @@ static void emit_token(void *ud, int token) {
     fflush(stdout);
     free(text);
     if (getenv("DS4F_FAST_TRACE_IDS")) {
-        fprintf(stderr, "trace token[%d]=%d", state->emitted, token);
-        fputc(10, stderr);
+        fprintf(stderr, "trace token[%d]=%d\n", state->emitted, token);
     }
     state->emitted++;
 }
@@ -139,90 +98,48 @@ int main(int argc, char **argv) {
         usage(argv[0]);
         return 2;
     }
-    uint64_t cache_bytes = 0;
-    if (cache_bytes_from_env(&cache_bytes)) {
-        fprintf(stderr, "ds4f-fast: DS4F_FAST_CACHE_GIB must be between 1 and 6\n");
+
+    uint32_t cache_experts = 0;
+    if (cache_experts_from_env(&cache_experts)) {
+        fprintf(stderr, "ds4f-q4-speed: DS4F_FAST_CACHE_EXPERTS must be between 1 and 1200\n");
         return 2;
     }
-    uint32_t direct_cache_experts = 0;
-    if (cache_experts_from_env(&direct_cache_experts)) {
-        fprintf(stderr, "ds4f-fast: DS4F_FAST_CACHE_EXPERTS must be between 1 and 1200\n");
+    int output_tokens = parse_positive(argc >= 4 ? argv[3] : NULL,
+                                       DEFAULT_OUTPUT_TOKENS);
+    if (output_tokens < 0) {
+        fprintf(stderr, "ds4f-q4-speed: TOKENS must be a positive integer\n");
         return 2;
     }
 
-    int context_size = 0;
-    if (context_tokens_from_env(&context_size)) {
-        fprintf(stderr, "ds4f-fast: DS4F_FAST_CONTEXT_K must be 8, 16, 24, 32, 128, or 256\n");
-        return 2;
-    }
-    const char *cache_override = getenv("DS4F_FAST_CACHE_GIB");
-    const char *expert_override = getenv("DS4F_FAST_CACHE_EXPERTS");
-    if (cache_override && cache_override[0] && expert_override && expert_override[0]) {
-        fprintf(stderr, "ds4f-fast: choose DS4F_FAST_CACHE_EXPERTS or DS4F_FAST_CACHE_GIB, not both\n");
-        return 2;
-    }
-    if (context_size > DS4F_FAST_COMPACT_CONTEXT_MAX &&
-        expert_override && expert_override[0]) {
-        fprintf(stderr, "ds4f-fast: DS4F_FAST_CACHE_EXPERTS is limited to 8K-32K contexts\n");
-        return 2;
-    }
-#ifdef DS4F_SPEED_BUILD
-    if (context_size != DS4F_FAST_COMPACT_CONTEXT_MAX || (cache_override && cache_override[0])) {
-        fprintf(stderr, "ds4f-speed: only 32K direct-expert-cache configurations are supported\n");
-        return 2;
-    }
-#endif
-    const bool use_compact_direct_expert_cache =
-        context_size <= DS4F_FAST_COMPACT_CONTEXT_MAX && (!cache_override || !cache_override[0]);
-    enable_exact_cpu_router();
     char model_path[PATH_MAX];
     if (!realpath(argv[1], model_path)) {
         perror(argv[1]);
         return 2;
     }
-    const char *prompt = argc >= 3 ? argv[2] : "";
-    const int tokens = parse_positive(argc >= 4 ? argv[3] : NULL,
-                                      DS4F_FAST_DEFAULT_TOKENS);
-    if (tokens < 0) {
-        fprintf(stderr, "ds4f-fast: TOKENS must be a positive integer\n");
-        return 2;
-    }
-
-    const char prefix[] = "<｜User｜>";
-    const char suffix[] = "<｜Assistant｜></think>";
-    const size_t rendered_len = strlen(prefix) + strlen(prompt) + strlen(suffix);
-    char *rendered = malloc(rendered_len + 1u);
+    char *rendered = render_prompt(argc >= 3 ? argv[2] : "");
     if (!rendered) {
         perror("malloc");
         return 1;
     }
-    snprintf(rendered, rendered_len + 1u, "%s%s%s", prefix, prompt, suffix);
-
     if (enter_runtime_dir(argv[0])) {
-        fprintf(stderr,
-                "ds4f-fast: cannot locate the bundled runtime next to the executable\n");
+        fprintf(stderr, "ds4f-q4-speed: cannot locate the bundled runtime\n");
         free(rendered);
         return 1;
     }
 
+    (void)setenv("DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER", "1", 0);
     ds4_engine_options options = {
         .model_path = model_path,
         .backend = DS4_BACKEND_METAL,
-        .context_size = context_size,
-#ifdef DS4F_SPEED_BUILD
+        .context_size = CONTEXT_TOKENS,
         .mtp_draft_tokens = 0,
-#else
-        .mtp_draft_tokens = 1,
-#endif
         .mtp_margin = 3.0f,
         .ssd_streaming = true,
-        .ssd_streaming_cache_experts = use_compact_direct_expert_cache ?
-            direct_cache_experts : 0,
-        .ssd_streaming_cache_bytes = use_compact_direct_expert_cache ? 0 : cache_bytes,
+        .ssd_streaming_cache_experts = cache_experts,
     };
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &options) != 0 || !engine) {
-        fprintf(stderr, "ds4f-fast: failed to initialize the Metal graph\n");
+        fprintf(stderr, "ds4f-q4-speed: failed to initialize the Metal graph\n");
         free(rendered);
         return 1;
     }
@@ -231,13 +148,14 @@ int main(int argc, char **argv) {
     ds4_tokenize_rendered_chat(engine, rendered, &prompt_tokens);
     free(rendered);
     if (prompt_tokens.len == 0) {
-        fprintf(stderr, "ds4f-fast: failed to encode the chat prompt\n");
+        fprintf(stderr, "ds4f-q4-speed: failed to encode the chat prompt\n");
         ds4_engine_close(engine);
         return 1;
     }
+
     output_state output = { .engine = engine };
-    int rc = ds4_engine_generate_argmax(engine, &prompt_tokens, tokens,
-                                        context_size, emit_token,
+    int rc = ds4_engine_generate_argmax(engine, &prompt_tokens, output_tokens,
+                                        CONTEXT_TOKENS, emit_token,
                                         finish_output, &output, NULL, NULL);
     ds4_tokens_free(&prompt_tokens);
     ds4_engine_close(engine);

@@ -10,30 +10,11 @@
 /0731-q2-inventory.json
 /0731-q2-manifest.json
 
-# Build artifacts and experimental binaries.
+# Build artifacts.
 *.o
-/bin/
-/ds4f-dspark-probe
-/ds4f-first-token
-/ds4f-first-token-metal
-/ds4f-generate
-/ds4f-generate-metal
-/ds4f-layer0
-/ds4f-probe
-/ds4f-tokenize
+/ds4f-q4-speed
+/ds4f-server
+/ds4f-speed-template-test
 
 # macOS metadata.
 .DS_Store
-
-/ds4f-fast
-/ds4f-reuse
-/speed-ds4/
-/ds4f-speed
-/q4-ds4/
-/q4-speed-ds4/
-/ds4f-q4
-/ds4f-q4-reuse
-/ds4f-q4-smoke
-/ds4f-q4-speed
-/ds4f-q4-speed-packed
-/ds4f-server

@@ -59,7 +59,6 @@ if [ ! -r "$model" ] || [ ! -r "$pack" ]; then
 fi
 
 exec env \
-    DS4F_FAST_CONTEXT_K=32 \
     DS4F_FAST_CACHE_EXPERTS="$cache_experts" \
     DS4F_SPEED_CACHE_AWARE_MASS_PCT="$mass" \
     DS4F_SPEED_CACHE_AWARE_MAX_ENTROPY_PCT="$max_entropy" \
