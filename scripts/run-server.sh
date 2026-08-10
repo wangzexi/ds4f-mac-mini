@@ -15,6 +15,9 @@ cache_experts=${DS4F_SERVER_CACHE_EXPERTS:-600}
 working_set_mib=${DS4F_SERVER_WORKING_SET_MIB:-11776}
 pinned_mib=${DS4F_SERVER_PINNED_MIB:-4096}
 reserve_mib=${DS4F_SERVER_MEMORY_RESERVE_MIB:-512}
+kv_cache_dir=${DS4F_SERVER_KV_CACHE_DIR:-$project_dir/cache/kv}
+kv_cache_mib=${DS4F_SERVER_KV_CACHE_MIB:-10240}
+kv_cache_min_tokens=${DS4F_SERVER_KV_CACHE_MIN_TOKENS:-1}
 
 if [ ! -x "$project_dir/ds4f-server" ]; then
     echo "missing ds4f-server; run: make server" >&2
@@ -33,6 +36,7 @@ exec env \
     DS4_SERVER_WORKING_SET_MIB="$working_set_mib" \
     DS4_SERVER_PINNED_MIB="$pinned_mib" \
     DS4_SERVER_MEMORY_RESERVE_MIB="$reserve_mib" \
+    DS4_KVSTORE_STRICT_LRU=1 \
     "$project_dir/ds4f-server" \
     --model "$model" \
     --metal \
@@ -40,6 +44,11 @@ exec env \
     --ssd-streaming-cache-experts "$cache_experts" \
     --ctx "$context" \
     --tokens "$tokens" \
+    --kv-disk-dir "$kv_cache_dir" \
+    --kv-disk-space-mb "$kv_cache_mib" \
+    --kv-cache-min-tokens "$kv_cache_min_tokens" \
+    --kv-cache-cold-max-tokens 0 \
+    --kv-cache-continued-interval-tokens 0 \
     --batched-session 1 \
     --host "$host" \
     --port "$port" \

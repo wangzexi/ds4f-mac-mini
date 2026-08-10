@@ -9656,11 +9656,11 @@ static bool kv_cache_store_live_prefix(server *s, server_slot *slot,
                                            NULL, 0, NULL);
 }
 
-static void kv_cache_store_current(server *s, server_slot *slot,
+static bool kv_cache_store_current(server *s, server_slot *slot,
                                    const char *reason) {
-    if (!s || !slot) return;
+    if (!s || !slot) return false;
     const ds4_tokens *tokens = ds4_session_tokens(slot->session);
-    if (!tokens) return;
+    if (!tokens) return false;
 
     char *visible_text = NULL;
     uint8_t visible_ext = 0;
@@ -9690,12 +9690,31 @@ static void kv_cache_store_current(server *s, server_slot *slot,
      * key that payload by the visible protocol transcript, not by rendering the
      * hidden sampled tokens.  On load, DS4 restores the hidden KV payload and
      * tokenizes only the visible suffix that follows this key. */
+    bool stored = false;
     if (visible_text) {
-        kv_cache_store_live_prefix_text(s, slot, tokens, tokens->len, reason,
-                                        visible_text, visible_ext, visible_key);
+        stored = kv_cache_store_live_prefix_text(
+                s, slot, tokens, tokens->len, reason,
+                visible_text, visible_ext, visible_key);
         free(visible_text);
     } else {
-        kv_cache_store_live_prefix(s, slot, tokens, tokens->len, reason);
+        stored = kv_cache_store_live_prefix(
+                s, slot, tokens, tokens->len, reason);
+    }
+    return stored;
+}
+
+static void kv_cache_store_response_end(server *s, server_slot *slot,
+                                        const char *finish) {
+    if (!s || !slot || !s->kv.enabled ||
+        !finish || !strcmp(finish, "error")) return;
+    const ds4_tokens *tokens = ds4_session_tokens(slot->session);
+    if (!tokens || tokens->len < s->kv.opt.min_tokens) return;
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: persisting response-end KV cache slot=%d tokens=%d",
+               slot->id, tokens->len);
+    if (kv_cache_store_current(s, slot, "continued") &&
+        tokens->len > slot->continued_last_store_tokens) {
+        slot->continued_last_store_tokens = tokens->len;
     }
 }
 
@@ -12357,6 +12376,10 @@ decode_again:
                        now_sec() - t0);
         }
     }
+    /* The network response is already complete at this point.  Persist the
+     * exact post-response frontier before the worker accepts another request,
+     * so a future full-history prompt can restore it from disk safely. */
+    kv_cache_store_response_end(s, slot, final_finish);
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);

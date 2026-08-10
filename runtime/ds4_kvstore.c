@@ -568,21 +568,39 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
     uint64_t total = 0;
     for (int i = 0; i < kc->len; i++) total += kc->entry[i].file_size;
     const uint64_t target = kc->budget_bytes - extra_bytes;
+    const char *strict_lru_env = getenv("DS4_KVSTORE_STRICT_LRU");
+    const bool strict_lru = strict_lru_env && strict_lru_env[0] &&
+                            strcmp(strict_lru_env, "0") != 0;
     while (total > target && kc->len > 0) {
         int victim = 0;
-        double victim_score =
-            ds4_kvstore_entry_eviction_score(&kc->entry[0], live, now,
-                                             incoming);
-        for (int i = 1; i < kc->len; i++) {
-            double score =
-                ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
+        if (strict_lru) {
+            uint64_t victim_used = kc->entry[0].last_used ?
+                kc->entry[0].last_used : kc->entry[0].created_at;
+            for (int i = 1; i < kc->len; i++) {
+                const uint64_t used = kc->entry[i].last_used ?
+                    kc->entry[i].last_used : kc->entry[i].created_at;
+                if (used < victim_used ||
+                    (used == victim_used &&
+                     kc->entry[i].created_at < kc->entry[victim].created_at)) {
+                    victim = i;
+                    victim_used = used;
+                }
+            }
+        } else {
+            double victim_score =
+                ds4_kvstore_entry_eviction_score(&kc->entry[0], live, now,
                                                  incoming);
-            if (score < victim_score ||
-                (score == victim_score &&
-                 kc->entry[i].last_used < kc->entry[victim].last_used))
-            {
-                victim = i;
-                victim_score = score;
+            for (int i = 1; i < kc->len; i++) {
+                double score =
+                    ds4_kvstore_entry_eviction_score(&kc->entry[i], live, now,
+                                                     incoming);
+                if (score < victim_score ||
+                    (score == victim_score &&
+                     kc->entry[i].last_used < kc->entry[victim].last_used))
+                {
+                    victim = i;
+                    victim_score = score;
+                }
             }
         }
         ds4_kvstore_entry e = kc->entry[victim];
@@ -630,10 +648,13 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
     kc->opt = opt;
     ds4_kvstore_evict(kc, NULL, 0, NULL);
     kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-            "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
+            "%s: KV disk cache %s (budget=%llu MiB, eviction=%s, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
             kv_log_name(kc),
             kc->dir,
             (unsigned long long)(kc->budget_bytes / (1024ull * 1024ull)),
+            getenv("DS4_KVSTORE_STRICT_LRU") &&
+                    strcmp(getenv("DS4_KVSTORE_STRICT_LRU"), "0") != 0 ?
+                "lru" : "weighted",
             reject_different_quant ? "reject" : "accept",
             kc->opt.min_tokens,
             kc->opt.cold_max_tokens,

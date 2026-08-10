@@ -34,7 +34,23 @@ DS4F_SERVER_CACHE_EXPERTS
 DS4F_SERVER_WORKING_SET_MIB
 DS4F_SERVER_PINNED_MIB
 DS4F_SERVER_MEMORY_RESERVE_MIB
+DS4F_SERVER_KV_CACHE_DIR
+DS4F_SERVER_KV_CACHE_MIB
+DS4F_SERVER_KV_CACHE_MIN_TOKENS
 ```
+
+默认还会在 `cache/kv/` 保留最多 10240MiB（10GiB）的磁盘 KV 前缀缓存。
+每次成功 response 已经发送给客户端后，server 同步保存当前完整 token frontier
+和对应 KV；下次请求会在磁盘条目中选择最长的文本前缀命中，只恢复该快照并
+prefill 新增后缀。生产配置把最小保存长度设为 1 token，短对话也会持久化。
+旧的冷 prompt 锚点和每 10K token 中间检查点在生产启动中关闭，因此正常路径
+每轮只新增 response-end 快照；会话被替换或服务退出时仍会确保当前状态已保存，
+相同 key 会直接复用已有文件而不重写 KV payload。
+
+磁盘上限采用严格 LRU：缓存命中会更新 `last_used`；写入新快照导致总量超过
+10GiB 时，持续删除最久未使用的文件直到重新低于上限。保存发生在网络响应
+结束之后，但会占用单 session worker，因此紧接着到来的下一轮请求需要等待
+本轮 SSD 写入完成。
 
 ## 按请求分配内存
 
