@@ -98,22 +98,16 @@ static int context_tokens_from_env(int *out) {
     return 0;
 }
 
-static int enter_reference_dir(const char *program) {
+static int enter_runtime_dir(const char *program) {
     char executable[PATH_MAX];
-    char reference_dir[PATH_MAX];
-#ifdef DS4F_SPEED_BUILD
-    const char *engine_dir_name = "speed-ds4";
-#else
-    const char *engine_dir_name = "reference-ds4";
-#endif
+    char runtime_dir[PATH_MAX];
     if (!realpath(program, executable)) return -1;
     char *slash = strrchr(executable, '/');
     if (!slash) return -1;
     *slash = '\0';
-    int written = snprintf(reference_dir, sizeof(reference_dir), "%s/%s",
-                           executable, engine_dir_name);
-    if (written < 0 || (size_t)written >= sizeof(reference_dir)) return -1;
-    return chdir(reference_dir);
+    int written = snprintf(runtime_dir, sizeof(runtime_dir), "%s/runtime", executable);
+    if (written < 0 || (size_t)written >= sizeof(runtime_dir)) return -1;
+    return chdir(runtime_dir);
 }
 
 static void emit_token(void *ud, int token) {
@@ -204,9 +198,9 @@ int main(int argc, char **argv) {
     }
     snprintf(rendered, rendered_len + 1u, "%s%s%s", prefix, prompt, suffix);
 
-    if (enter_reference_dir(argv[0])) {
+    if (enter_runtime_dir(argv[0])) {
         fprintf(stderr,
-                "ds4f-fast: cannot locate reference-ds4 next to the executable\n");
+                "ds4f-fast: cannot locate the bundled runtime next to the executable\n");
         free(rendered);
         return 1;
     }

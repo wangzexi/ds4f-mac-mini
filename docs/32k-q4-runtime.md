@@ -49,7 +49,7 @@ cache-aware router 的初步速度档位：
 | exact，8192 chunk，256 slots，无 alias | 14,735 | 未完成 | — | `mlock` 后只剩 12 slots |
 | exact，8192 chunk，256 slots，stage alias | 14,735 | **41.55 t/s** | `I` | 完整运行，无 `mlock` 降级 |
 
-8192 alias 配置的修正预算为 8.72GiB：KV 0.92、完整 graph buffer 5.84、resident model 0.28、expert cache 1.69GiB。相对旧 4096 长提示基线提升约 51.9%；相对同版 4K 单块的 38.80 t/s 只再提高约 7%，说明更大 batch 的边际收益已经明显下降。该模式目前保持 opt-in，不作为普通短请求默认值。
+8192 alias 配置的修正预算为 8.72GiB：KV 0.92、完整 graph buffer 5.84、resident model 0.28、expert cache 1.69GiB。相对旧 4096 长提示基线提升约 51.9%；相对同版 4K 单块的 38.80 t/s 只再提高约 7%，说明更大 batch 的边际收益已经明显下降。一次性 runner 在冷 engine 首个 prompt 超过 4096 token 时会自动选择该模式；常驻聊天 server 保持 4096 workspace 和较大的专家缓存，因为后续轮次只预填充新增后缀。
 
 ```sh
 env \
@@ -91,10 +91,10 @@ make ds4f-q4-speed
 ```sh
 env \
   DS4F_SPEED_CACHE_AWARE_MASS_PCT=70 \
-  DS4_METAL_STREAMING_EXPERT_PACK_PATH=reference-ds4/gguf/DeepSeek-V4-Flash-0731-IQ2Experts-packed.bin \
+  DS4_METAL_STREAMING_EXPERT_PACK_PATH=models/DeepSeek-V4-Flash-0731-IQ2Experts-packed.bin \
   DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER=1 \
   ./ds4f-q4-speed \
-  reference-ds4/gguf/DeepSeek-V4-Flash-0731-Mini-Q4Trunk-IQ2Experts.gguf \
+  models/DeepSeek-V4-Flash-0731-Mini-Q4Trunk-IQ2Experts.gguf \
   '你好' 32
 ```
 

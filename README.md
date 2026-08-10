@@ -2,13 +2,11 @@
 
 面向 Apple M4 Mac mini（16GB 统一内存）的最小 DeepSeek V4 Flash 0731 推理实验。
 
-目标被刻意限制为：只支持固定的量化 GGUF 权重，在 16GB 统一内存上尽可能完成连续生成，不引入 Ollama。自写运行器用于独立实现与数值验证；可选的 `ds4f-fast` 部署适配器会链接 DwarfStar 的公开 engine API，以便在完整自研 GPU 图完成前使用其已验证的 Metal graph。Kimi 工程仅作格式参考。
+目标被刻意限制为：只支持固定的量化 GGUF 权重，在 16GB 统一内存上尽可能完成连续生成，不引入 Ollama。正式 Q4 runtime、Metal kernels、会话 KV 和 HTTP server 均作为本仓库源码直接构建，不需要外部推理仓库。历史参考工程只保留研究记录，不参与生产构建。
 
-当前模型：
+当前唯一部署模型是 `DeepSeek-V4-Flash-0731-Mini-Q4Trunk-IQ2Experts.gguf`：保持 routed IQ2 专家不变，把 embedding、attention、shared expert 与 output trunk 从 Q8 改为 Q4_K。32K 的构建、启动、质量与性能数据见 [`docs/32k-q4-runtime.md`](docs/32k-q4-runtime.md)。
 
-`DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf`
-
-16GB Mini 的当前优化模型是 `DeepSeek-V4-Flash-0731-Mini-Q4Trunk-IQ2Experts.gguf`：保持 routed IQ2 专家不变，把 embedding、attention、shared expert 与 output trunk 从 Q8 改为 Q4_K。32K 的构建、启动、质量与性能数据见 [`docs/32k-q4-runtime.md`](docs/32k-q4-runtime.md)。
+正式运行路径已经独立：Q4 Metal runtime、会话 KV 和 HTTP server 源码直接保存在 `runtime/`，构建时不再复制、链接或要求存在 DwarfStar checkout。`make server && scripts/run-server.sh` 会启动同时兼容 Anthropic Messages 和 OpenAI Chat Completions 的常驻服务；Open WebUI 配置见 [`docs/server.md`](docs/server.md)。复制来源及 MIT 许可保留在 `runtime/UPSTREAM.md` 和 `runtime/LICENSE`。
 
 当前 Q4 预填充会按真实 prompt 长度分配工作区，并自动复用 attention/FFN 生命周期不重叠的 batch workspace。冷 engine 首次处理超过 4096 token 时，会自动选择 8192 chunk 和 256 个当前层 expert slots；M4/16GB 上已完整处理 14,735-token prompt，exact prefill 为 **41.61 t/s**，首 token 与旧 4096 基线同为 `I`，相对旧 27.36 t/s 提升约 52.1%。显式内存计划为 8.72GiB；启动时日志是 prompt 尚未知时的保守上限，后续 `prefill runtime plan` 才是本次真实分配。数值不一致的 8K selected-address 与无收益的异步读取原型均未进入正式路径。
 
@@ -21,8 +19,8 @@
 - routed IQ2/Q2 专家切片有独立 LRU 缓存，`DS4F_EXPERT_CACHE_GIB` 控制预算，默认 4 GiB，上限 8 GiB；Metal 版本已加入 IQ2/Q2 专家线程组 kernel 和 gate/up 批处理。
 - Metal 权重 cache 对专家 buffer 命中会刷新 LRU 次序；默认 10GiB 的空 prompt 8-token 回归中，专家 SSD 读取从 11.85GiB 降至 10.75GiB（miss 5739→5238），greedy token 不变。
 - 路由结果确定后，会在 gate/up Metal command buffer 执行期间预取同一批专家的 down 权重；8-token 空 prompt 对照中 decode 从约 2.75 秒/token 降至约 2.59 秒/token，`DS4F_DISABLE_DOWN_PREFETCH=1` 可作诊断开关。
-- `ds4f-fast` 的部署路径仍是 target-only；DSpark 仅在下文隔离的 DwarfStar 实验中接入，不能作为部署默认值。
-- `ds4f-fast` 是可选的快速部署入口：仅支持固定 Flash 0731 模型，复用 reference-ds4 的公开 engine API 与 Metal graph；默认 128K context；`DS4F_FAST_CONTEXT_K` 只接受 `8/16/24/32/128/256`。8–32K 默认直接锁定 440 个专家（约 2.90GiB），不再为长 prefill 预留 3.38GiB 图缓存；显式设置 `DS4F_FAST_CACHE_GIB` 才回到旧的总预算布局，供诊断与历史对照使用。
+- `ds4f-q4-speed` 是独立的一次性精确/近似实验入口；`ds4f-server` 是正式常驻聊天入口，两者直接链接仓库内 `runtime/`。
+- server 固定 32K context、单常驻 session 和 SSD expert streaming；同时提供 Anthropic Messages 与 OpenAI Chat Completions 流式接口。
 
 2026-08-08/09 在 Mini 上重新验证：target-only SSD streaming 路径能够在 M4/16GB 上实际输出 token。`ds4f-fast` 通过 DwarfStar 的公开 engine API 复用已验证的完整 Metal graph；空 chat prompt（3 个 prompt token）连续生成 8 token，输出 `DeepSeek-V2, released in`，generation 为 **1.83 token/s**（6GiB cache）。在同一 16-token 对照中，6GiB 为 **1.86 token/s**，4GiB 为 **1.67 token/s**；连续生成应保持 6GiB 默认。因此“16GB 机器上把这个固定模型跑起来”的目标已有可部署入口。
 
@@ -36,17 +34,20 @@
 
 DS4F_PROFILE=1 可输出 attention、FFN 与 head 的分项时间。10GiB 是自写路径的安全默认值；提高到 11GiB 以上会造成统一内存压力并使连续 decode 变慢，因此不把它设为默认值。
 
-当前最快的 target-only 启动命令：
+当前正式启动命令：
 
 ```sh
 cd /Users/zexi/workspace/ds4f-mini
-make fast
-./ds4f-fast \
-  reference-ds4/gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf \
-  "你好" 16
+make server
+scripts/run-server.sh
 ```
 
-`ds4f-fast` 是受限部署适配器：只暴露这个固定模型的 greedy SSD-streaming 路径，静态链接 `reference-ds4` 的公开 engine API，并在运行时使用其 Metal shader；它不修改 reference 源码。自写路径保持独立，作为下一步将整张 GPU 图迁入项目本身的数值和结构基线。
+一次性命令仍可用于性能与数值测试：
+
+```sh
+make ds4f-q4-speed
+scripts/run-32k.sh exact '你好' 32
+```
 
 `--ssd-streaming` 是在 16GB 机器上成立的关键；不要省略。对于 8–32K 紧凑布局，默认是直接锁定 440 个专家（约 2.90GiB），不使用旧的 6GiB 总预算；对于 128K/256K，默认仍是 6GiB 总专家预算。旧的 16-token 空 prompt 对照中，6GiB 为 **1.86 token/s**，4GiB 为 **1.67 token/s**；8GiB 会因 macOS 无法锁住足够的专家页而显著退化。
 

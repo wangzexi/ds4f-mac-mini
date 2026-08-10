@@ -3,6 +3,7 @@
 /reference-ds4/
 /reference-deepspec/
 /reference-kimi-k3-in-c/
+/models/
 
 # Generated model inventories.
 /0731-q2-inventory-summary.json
@@ -35,3 +36,4 @@
 /ds4f-q4-smoke
 /ds4f-q4-speed
 /ds4f-q4-speed-packed
+/ds4f-server

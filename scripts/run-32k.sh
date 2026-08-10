@@ -12,8 +12,8 @@ max_tokens=${3:-32}
 cache_experts=${DS4F_FAST_CACHE_EXPERTS:-600}
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-model="$project_dir/reference-ds4/gguf/DeepSeek-V4-Flash-0731-Mini-Q4Trunk-IQ2Experts.gguf"
-pack="$project_dir/reference-ds4/gguf/DeepSeek-V4-Flash-0731-IQ2Experts-packed.bin"
+model="$project_dir/models/DeepSeek-V4-Flash-0731-Mini-Q4Trunk-IQ2Experts.gguf"
+pack="$project_dir/models/DeepSeek-V4-Flash-0731-IQ2Experts-packed.bin"
 
 case "$prompt_input" in
     @*)
