@@ -3,13 +3,14 @@ CFLAGS ?= -O2 -Wall -Wextra -Werror -std=c11
 
 DS4F_FAST_CORE_OBJS = reference-ds4/ds4.o reference-ds4/ds4_distributed.o reference-ds4/ds4_tp.o reference-ds4/ds4_ssd.o reference-ds4/ds4_metal.o reference-ds4/ds4_layer_pack.o
 DS4F_Q4_CORE_OBJS = q4-ds4/ds4.o q4-ds4/ds4_distributed.o q4-ds4/ds4_tp.o q4-ds4/ds4_ssd.o q4-ds4/ds4_metal.o q4-ds4/ds4_layer_pack.o
-.PHONY: all metal fast q4-fast check-production dspark clean ds4f-fast-reference ds4f-q4-reference
+DS4F_Q4_SPEED_CORE_OBJS = q4-speed-ds4/ds4.o q4-speed-ds4/ds4_distributed.o q4-speed-ds4/ds4_tp.o q4-speed-ds4/ds4_ssd.o q4-speed-ds4/ds4_metal.o q4-speed-ds4/ds4_layer_pack.o
+.PHONY: all metal fast q4-fast check-production dspark clean ds4f-fast-reference ds4f-q4-reference ds4f-q4-speed-reference
 all: ds4f-probe ds4f-layer0 ds4f-first-token ds4f-tokenize ds4f-generate
 
 metal: ds4f-generate-metal ds4f-first-token-metal
 
 fast: ds4f-fast ds4f-reuse ds4f-speed
-q4-fast: ds4f-q4 ds4f-q4-reuse
+q4-fast: ds4f-q4 ds4f-q4-reuse ds4f-q4-speed
 check-production: ds4f-fast
 	@test -n "$(MODEL)" || { echo "usage: make check-production MODEL=/path/to/Flash-0731.gguf" >&2; exit 2; }
 	./scripts/check-production-regression.sh ./ds4f-fast "$(MODEL)"
@@ -52,9 +53,16 @@ ds4f-q4: src/ds4f_fast.o ds4f-q4-reference
 ds4f-q4-reuse: src/ds4f_reuse.o ds4f-q4-reference
 	$(CC) $(CFLAGS) -o $@ src/ds4f_reuse.o $(DS4F_Q4_CORE_OBJS) -framework Foundation -framework Metal -lm -pthread
 
-ds4f-q4-reference: scripts/prepare-q4-engine.sh patches/q4-embedding-hc.patch
+ds4f-q4-reference: scripts/prepare-q4-engine.sh patches/q4-embedding-hc.patch patches/q4-embedding-dspark-calls.patch
 	./scripts/prepare-q4-engine.sh
 	$(MAKE) -C q4-ds4 ds4
+
+ds4f-q4-speed: src/ds4f_fast_speed.o ds4f-q4-speed-reference
+	$(CC) $(CFLAGS) -o $@ src/ds4f_fast_speed.o $(DS4F_Q4_SPEED_CORE_OBJS) -framework Foundation -framework Metal -lm -pthread
+
+ds4f-q4-speed-reference: scripts/prepare-q4-speed-engine.sh patches/packed-expert-sidecar.patch patches/q4-embedding-dspark-calls.patch patches/decode-only-cache-aware.patch patches/cache-aware-entropy-guard.patch
+	./scripts/prepare-q4-speed-engine.sh
+	$(MAKE) -C q4-speed-ds4 ds4
 ds4f-generate-metal: src/ds4f_generate.o src/ds4f_tokenizer.o src/ds4f_gguf.o src/ds4f_quant_metal.o src/ds4f_metal.o src/ds4f_attention_metal.o
 	$(CC) $(CFLAGS) -o $@ $^ -framework Foundation -framework Metal -lm
 
@@ -76,14 +84,14 @@ src/%.o: src/%.c src/ds4f_gguf.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f ds4f-probe ds4f-layer0 ds4f-first-token ds4f-first-token-metal ds4f-tokenize ds4f-generate ds4f-generate-metal ds4f-dspark-probe ds4f-fast ds4f-reuse ds4f-q4 ds4f-q4-reuse src/*.o ds4f-speed src/ds4f_fast_speed.o
+	rm -f ds4f-probe ds4f-layer0 ds4f-first-token ds4f-first-token-metal ds4f-tokenize ds4f-generate ds4f-generate-metal ds4f-dspark-probe ds4f-fast ds4f-reuse ds4f-q4 ds4f-q4-reuse ds4f-q4-speed src/*.o ds4f-speed src/ds4f_fast_speed.o
 
 DS4F_SPEED_CORE_OBJS = speed-ds4/ds4.o speed-ds4/ds4_distributed.o speed-ds4/ds4_tp.o speed-ds4/ds4_ssd.o speed-ds4/ds4_metal.o speed-ds4/ds4_layer_pack.o
 
 ds4f-speed: src/ds4f_fast_speed.o ds4f-speed-reference
 	$(CC) $(CFLAGS) -o $@ src/ds4f_fast_speed.o $(DS4F_SPEED_CORE_OBJS) -framework Foundation -framework Metal -lm -pthread
 
-ds4f-speed-reference: scripts/prepare-speed-engine.sh
+ds4f-speed-reference: scripts/prepare-speed-engine.sh patches/cache-aware-experts.patch patches/decode-only-cache-aware.patch patches/cache-aware-entropy-guard.patch
 	./scripts/prepare-speed-engine.sh
 	$(MAKE) -C speed-ds4 ds4
 

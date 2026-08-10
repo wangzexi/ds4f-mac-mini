@@ -1,0 +1,30 @@
+ds4: Metal device Apple M4, 16.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped
+ds4: SSD streaming initial metal model map restricted to token embedding (1 spans, 0.28 GiB tensor span)
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 0.61 GiB (raw 0.36 + compressed 0.25) + buffers 0.25 GiB + resident model 0.28 GiB + expert cache 3.96 GiB = 5.09 GiB planned
+ds4: memory detail: ctx=32768 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=8194 backend=metal
+ds4: packed expert sidecar enabled: ../reference-ds4/gguf/DeepSeek-V4-Flash-0731-IQ2Experts-packed.bin (72.56 GiB)
+case_000 cases=1 prompt=17 target=24 avg_nll=1.063278 lcp=0 api_target_mae=1.063278 api_top_coverage=480/480 api_top1=0.750 api_topn=0.656 api_pair=0.965
+case_001 cases=2 prompt=18 target=24 avg_nll=0.372986 lcp=0 api_target_mae=0.372986 api_top_coverage=478/480 api_top1=0.833 api_topn=0.699 api_pair=0.991
+case_002 cases=3 prompt=19 target=24 avg_nll=0.778676 lcp=0 api_target_mae=0.778676 api_top_coverage=478/480 api_top1=0.708 api_topn=0.757 api_pair=0.963
+case_003 cases=4 prompt=19 target=24 avg_nll=0.757235 lcp=0 api_target_mae=0.757235 api_top_coverage=479/480 api_top1=0.792 api_topn=0.670 api_pair=0.978
+case_004 cases=5 prompt=15 target=24 avg_nll=0.566594 lcp=0 api_target_mae=0.566594 api_top_coverage=479/480 api_top1=0.792 api_topn=0.653 api_pair=0.983
+case_005 cases=6 prompt=14 target=24 avg_nll=0.816736 lcp=0 api_target_mae=0.816736 api_top_coverage=477/480 api_top1=0.667 api_topn=0.721 api_pair=0.974
+case_006 cases=7 prompt=18 target=24 avg_nll=0.433419 lcp=0 api_target_mae=0.433419 api_top_coverage=478/480 api_top1=0.833 api_topn=0.663 api_pair=0.991
+case_007 cases=8 prompt=14 target=24 avg_nll=1.198245 lcp=0 api_target_mae=1.198245 api_top_coverage=480/480 api_top1=0.625 api_topn=0.619 api_pair=0.962
+case_008 cases=9 prompt=20 target=24 avg_nll=0.331146 lcp=0 api_target_mae=0.331146 api_top_coverage=480/480 api_top1=0.875 api_topn=0.731 api_pair=0.991
+case_009 cases=10 prompt=17 target=24 avg_nll=0.275206 lcp=0 api_target_mae=0.275206 api_top_coverage=475/480 api_top1=0.917 api_topn=0.695 api_pair=0.996
+case_010 cases=11 prompt=26 target=24 avg_nll=0.530794 lcp=0 api_target_mae=0.530794 api_top_coverage=477/480 api_top1=0.833 api_topn=0.700 api_pair=0.985
+case_011 cases=12 prompt=21 target=24 avg_nll=0.114592 lcp=16 api_target_mae=0.114592 api_top_coverage=479/480 api_top1=0.958 api_topn=0.737 api_pair=0.998
+case_012 cases=13 prompt=22 target=24 avg_nll=0.826044 lcp=0 api_target_mae=0.826044 api_top_coverage=480/480 api_top1=0.750 api_topn=0.702 api_pair=0.971
+case_013 cases=14 prompt=22 target=24 avg_nll=0.314183 lcp=0 api_target_mae=0.314183 api_top_coverage=480/480 api_top1=0.917 api_topn=0.715 api_pair=0.993
+case_014 cases=15 prompt=21 target=24 avg_nll=0.531112 lcp=0 api_target_mae=0.531112 api_top_coverage=479/480 api_top1=0.792 api_topn=0.731 api_pair=0.982
+case_015 cases=16 prompt=22 target=24 avg_nll=0.762458 lcp=0 api_target_mae=0.762458 api_top_coverage=480/480 api_top1=0.792 api_topn=0.738 api_pair=0.965
+case_016 cases=17 prompt=19 target=24 avg_nll=1.044116 lcp=1 api_target_mae=1.044116 api_top_coverage=479/480 api_top1=0.667 api_topn=0.681 api_pair=0.949
+case_017 cases=18 prompt=26 target=24 avg_nll=0.538618 lcp=1 api_target_mae=0.538618 api_top_coverage=480/480 api_top1=0.792 api_topn=0.688 api_pair=0.989
+case_018 cases=19 prompt=25 target=24 avg_nll=0.357151 lcp=1 api_target_mae=0.357151 api_top_coverage=479/480 api_top1=0.958 api_topn=0.735 api_pair=0.993
+case_019 cases=20 prompt=19 target=24 avg_nll=0.964512 lcp=0 api_target_mae=0.964512 api_top_coverage=478/480 api_top1=0.750 api_topn=0.646 api_pair=0.972
+case_020 cases=21 prompt=18 target=24 avg_nll=0.516670 lcp=0 api_target_mae=0.516670 api_top_coverage=480/480 api_top1=0.875 api_topn=0.675 api_pair=0.994

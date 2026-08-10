@@ -1,0 +1,21 @@
+ds4: Metal device Apple M4, 16.00 GiB RAM
+ds4: Metal 4 tensor API disabled for pre-M5/pre-A19 devices
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=off
+ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped
+ds4: SSD streaming initial metal model map restricted to token embedding (1 spans, 0.28 GiB tensor span)
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 0.61 GiB (raw 0.36 + compressed 0.25) + buffers 0.25 GiB + resident model 0.28 GiB + expert cache 3.96 GiB = 5.09 GiB planned
+ds4: memory detail: ctx=32768 prefill_cap=4096 raw_kv_rows=4352 compressed_kv_rows=8194 backend=metal
+ds4: packed expert sidecar enabled: ../reference-ds4/gguf/DeepSeek-V4-Flash-0731-IQ2Experts-packed.bin (72.56 GiB)
+case_000 cases=1 prompt=17 target=24 avg_nll=2.973245 lcp=0 api_target_mae=2.973245 api_top_coverage=480/480 api_top1=0.458 api_topn=0.531 api_pair=0.917
+case_001 cases=2 prompt=18 target=24 avg_nll=0.465582 lcp=10 api_target_mae=0.465582 api_top_coverage=478/480 api_top1=0.833 api_topn=0.628 api_pair=0.987
+case_002 cases=3 prompt=19 target=24 avg_nll=0.867972 lcp=0 api_target_mae=0.867972 api_top_coverage=478/480 api_top1=0.708 api_topn=0.653 api_pair=0.954
+case_003 cases=4 prompt=19 target=24 avg_nll=0.821379 lcp=0 api_target_mae=0.821379 api_top_coverage=479/480 api_top1=0.708 api_topn=0.585 api_pair=0.971
+case_004 cases=5 prompt=15 target=24 avg_nll=0.958920 lcp=1 api_target_mae=0.958920 api_top_coverage=479/480 api_top1=0.625 api_topn=0.541 api_pair=0.962
+case_005 cases=6 prompt=14 target=24 avg_nll=0.872917 lcp=9 api_target_mae=0.872917 api_top_coverage=477/480 api_top1=0.750 api_topn=0.635 api_pair=0.974
+case_006 cases=7 prompt=18 target=24 avg_nll=0.782039 lcp=1 api_target_mae=0.782039 api_top_coverage=478/480 api_top1=0.625 api_topn=0.540 api_pair=0.965
+case_007 cases=8 prompt=14 target=24 avg_nll=1.578229 lcp=7 api_target_mae=1.578229 api_top_coverage=480/480 api_top1=0.500 api_topn=0.525 api_pair=0.930
+case_008 cases=9 prompt=20 target=24 avg_nll=0.569985 lcp=0 api_target_mae=0.569985 api_top_coverage=480/480 api_top1=0.792 api_topn=0.581 api_pair=0.978
+case_009 cases=10 prompt=17 target=24 avg_nll=0.372400 lcp=9 api_target_mae=0.372400 api_top_coverage=475/480 api_top1=0.875 api_topn=0.611 api_pair=0.984
+case_010 cases=11 prompt=26 target=24 avg_nll=1.167599 lcp=0 api_target_mae=1.167599 api_top_coverage=477/480 api_top1=0.750 api_topn=0.532 api_pair=0.965
+case_011 cases=12 prompt=21 target=24 avg_nll=0.429037 lcp=13 api_target_mae=0.429037 api_top_coverage=479/480 api_top1=0.875 api_topn=0.585 api_pair=0.991

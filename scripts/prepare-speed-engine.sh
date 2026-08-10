@@ -10,15 +10,18 @@ if [ ! -d "$source_dir" ]; then
     printf '%s\n' 'ds4f-speed: missing reference-ds4' >&2
     exit 1
 fi
-if [ -f "$target_dir/.ds4f-speed-prepared" ]; then
-    exit 0
-fi
-if [ -e "$target_dir" ]; then
-    printf '%s\n' 'ds4f-speed: speed-ds4 exists without its preparation marker; inspect or remove it explicitly' >&2
-    exit 1
-fi
-mkdir "$target_dir"
-rsync -a --exclude=.git --exclude=gguf --exclude='*.gguf' --exclude='*.o' --exclude=ds4 --exclude='ds4-*' --exclude='*.dSYM' "$source_dir/" "$target_dir/"
+mkdir -p "$target_dir"
+rsync -a --delete --delete-excluded \
+    --exclude=.git \
+    --exclude=gguf \
+    --exclude='*.gguf' \
+    --exclude='*.o' \
+    --exclude=ds4 \
+    --exclude='ds4-*' \
+    --exclude='*.dSYM' \
+    "$source_dir/" "$target_dir/"
 cd "$target_dir"
 patch -p1 < "$project_dir/patches/cache-aware-experts.patch"
+patch -p1 < "$project_dir/patches/decode-only-cache-aware.patch"
+patch -p1 < "$project_dir/patches/cache-aware-entropy-guard.patch"
 touch .ds4f-speed-prepared

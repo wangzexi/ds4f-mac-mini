@@ -1,0 +1,455 @@
+--- a/ds4_metal.m
++++ b/ds4_metal.m
+@@ -16,6 +16,7 @@
+ #include <pthread.h>
+ #include <unistd.h>
+ #include <sys/mman.h>
++#include <sys/stat.h>
+ #include <sys/sysctl.h>
+ #include <mach/mach.h>
+ 
+@@ -305,6 +306,10 @@
+ static id<MTLBuffer> g_moe_q4_down_slots_buffer;
+ static id<MTLBuffer> g_attn_out_group_ids_buffer;
+ static int g_model_fd = -1;
++static int g_stream_expert_pack_fd = -1;
++static int g_stream_expert_pack_checked;
++static uint64_t g_stream_expert_pack_data_offset;
++static uint64_t g_stream_expert_pack_size;
+ static const void *g_model_map_ptr;
+ static uint64_t g_model_map_size;
+ static uint64_t g_model_mapped_offset;
+@@ -9302,6 +9307,13 @@
+         g_moe_q4_up_slots_buffer = nil;
+         g_moe_q4_down_slots_buffer = nil;
+         g_attn_out_group_ids_buffer = nil;
++        if (g_stream_expert_pack_fd >= 0) {
++            close(g_stream_expert_pack_fd);
++        }
++        g_stream_expert_pack_fd = -1;
++        g_stream_expert_pack_checked = 0;
++        g_stream_expert_pack_data_offset = 0;
++        g_stream_expert_pack_size = 0;
+         g_model_fd = -1;
+         g_model_map_ptr = NULL;
+         g_model_map_size = 0;
+@@ -10981,9 +10993,123 @@
+     (void)offset;
+     (void)len;
+ #endif
++}
++
++static void ds4_gpu_stream_expert_readahead_fd(int fd, uint64_t offset, uint64_t len) {
++    if (!ds4_gpu_stream_expert_readahead_enabled() || fd < 0 || len == 0) return;
++#if defined(F_RDADVISE)
++    const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
++    const double t0 = timing ? ds4_gpu_now_ms() : 0.0;
++    uint64_t pos = offset;
++    uint64_t rem = len;
++    while (rem > 0) {
++        const uint64_t chunk64 = rem > (uint64_t)INT_MAX ? (uint64_t)INT_MAX : rem;
++        if (pos > (uint64_t)LLONG_MAX) break;
++        struct radvisory ra = { .ra_offset = (off_t)pos, .ra_count = (int)chunk64 };
++        (void)fcntl(fd, F_RDADVISE, &ra);
++        pos += chunk64;
++        rem -= chunk64;
++    }
++    if (timing) {
++        g_stream_expert_timing_readahead_calls++;
++        g_stream_expert_timing_readahead_bytes += len;
++        g_stream_expert_timing_readahead_ms += ds4_gpu_now_ms() - t0;
++    }
++#else
++    (void)offset;
++    (void)len;
++#endif
++}
++
++static int ds4_gpu_stream_expert_pack_source(
++        uint64_t model_size,
++        uint32_t layer,
++        uint32_t expert,
++        uint64_t gate_expert_bytes,
++        uint64_t down_expert_bytes,
++        int *fd_out,
++        uint64_t *offset_out) {
++    const uint32_t pack_layers = 43u;
++    const uint32_t pack_experts = 256u;
++    if (!fd_out || !offset_out || layer >= pack_layers || expert >= pack_experts ||
++        gate_expert_bytes > (UINT64_MAX - down_expert_bytes) / 2u) {
++        return 0;
++    }
++
++    if (!g_stream_expert_pack_checked) {
++        g_stream_expert_pack_checked = 1;
++        const char *path = getenv("DS4_METAL_STREAMING_EXPERT_PACK_PATH");
++        if (!path || !path[0]) return 0;
++        const int fd = open(path, O_RDONLY);
++        if (fd < 0) {
++            fprintf(stderr, "ds4: cannot open packed expert sidecar %s: %s\n", path, strerror(errno));
++            return 0;
++        }
++        uint8_t header[48];
++        ssize_t got;
++        do {
++            got = pread(fd, header, sizeof(header), 0);
++        } while (got < 0 && errno == EINTR);
++        uint64_t header_model_size = 0;
++        uint32_t header_layers = 0;
++        uint32_t header_experts = 0;
++        uint64_t header_gate_bytes = 0;
++        uint64_t header_down_bytes = 0;
++        uint64_t header_data_offset = 0;
++        if (got == (ssize_t)sizeof(header)) {
++            memcpy(&header_model_size, header + 8, sizeof(header_model_size));
++            memcpy(&header_layers, header + 16, sizeof(header_layers));
++            memcpy(&header_experts, header + 20, sizeof(header_experts));
++            memcpy(&header_gate_bytes, header + 24, sizeof(header_gate_bytes));
++            memcpy(&header_down_bytes, header + 32, sizeof(header_down_bytes));
++            memcpy(&header_data_offset, header + 40, sizeof(header_data_offset));
++        }
++        const uint64_t slot_bytes = gate_expert_bytes * 2u + down_expert_bytes;
++        const uint64_t slots = (uint64_t)pack_layers * pack_experts;
++        struct stat st;
++        const int valid =
++            got == (ssize_t)sizeof(header) &&
++            memcmp(header, "DS4FPK1", 7) == 0 &&
++            header_model_size == model_size &&
++            header_layers == pack_layers &&
++            header_experts == pack_experts &&
++            header_gate_bytes == gate_expert_bytes &&
++            header_down_bytes == down_expert_bytes &&
++            header_data_offset >= sizeof(header) &&
++            slot_bytes <= UINT64_MAX / slots &&
++            header_data_offset <= UINT64_MAX - slot_bytes * slots &&
++            fstat(fd, &st) == 0 && st.st_size >= 0 &&
++            (uint64_t)st.st_size >= header_data_offset + slot_bytes * slots;
++        if (!valid) {
++            fprintf(stderr, "ds4: packed expert sidecar header does not match this model\n");
++            close(fd);
++            return 0;
++        }
++        g_stream_expert_pack_fd = fd;
++        g_stream_expert_pack_data_offset = header_data_offset;
++        g_stream_expert_pack_size = (uint64_t)st.st_size;
++        fprintf(stderr, "ds4: packed expert sidecar enabled: %s (%.2f GiB)\n",
++                path, ds4_gpu_gib(g_stream_expert_pack_size));
++    }
++
++    if (g_stream_expert_pack_fd < 0) return 0;
++    const uint64_t slot_bytes = gate_expert_bytes * 2u + down_expert_bytes;
++    const uint64_t index = (uint64_t)layer * pack_experts + expert;
++    if (index > UINT64_MAX / slot_bytes ||
++        g_stream_expert_pack_data_offset > UINT64_MAX - index * slot_bytes) {
++        return 0;
++    }
++    const uint64_t offset = g_stream_expert_pack_data_offset + index * slot_bytes;
++    if (offset > g_stream_expert_pack_size || slot_bytes > g_stream_expert_pack_size - offset) {
++        return 0;
++    }
++    *fd_out = g_stream_expert_pack_fd;
++    *offset_out = offset;
++    return 1;
+ }
+ 
+ typedef struct {
++    int fd;
+     uint64_t offset;
+     uint64_t len;
+     uint8_t *dst;
+@@ -11090,6 +11216,7 @@
+ }
+ 
+ static int ds4_gpu_stream_expert_pread_into(
++        int       fd,
+         uint64_t  offset,
+         uint64_t  len,
+         uint8_t  *dst,
+@@ -11097,7 +11224,7 @@
+         double   *ms_out) {
+     if (read_bytes) *read_bytes = 0;
+     if (ms_out) *ms_out = 0.0;
+-    if (g_model_fd < 0 ||
++    if (fd < 0 ||
+         !dst ||
+         len == 0 ||
+         offset > (uint64_t)LLONG_MAX ||
+@@ -11113,7 +11240,7 @@
+         const size_t want = rem > (uint64_t)SSIZE_MAX ? (size_t)SSIZE_MAX : (size_t)rem;
+         ssize_t nread;
+         do {
+-            nread = pread(g_model_fd, dst + pos, want, (off_t)(offset + pos));
++            nread = pread(fd, dst + pos, want, (off_t)(offset + pos));
+         } while (nread < 0 && errno == EINTR);
+         if (nread <= 0) {
+             ok = 0;
+@@ -11140,7 +11267,8 @@
+         (ds4_gpu_stream_expert_pread_worker_args *)arg;
+     for (uint32_t i = wa->worker_index; i < wa->n_tasks; i += wa->n_workers) {
+         ds4_gpu_stream_expert_pread_task *task = &wa->tasks[i];
+-        task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
++        task->ok = ds4_gpu_stream_expert_pread_into(task->fd,
++                                                    task->offset,
+                                                     task->len,
+                                                     task->dst,
+                                                     &task->read_bytes,
+@@ -11199,7 +11327,8 @@
+                 &g_stream_expert_pread_pool_tasks[task_index];
+             pthread_mutex_unlock(&g_stream_expert_pread_pool_mutex);
+ 
+-            task->ok = ds4_gpu_stream_expert_pread_into(task->offset,
++            task->ok = ds4_gpu_stream_expert_pread_into(task->fd,
++                                                        task->offset,
+                                                         task->len,
+                                                         task->dst,
+                                                         &task->read_bytes,
+@@ -14421,13 +14550,6 @@
+         const int force_reuse =
+             cache_budget != 0 && reserved_entries >= cache_budget;
+ 
+-        ds4_gpu_stream_expert_readahead_range(p->gate_abs_offsets[slot],
+-                                              gate_expert_bytes);
+-        ds4_gpu_stream_expert_readahead_range(p->up_abs_offsets[slot],
+-                                              gate_expert_bytes);
+-        ds4_gpu_stream_expert_readahead_range(p->down_abs_offsets[slot],
+-                                              down_expert_bytes);
+-
+         if (load_i < batch_reuse_count &&
+             batch_reuse[load_i].gate_buffer &&
+             batch_reuse[load_i].up_buffer &&
+@@ -14478,21 +14600,52 @@
+             return 0;
+         }
+         const double task_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
+-        p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+-            .offset = p->gate_abs_offsets[slot],
+-            .len = gate_expert_bytes,
+-            .dst = gate_dst,
+-        };
+-        p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+-            .offset = p->up_abs_offsets[slot],
+-            .len = gate_expert_bytes,
+-            .dst = up_dst,
+-        };
+-        p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+-            .offset = p->down_abs_offsets[slot],
+-            .len = down_expert_bytes,
+-            .dst = down_dst,
+-        };
++        int pack_fd = -1;
++        uint64_t pack_offset = 0;
++        const uint64_t packed_bytes = gate_expert_bytes * 2u + down_expert_bytes;
++        const int use_pack =
++            p->gate_bufs[load_i] == p->up_bufs[load_i] &&
++            p->gate_bufs[load_i] == p->down_bufs[load_i] &&
++            p->up_inners[load_i] == p->gate_inners[load_i] + gate_expert_bytes &&
++            p->down_inners[load_i] == p->up_inners[load_i] + gate_expert_bytes &&
++            ds4_gpu_stream_expert_pack_source(p->model_size,
++                                              p->layer,
++                                              expert,
++                                              gate_expert_bytes,
++                                              down_expert_bytes,
++                                              &pack_fd,
++                                              &pack_offset);
++        if (use_pack) {
++            ds4_gpu_stream_expert_readahead_fd(pack_fd, pack_offset, packed_bytes);
++            p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
++                .fd = pack_fd,
++                .offset = pack_offset,
++                .len = packed_bytes,
++                .dst = gate_dst,
++            };
++        } else {
++            ds4_gpu_stream_expert_readahead_range(p->gate_abs_offsets[slot], gate_expert_bytes);
++            ds4_gpu_stream_expert_readahead_range(p->up_abs_offsets[slot], gate_expert_bytes);
++            ds4_gpu_stream_expert_readahead_range(p->down_abs_offsets[slot], down_expert_bytes);
++            p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
++                .fd = g_model_fd,
++                .offset = p->gate_abs_offsets[slot],
++                .len = gate_expert_bytes,
++                .dst = gate_dst,
++            };
++            p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
++                .fd = g_model_fd,
++                .offset = p->up_abs_offsets[slot],
++                .len = gate_expert_bytes,
++                .dst = up_dst,
++            };
++            p->tasks[p->n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
++                .fd = g_model_fd,
++                .offset = p->down_abs_offsets[slot],
++                .len = down_expert_bytes,
++                .dst = down_dst,
++            };
++        }
+         if (load_timing) {
+             ds4_gpu_stream_expert_timing_note_prepare_task(
+                     1,
+@@ -14712,15 +14865,6 @@
+         const int force_reuse =
+             cache_budget != 0 && reserved_entries >= cache_budget;
+ 
+-        if (!gpu_copy_source) {
+-            ds4_gpu_stream_expert_readahead_range(gate_abs_offsets[slot],
+-                                                  gate_expert_bytes);
+-            ds4_gpu_stream_expert_readahead_range(up_abs_offsets[slot],
+-                                                  gate_expert_bytes);
+-            ds4_gpu_stream_expert_readahead_range(down_abs_offsets[slot],
+-                                                  down_expert_bytes);
+-        }
+-
+         if (load_i < batch_reuse_count &&
+             batch_reuse[load_i].gate_buffer &&
+             batch_reuse[load_i].up_buffer &&
+@@ -14782,21 +14926,55 @@
+             return 0;
+         }
+         const double task_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
+-        tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+-            .offset = gate_abs_offsets[slot],
+-            .len = gate_expert_bytes,
+-            .dst = gate_dst,
+-        };
+-        tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+-            .offset = up_abs_offsets[slot],
+-            .len = gate_expert_bytes,
+-            .dst = up_dst,
+-        };
+-        tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+-            .offset = down_abs_offsets[slot],
+-            .len = down_expert_bytes,
+-            .dst = down_dst,
+-        };
++        int pack_fd = -1;
++        uint64_t pack_offset = 0;
++        const uint64_t packed_bytes = gate_expert_bytes * 2u + down_expert_bytes;
++        const int use_pack =
++            !gpu_copy_source &&
++            gate_bufs[load_i] == up_bufs[load_i] &&
++            gate_bufs[load_i] == down_bufs[load_i] &&
++            up_inners[load_i] == gate_inners[load_i] + gate_expert_bytes &&
++            down_inners[load_i] == up_inners[load_i] + gate_expert_bytes &&
++            ds4_gpu_stream_expert_pack_source(model_size,
++                                              layer,
++                                              expert,
++                                              gate_expert_bytes,
++                                              down_expert_bytes,
++                                              &pack_fd,
++                                              &pack_offset);
++        if (use_pack) {
++            ds4_gpu_stream_expert_readahead_fd(pack_fd, pack_offset, packed_bytes);
++            tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
++                .fd = pack_fd,
++                .offset = pack_offset,
++                .len = packed_bytes,
++                .dst = gate_dst,
++            };
++        } else {
++            if (!gpu_copy_source) {
++                ds4_gpu_stream_expert_readahead_range(gate_abs_offsets[slot], gate_expert_bytes);
++                ds4_gpu_stream_expert_readahead_range(up_abs_offsets[slot], gate_expert_bytes);
++                ds4_gpu_stream_expert_readahead_range(down_abs_offsets[slot], down_expert_bytes);
++            }
++            tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
++                .fd = g_model_fd,
++                .offset = gate_abs_offsets[slot],
++                .len = gate_expert_bytes,
++                .dst = gate_dst,
++            };
++            tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
++                .fd = g_model_fd,
++                .offset = up_abs_offsets[slot],
++                .len = gate_expert_bytes,
++                .dst = up_dst,
++            };
++            tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
++                .fd = g_model_fd,
++                .offset = down_abs_offsets[slot],
++                .len = down_expert_bytes,
++                .dst = down_dst,
++            };
++        }
+         if (load_timing) {
+             ds4_gpu_stream_expert_timing_note_prepare_task(
+                     1,
+@@ -15332,12 +15510,6 @@
+ 
+             const int force_reuse =
+                 cache_budget != 0 && reserved_entries >= cache_budget;
+-            ds4_gpu_stream_expert_readahead_range(unique_gate_offsets[u],
+-                                                  gate_expert_bytes);
+-            ds4_gpu_stream_expert_readahead_range(unique_up_offsets[u],
+-                                                  gate_expert_bytes);
+-            ds4_gpu_stream_expert_readahead_range(unique_down_offsets[u],
+-                                                  down_expert_bytes);
+             const double buffer_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
+             const int prepared =
+                 ds4_gpu_stream_expert_cache_prepare_load_buffers(layer,
+@@ -15385,21 +15557,52 @@
+ 
+             load_unique[n_loads] = u;
+             const double task_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
+-            tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+-                .offset = unique_gate_offsets[u],
+-                .len = gate_expert_bytes,
+-                .dst = gate_dst,
+-            };
+-            tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+-                .offset = unique_up_offsets[u],
+-                .len = gate_expert_bytes,
+-                .dst = up_dst,
+-            };
+-            tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
+-                .offset = unique_down_offsets[u],
+-                .len = down_expert_bytes,
+-                .dst = down_dst,
+-            };
++            int pack_fd = -1;
++            uint64_t pack_offset = 0;
++            const uint64_t packed_bytes = gate_expert_bytes * 2u + down_expert_bytes;
++            const int use_pack =
++                gate_bufs[n_loads] == up_bufs[n_loads] &&
++                gate_bufs[n_loads] == down_bufs[n_loads] &&
++                up_inners[n_loads] == gate_inners[n_loads] + gate_expert_bytes &&
++                down_inners[n_loads] == up_inners[n_loads] + gate_expert_bytes &&
++                ds4_gpu_stream_expert_pack_source(model_size,
++                                                  layer,
++                                                  expert,
++                                                  gate_expert_bytes,
++                                                  down_expert_bytes,
++                                                  &pack_fd,
++                                                  &pack_offset);
++            if (use_pack) {
++                ds4_gpu_stream_expert_readahead_fd(pack_fd, pack_offset, packed_bytes);
++                tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
++                    .fd = pack_fd,
++                    .offset = pack_offset,
++                    .len = packed_bytes,
++                    .dst = gate_dst,
++                };
++            } else {
++                ds4_gpu_stream_expert_readahead_range(unique_gate_offsets[u], gate_expert_bytes);
++                ds4_gpu_stream_expert_readahead_range(unique_up_offsets[u], gate_expert_bytes);
++                ds4_gpu_stream_expert_readahead_range(unique_down_offsets[u], down_expert_bytes);
++                tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
++                    .fd = g_model_fd,
++                    .offset = unique_gate_offsets[u],
++                    .len = gate_expert_bytes,
++                    .dst = gate_dst,
++                };
++                tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
++                    .fd = g_model_fd,
++                    .offset = unique_up_offsets[u],
++                    .len = gate_expert_bytes,
++                    .dst = up_dst,
++                };
++                tasks[n_tasks++] = (ds4_gpu_stream_expert_pread_task) {
++                    .fd = g_model_fd,
++                    .offset = unique_down_offsets[u],
++                    .len = down_expert_bytes,
++                    .dst = down_dst,
++                };
++            }
+             if (load_timing) {
+                 ds4_gpu_stream_expert_timing_note_prepare_task(
+                         1,

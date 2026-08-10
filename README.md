@@ -8,6 +8,8 @@
 
 `DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf`
 
+16GB Mini 的当前优化模型是 `DeepSeek-V4-Flash-0731-Mini-Q4Trunk-IQ2Experts.gguf`：保持 routed IQ2 专家不变，把 embedding、attention、shared expert 与 output trunk 从 Q8 改为 Q4_K。32K 的构建、启动、质量与性能数据见 [`docs/32k-q4-runtime.md`](docs/32k-q4-runtime.md)。
+
 当前状态：
 
 - 独立 GGUF 解析、按张量 `pread` 读取和 Q8/Q2/IQ2 计算模块已完成。

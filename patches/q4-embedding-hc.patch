@@ -252,22 +252,6 @@
                                             (uint32_t)weights->token_embd->dim[1],
                                             (uint32_t)token,
                                             DS4_N_EMBD,
-@@ -30762,6 +30772,7 @@
-                                             base_model->map,
-                                             base_model->size,
-                                             base_weights->token_embd->abs_offset,
-+                                            base_weights->token_embd->type,
-                                             (uint32_t)base_weights->token_embd->dim[1],
-                                             dw->block_size,
-                                             DS4_N_EMBD,
-@@ -30867,6 +30878,7 @@
-                                             base_model->map,
-                                             base_model->size,
-                                             base_weights->token_embd->abs_offset,
-+                                            base_weights->token_embd->type,
-                                             (uint32_t)base_weights->token_embd->dim[1],
-                                             dw->block_size,
-                                             DS4_N_EMBD,
 @@ -32818,6 +32830,7 @@
                                                    base_model->map,
                                                    base_model->size,

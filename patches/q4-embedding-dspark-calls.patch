@@ -1,0 +1,86 @@
+--- a/ds4.c
++++ b/ds4.c
+@@ -30811,40 +30811,41 @@
+     for (uint32_t i = 1; i < dw->block_size; i++) {
+         ids[i] = (int32_t)dw->noise_token_id;
+     }
+ 
+     bool ok = ds4_gpu_tensor_write(g->dspark_draft_tokens,
+                                    0,
+                                    ids,
+                                    (uint64_t)dw->block_size * sizeof(ids[0])) != 0 &&
+               ds4_gpu_tensor_write(g->dspark_position_ids,
+                                    0,
+                                    positions,
+                                    ((uint64_t)dw->block_size + 1u) *
+                                        sizeof(positions[0])) != 0;
+     if (ok) ok = ds4_gpu_begin_commands() != 0;
+     if (ok) {
+         ok = ds4_gpu_embed_tokens_hc_tensor(g->dspark_draft_hc,
+                                             g->dspark_draft_tokens,
+                                             base_model->map,
+                                             base_model->size,
+                                             base_weights->token_embd->abs_offset,
++                                            base_weights->token_embd->type,
+                                             (uint32_t)base_weights->token_embd->dim[1],
+                                             dw->block_size,
+                                             DS4_N_EMBD,
+                                             DS4_N_HC) != 0;
+     }
+     if (ok) {
+         ok = ds4_gpu_repeat_hc_tensor(g->dspark_target_hc,
+                                       g->dspark_main_x,
+                                       DS4_N_EMBD,
+                                       DS4_N_HC) != 0;
+     }
+     if (ok) {
+         ok = ds4_gpu_tensor_copy(g->dspark_stage_input_hc,
+                                  0,
+                                  g->dspark_target_hc,
+                                  0,
+                                  hc_bytes) != 0;
+     }
+     if (ok) {
+         ok = ds4_gpu_tensor_copy(g->dspark_stage_input_hc,
+@@ -30916,40 +30917,41 @@
+                                              in_dim,
+                                              DS4_N_EMBD,
+                                              g->dspark_target_hidden,
+                                              1);
+     }
+     if (ok) {
+         ok = ds4_gpu_rms_norm_weight_tensor(g->dspark_main_x,
+                                             g->dspark_stage0_proj,
+                                             dspark_model->map,
+                                             dspark_model->size,
+                                             stage0->main_norm->abs_offset,
+                                             DS4_N_EMBD,
+                                             DS4_RMS_EPS) != 0;
+     }
+     if (ok) {
+         ok = ds4_gpu_embed_tokens_hc_tensor(g->dspark_draft_hc,
+                                             g->dspark_draft_tokens,
+                                             base_model->map,
+                                             base_model->size,
+                                             base_weights->token_embd->abs_offset,
++                                            base_weights->token_embd->type,
+                                             (uint32_t)base_weights->token_embd->dim[1],
+                                             dw->block_size,
+                                             DS4_N_EMBD,
+                                             DS4_N_HC) != 0;
+     }
+     if (ok) {
+         ok = ds4_gpu_repeat_hc_tensor(g->dspark_target_hc,
+                                       g->dspark_main_x,
+                                       DS4_N_EMBD,
+                                       DS4_N_HC) != 0;
+     }
+     if (ok) {
+         ok = ds4_gpu_tensor_copy(g->dspark_stage_input_hc,
+                                  0,
+                                  g->dspark_target_hc,
+                                  0,
+                                  hc_bytes) != 0;
+     }
+     if (ok) {
+         ok = ds4_gpu_tensor_copy(g->dspark_stage_input_hc,

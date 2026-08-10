@@ -1,0 +1,40 @@
+--- a/ds4.c
++++ b/ds4.c
+@@ -15125,6 +15125,7 @@
+     uint32_t pipeline_capture_chunk_start;
+     uint32_t pipeline_capture_chunk_len;
+     bool ssd_streaming; /* glm-branch SSD streaming; always false here */
++    bool cache_aware_exact_prefill;
+ 
+     /* Optional MTP model state.  It has its own raw cache because the drafter
+      * runs on speculative future tokens; target KV state is updated only after
+@@ -20943,6 +20944,7 @@
+     }
+     const char *cache_mass_text = getenv("DS4F_SPEED_CACHE_AWARE_MASS_PCT");
+     if (cache_mass_text && cache_mass_text[0] && g->ssd_streaming &&
++        !g->cache_aware_exact_prefill &&
+         DS4_N_EXPERT_USED <= 32u) {
+         char *mass_end = NULL;
+         const long mass_pct = strtol(cache_mass_text, &mass_end, 10);
+@@ -30040,12 +30042,15 @@
+         const uint32_t pos = start + i;
+         const bool last = i + 1u == n_tokens;
+         float *token_logits = (last && logits) ? logits : NULL;
+-        if (!metal_graph_eval_token_raw_swa(g,
+-                                            model,
+-                                            weights,
+-                                            prompt->v[pos],
+-                                            pos,
+-                                            token_logits)) {
++        g->cache_aware_exact_prefill = true;
++        const bool eval_ok = metal_graph_eval_token_raw_swa(g,
++                                                             model,
++                                                             weights,
++                                                             prompt->v[pos],
++                                                             pos,
++                                                             token_logits);
++        g->cache_aware_exact_prefill = false;
++        if (!eval_ok) {
+             if (ds4_gpu_synchronize() == 0) {
+                 fprintf(stderr, "ds4: Metal synchronize after decode-style streaming prefill failure also failed\n");
+             }

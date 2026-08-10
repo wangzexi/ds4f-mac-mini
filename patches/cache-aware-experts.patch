@@ -1,6 +1,6 @@
 --- a/ds4.c
 +++ b/ds4.c
-@@ -20940,6 +20940,70 @@
+@@ -20940,6 +20940,67 @@
      }
      for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
          selected_i32[i] = (int32_t)selected[i];
@@ -57,11 +57,8 @@
 +            if (kept != 0 && kept < DS4_N_EXPERT_USED && kept_mass > 0.0f) {
 +                uint32_t fallback = 0;
 +                while (fallback < DS4_N_EXPERT_USED && !keep[fallback]) fallback++;
-+                const float renorm = total_mass / kept_mass;
 +                for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
-+                    if (keep[i]) {
-+                        weights[i] *= renorm;
-+                    } else {
++                    if (!keep[i]) {
 +                        selected_i32[i] = selected_i32[fallback];
 +                        weights[i] = 0.0f;
 +                    }
@@ -155,4 +152,3 @@
  uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
          uint64_t gate_expert_bytes,
          uint64_t down_expert_bytes) {
-
