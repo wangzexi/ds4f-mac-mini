@@ -3252,6 +3252,16 @@ static void ds4_gpu_print_task_memory_report(void) {
             ds4_gpu_gib((uint64_t)info.virtual_size));
 }
 
+uint64_t ds4_gpu_task_phys_footprint(void) {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    const kern_return_t kr = task_info(mach_task_self(),
+                                       TASK_VM_INFO,
+                                       (task_info_t)&info,
+                                       &count);
+    return kr == KERN_SUCCESS ? (uint64_t)info.phys_footprint : 0;
+}
+
 void ds4_gpu_print_memory_report(const char *label) {
     uint64_t cached_prefill_mask_bytes = 0;
     uint64_t cached_prefill_blk_bytes = 0;
@@ -8135,6 +8145,12 @@ uint64_t ds4_gpu_tensor_set_reusable(ds4_gpu_tensor *tensor, bool reusable) {
     (void)reusable;
     return 0;
 #endif
+}
+
+uint64_t ds4_gpu_tensor_owned_bytes(const ds4_gpu_tensor *tensor) {
+    if (!tensor) return 0;
+    const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
+    return obj.owner ? obj.bytes : 0;
 }
 
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {

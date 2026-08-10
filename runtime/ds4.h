@@ -185,13 +185,17 @@ typedef struct {
     uint32_t comp_cap;
 } ds4_context_memory;
 
-/* Physical working-set inputs for a single fixed-model request.  The graph
- * remains allocated at its session maximum, but graph_bytes prices only the
- * exact prefill rows the request will touch; untouched shared-buffer pages are
- * demand-zero and completed prefill pages can be made VM-reusable. */
+/* Physical working-set inputs for a single fixed-model request. The graph
+ * remains allocated at its session maximum. graph_bytes reports the logical
+ * size for the requested rows; the fixed-device server prices physical
+ * prefill residency from the session's owner-backed Metal workspace instead
+ * of treating this logical value as a residency estimate. */
 typedef struct {
     uint64_t resident_model_bytes;
     uint64_t kv_bytes;
+    /* One-row graph state that remains resident in both phases. */
+    uint64_t fixed_graph_bytes;
+    /* Logical graph size for diagnostics; not a physical-residency proxy. */
     uint64_t graph_bytes;
     uint64_t per_expert_bytes;
     uint32_t configured_cache_experts;
@@ -260,6 +264,7 @@ uint32_t ds4_engine_resize_streaming_expert_cache(
         uint32_t    pinned_experts,
         bool        release_resident);
 uint32_t ds4_engine_streaming_expert_cache_locked_count(ds4_engine *e);
+uint64_t ds4_engine_task_phys_footprint(ds4_engine *e);
 int ds4_engine_tp_vocab_split(ds4_engine *e);
 bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
                                         uint32_t layer,
@@ -387,6 +392,7 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
  * do not change tensor addresses or durable KV state. */
 uint64_t ds4_session_prepare_prefill_workspace(ds4_session *s);
 uint64_t ds4_session_release_prefill_workspace(ds4_session *s);
+uint64_t ds4_session_prefill_workspace_owner_bytes(ds4_session *s);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,

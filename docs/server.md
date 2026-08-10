@@ -64,15 +64,18 @@ prefill 新增后缀。生产配置把最小保存长度设为 1 token，短对�
 
 - `uncached = prompt_tokens - cached_tokens`，决定本轮真正触碰多少 prefill 行；
 - `output = min(max_tokens, 32768 - prompt_tokens)`，决定本轮规划 context；
-- 固定模型常驻页、预计 KV、精确 prefill graph 行数和 512MiB 安全余量先扣除；
-- M4 实测 Metal prefill 物理驻留约为静态 graph 估计的 4 倍，因此 prefill
-  规划按 `graph_bytes * 4` 计价，decode 仍按精确的单行 graph 计价；
+- 固定模型常驻页、按计划 context 计算的 KV、单行固定 graph 和 512MiB 系统
+  安全余量先扣除；
+- 已删除原来的 `graph_bytes * 4` 近似。M4实测在18行及以下走小路径，新增物理
+  驻留最高约44.3MiB，规划取48MiB；从19行开始进入完整batch路径，直接读取
+  本session的Metal owner buffer总量精确计价，当前固定值为3122479104字节
+  （2.91GiB），不再随逻辑graph字节乘倍数；
 - 剩余的 11.5GiB 工作集预算决定总专家槽数，最多1000槽。冷启动 prefill 先锁
   4GiB（约606槽），草稿清空后 decode 扩到6GiB并补锁约910槽，因此900个热点
   专家在系统wired余量充足时可以全部进入一级缓存，另约90槽作为可分页二级缓存；
   余量不足时则保留内核已确认锁定的槽，其余槽仍可驻留但允许分页。后续短 prefill
-  不再机械地解锁910→606。只有 graph 估算真的挤占空间时，总专家槽才按精确
-  方案缩小并同步解锁，decode 再扩回1000槽。
+  不再机械地解锁910→606。当前固定配置即使在4093行prefill时，base也只有
+  4.05GiB，仍保留全部1000槽；只有未来实际owner/KV超过预算时才会精确缩容。
 
 总槽数和锁页槽数已经解耦。macOS 拒绝继续 `mlock` 时只缩小 wired tier，不能再
 把整个专家缓存从 1000 槽误降到 455 槽。planner-driven 缩容会逐槽 `munlock`，
@@ -101,8 +104,11 @@ decode 时被清空的2.91GiB草稿不应为了数字好看重新占满；未归
 macOS文件缓存吸收专家sidecar读取，并保留系统要求的不可用户锁页空间。实测1000槽
 时进程footprint约7.5GB，而整机空闲页已接近零，说明统一内存仍被有效利用。
 
-早期8GiB预算实测：605-token prompt 使用844槽，prefill约36.2秒（16.7 t/s）；
-1005-token prompt 使用682槽，prefill约98.2秒（10.2 t/s）。`mlock`仍受整机全局
+旧的×4近似曾让605-token prompt只保留844槽、1005-token只保留682槽；实机逐点
+测量覆盖14、18、19、23、31、32、33、39、71、135、256、512、1025、2048和
+4095行后确认这是误判。新规划在4093行仍保留1000槽。设置
+`DS4_SERVER_MEMORY_CALIBRATION=1` 可在日志记录每轮逻辑graph、owner字节以及prefill
+前/峰值/清理后的 `phys_footprint`，用于同一固定设备重新标定。`mlock`仍受整机全局
 wired压力约束，失败时只保留已经被内核确认锁定的一级缓存，不影响额外可分页槽。
 修改 `*_WORKING_SET_MIB`、`*_PINNED_MIB` 或总槽上限后必须同时检查速度、
 `phys_footprint`、memory pressure 和日志，不能只以占用更大作为优化成功。
