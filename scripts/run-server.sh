@@ -10,8 +10,11 @@ pack="$project_dir/models/DeepSeek-V4-Flash-0731-IQ2Experts-packed.bin"
 host=${DS4F_SERVER_HOST:-0.0.0.0}
 port=${DS4F_SERVER_PORT:-8000}
 context=${DS4F_SERVER_CONTEXT:-32768}
-tokens=${DS4F_SERVER_TOKENS:-128}
+tokens=${DS4F_SERVER_TOKENS:-4096}
 cache_experts=${DS4F_SERVER_CACHE_EXPERTS:-600}
+working_set_mib=${DS4F_SERVER_WORKING_SET_MIB:-11776}
+pinned_mib=${DS4F_SERVER_PINNED_MIB:-4096}
+reserve_mib=${DS4F_SERVER_MEMORY_RESERVE_MIB:-512}
 
 if [ ! -x "$project_dir/ds4f-server" ]; then
     echo "missing ds4f-server; run: make server" >&2
@@ -27,6 +30,9 @@ exec env \
     DS4_METAL_STREAMING_EXPERT_PACK_PATH="$pack" \
     DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER=1 \
     DS4_METAL_PREFILL_STAGE_ALIAS=1 \
+    DS4_SERVER_WORKING_SET_MIB="$working_set_mib" \
+    DS4_SERVER_PINNED_MIB="$pinned_mib" \
+    DS4_SERVER_MEMORY_RESERVE_MIB="$reserve_mib" \
     "$project_dir/ds4f-server" \
     --model "$model" \
     --metal \

@@ -15710,6 +15710,30 @@ static uint64_t metal_graph_prefill_workspace_bytes(const ds4_gpu_graph *g) {
     return total;
 }
 
+static uint64_t metal_graph_set_prefill_workspace_reusable(
+        ds4_gpu_graph *g,
+        bool           reusable) {
+#if defined(__APPLE__)
+    if (!g) return 0;
+    uint64_t total = 0;
+    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+#define DS4_REUSE_PREFILL_FIELD(name) \
+        total += ds4_gpu_tensor_set_reusable( \
+                g->name##_by_tier[t], reusable);
+        DS4_GPU_PREFILL_WORKSPACE_FIELDS(DS4_REUSE_PREFILL_FIELD)
+#undef DS4_REUSE_PREFILL_FIELD
+    }
+    total += ds4_gpu_tensor_set_reusable(g->batch_q_half, reusable);
+    total += ds4_gpu_tensor_set_reusable(
+            g->prefill_seed_router_selected, reusable);
+    return total;
+#else
+    (void)g;
+    (void)reusable;
+    return 0;
+#endif
+}
+
 static void metal_graph_free_prefill_workspace(ds4_gpu_graph *g) {
     if (!g || !g->owns_prefill_workspace) return;
     for (int t = 0; t < DS4_MAX_GPUS; t++) {
@@ -57389,6 +57413,67 @@ uint64_t ds4_engine_model_bytes(ds4_engine *e) {
     return e->model.size;
 }
 
+bool ds4_engine_request_memory_profile(
+        ds4_engine                 *e,
+        int                         planned_context_tokens,
+        uint32_t                    prefill_tokens,
+        ds4_request_memory_profile *out) {
+    if (!e || !out || planned_context_tokens <= 0) return false;
+    memset(out, 0, sizeof(*out));
+    if (!e->ssd_streaming || !ds4_backend_uses_graph(e->backend)) return false;
+    if (prefill_tokens == 0) prefill_tokens = 1;
+    if (prefill_tokens > (uint32_t)planned_context_tokens) {
+        prefill_tokens = (uint32_t)planned_context_tokens;
+    }
+
+    uint64_t per_expert_bytes = 0;
+    if (!ds4_streaming_routed_expert_bytes(&e->weights,
+                                           &per_expert_bytes) ||
+        per_expert_bytes == 0) {
+        return false;
+    }
+
+    const ds4_context_memory mem =
+        ds4_context_memory_estimate_with_prefill_mode(
+                e->backend,
+                planned_context_tokens,
+                prefill_tokens,
+                true);
+    ds4_engine planner = *e;
+    planner.placement_ctx_hint = planned_context_tokens;
+    planner.prefill_chunk = prefill_tokens;
+    planner.placement_session_count_hint = 1;
+
+    out->resident_model_bytes = e->startup_model_span_bytes;
+    out->kv_bytes = ds4_add_sat_u64(mem.raw_bytes, mem.compressed_bytes);
+    out->graph_bytes = engine_per_tier_graph_overhead_bytes(&planner);
+    out->per_expert_bytes = per_expert_bytes;
+    out->configured_cache_experts = e->ssd_streaming_cache_experts;
+    out->prefill_tokens = prefill_tokens;
+    out->planned_context_tokens = planned_context_tokens;
+    return true;
+}
+
+uint32_t ds4_engine_resize_streaming_expert_cache(
+        ds4_engine *e,
+        uint32_t    experts,
+        bool        release_resident) {
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+    if (!e || !e->ssd_streaming || e->backend != DS4_BACKEND_METAL) return 0;
+    if (e->ssd_streaming_cache_experts != 0 &&
+        experts > e->ssd_streaming_cache_experts) {
+        experts = e->ssd_streaming_cache_experts;
+    }
+    return ds4_gpu_resize_streaming_expert_cache_budget(
+            experts, release_resident);
+#else
+    (void)e;
+    (void)experts;
+    (void)release_resident;
+    return 0;
+#endif
+}
+
 int ds4_engine_tp_vocab_split(ds4_engine *e) {
     return e && e->tp.active && e->tp.vocab_split;
 }
@@ -65795,4 +65880,32 @@ int ds4_session_ctx(ds4_session *s) {
 
 int ds4_session_prefill_cap(ds4_session *s) {
     return s ? (int)s->prefill_cap : 0;
+}
+
+uint64_t ds4_session_prepare_prefill_workspace(ds4_session *s) {
+#ifndef DS4_NO_GPU
+    if (!s || !s->engine ||
+        s->engine->backend != DS4_BACKEND_METAL ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
+        return 0;
+    }
+    return metal_graph_set_prefill_workspace_reusable(&s->graph, false);
+#else
+    (void)s;
+    return 0;
+#endif
+}
+
+uint64_t ds4_session_release_prefill_workspace(ds4_session *s) {
+#ifndef DS4_NO_GPU
+    if (!s || !s->engine ||
+        s->engine->backend != DS4_BACKEND_METAL ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
+        return 0;
+    }
+    return metal_graph_set_prefill_workspace_reusable(&s->graph, true);
+#else
+    (void)s;
+    return 0;
+#endif
 }

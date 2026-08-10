@@ -4509,6 +4509,27 @@ static bool send_all(int fd, const void *p, size_t n) {
     return true;
 }
 
+/* Check for an orderly close or reset without consuming request bytes.  Each
+ * connection carries exactly one HTTP request, so after the body has been
+ * parsed any EOF means the queued/in-flight inference no longer has a client. */
+static bool client_socket_closed(int fd) {
+    if (fd < 0) return true;
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    int rc;
+    do {
+        rc = poll(&pfd, 1, 0);
+    } while (rc < 0 && errno == EINTR);
+    if (rc < 0) return false;
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return true;
+    if (!(pfd.revents & POLLIN)) return false;
+
+    char byte;
+    ssize_t n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n == 0) return true;
+    if (n > 0) return false;
+    return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
+}
+
 static void json_escape(buf *b, const char *s) {
     buf_putc(b, '"');
     for (; *s; s++) {
@@ -8455,6 +8476,10 @@ struct server {
     int active_generations;
     int mixed_prefill_quantum;
     int last_prefill_slot;
+    bool dynamic_memory_planner;
+    uint64_t memory_working_set_bytes;
+    uint64_t memory_pinned_bytes;
+    uint64_t memory_reserve_bytes;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     pthread_cond_t clients_cv;
@@ -8474,11 +8499,165 @@ struct server {
 struct job {
     int fd;
     request req;
+    int cancelled;
     bool done;
     pthread_mutex_t mu;
     pthread_cond_t cv;
     job *next;
 };
+
+typedef struct {
+    bool valid;
+    int prompt_tokens;
+    int cached_tokens;
+    int uncached_tokens;
+    int output_tokens;
+    int planned_context_tokens;
+    uint32_t prefill_experts;
+    uint32_t decode_experts;
+    ds4_request_memory_profile prefill;
+    ds4_request_memory_profile decode;
+} server_request_memory_plan;
+
+static uint64_t server_env_mib(const char *name, uint64_t fallback_mib) {
+    const char *value = getenv(name);
+    if (!value || !value[0]) return fallback_mib * 1024ull * 1024ull;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long mib = strtoull(value, &end, 10);
+    if (end == value || *end != '\0' || errno != 0 || mib == 0 ||
+        mib > UINT64_MAX / (1024ull * 1024ull)) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: ignoring invalid %s=%s (expected positive MiB)",
+                   name, value);
+        return fallback_mib * 1024ull * 1024ull;
+    }
+    return (uint64_t)mib * 1024ull * 1024ull;
+}
+
+static uint64_t server_add_sat_u64(uint64_t a, uint64_t b) {
+    return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+}
+
+static uint32_t server_plan_expert_budget(
+        const server                      *s,
+        const ds4_request_memory_profile  *profile) {
+    if (!s || !profile || profile->per_expert_bytes == 0) return 0;
+    uint64_t base = server_add_sat_u64(profile->resident_model_bytes,
+                                       profile->kv_bytes);
+    base = server_add_sat_u64(base, profile->graph_bytes);
+    base = server_add_sat_u64(base, s->memory_reserve_bytes);
+    uint64_t by_working = s->memory_working_set_bytes > base ?
+        (s->memory_working_set_bytes - base) / profile->per_expert_bytes : 0;
+    uint64_t by_pinned = s->memory_pinned_bytes /
+                         profile->per_expert_bytes;
+    uint64_t experts = by_working < by_pinned ? by_working : by_pinned;
+    if (experts > profile->configured_cache_experts) {
+        experts = profile->configured_cache_experts;
+    }
+    if (experts > UINT32_MAX) experts = UINT32_MAX;
+    return (uint32_t)experts;
+}
+
+static server_request_memory_plan server_build_request_memory_plan(
+        server      *s,
+        server_slot *slot,
+        int          prompt_tokens,
+        int          cached_tokens,
+        int          requested_output_tokens) {
+    server_request_memory_plan plan = {0};
+    if (!s || !s->dynamic_memory_planner || prompt_tokens <= 0) return plan;
+    int room = s->ctx_size - prompt_tokens;
+    if (room < 0) room = 0;
+    int output = requested_output_tokens;
+    if (output < 0) output = 0;
+    if (output > room) output = room;
+    int uncached = prompt_tokens - cached_tokens;
+    if (uncached < 0) uncached = 0;
+    uint32_t active_prefill = (uint32_t)(uncached > 0 ? uncached : 1);
+    int cap = slot && slot->session ?
+        ds4_session_prefill_cap(slot->session) : 1;
+    const uint32_t session_cap = cap > 0 ? (uint32_t)cap : 1u;
+    if (active_prefill > session_cap) active_prefill = session_cap;
+    int planned_ctx = prompt_tokens + output;
+    if (planned_ctx <= 0) planned_ctx = 1;
+
+    if (!ds4_engine_request_memory_profile(s->engine, planned_ctx,
+                                           active_prefill, &plan.prefill) ||
+        !ds4_engine_request_memory_profile(s->engine, planned_ctx,
+                                           1, &plan.decode)) {
+        return plan;
+    }
+    plan.valid = true;
+    plan.prompt_tokens = prompt_tokens;
+    plan.cached_tokens = cached_tokens;
+    plan.uncached_tokens = uncached;
+    plan.output_tokens = output;
+    plan.planned_context_tokens = planned_ctx;
+    plan.prefill_experts = server_plan_expert_budget(s, &plan.prefill);
+    plan.decode_experts = server_plan_expert_budget(s, &plan.decode);
+    return plan;
+}
+
+static void server_memory_plan_begin_prefill(
+        server                           *s,
+        server_slot                      *slot,
+        const server_request_memory_plan *plan) {
+    if (!s || !slot || !plan || !plan->valid) return;
+    pthread_mutex_lock(&s->inference_mu);
+    uint32_t applied = ds4_engine_resize_streaming_expert_cache(
+            s->engine, plan->prefill_experts, true);
+    uint64_t reacquired = ds4_session_prepare_prefill_workspace(slot->session);
+    pthread_mutex_unlock(&s->inference_mu);
+    const uint64_t base = server_add_sat_u64(
+        server_add_sat_u64(plan->prefill.resident_model_bytes,
+                           plan->prefill.kv_bytes),
+        server_add_sat_u64(plan->prefill.graph_bytes,
+                           s->memory_reserve_bytes));
+    server_log(DS4_LOG_PREFILL,
+               "ds4-server: memory plan prefill uncached=%d prompt=%d output=%d ctx=%d rows=%u base=%.2f GiB cache=%u/%.2f GiB workspace_reacquired=%.2f GiB",
+               plan->uncached_tokens,
+               plan->prompt_tokens,
+               plan->output_tokens,
+               plan->planned_context_tokens,
+               plan->prefill.prefill_tokens,
+               (double)base / 1073741824.0,
+               applied,
+               (double)applied * (double)plan->prefill.per_expert_bytes /
+                   1073741824.0,
+               (double)reacquired / 1073741824.0);
+}
+
+static void server_memory_plan_finish_prefill(
+        server                           *s,
+        server_slot                      *slot,
+        const server_request_memory_plan *plan) {
+    if (!s || !slot || !plan || !plan->valid) return;
+    pthread_mutex_lock(&s->inference_mu);
+    uint64_t released = ds4_session_release_prefill_workspace(slot->session);
+    uint32_t applied = ds4_engine_resize_streaming_expert_cache(
+            s->engine, plan->decode_experts, false);
+    pthread_mutex_unlock(&s->inference_mu);
+    server_log(DS4_LOG_PREFILL,
+               "ds4-server: memory plan decode ctx=%d cache=%u/%.2f GiB prefill_workspace_reusable=%.2f GiB",
+               plan->planned_context_tokens,
+               applied,
+               (double)applied * (double)plan->decode.per_expert_bytes /
+                   1073741824.0,
+               (double)released / 1073741824.0);
+}
+
+static bool job_client_disconnected(job *j) {
+    if (!j) return true;
+    if (__atomic_load_n(&j->cancelled, __ATOMIC_RELAXED)) return true;
+    if (!client_socket_closed(j->fd)) return false;
+    __atomic_store_n(&j->cancelled, 1, __ATOMIC_RELAXED);
+    return true;
+}
+
+static bool job_cancel_cb(void *ud) {
+    return job_client_disconnected((job *)ud);
+}
 
 /* =========================================================================
  * Tool Call Text Memory.
@@ -11087,6 +11266,7 @@ static uint64_t server_next_sequence(server *s) {
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
 static void generate_job(server *s, server_slot *slot, job *j) {
+    if (job_client_disconnected(j)) return;
     char err[160];
     err[0] = '\0';
     const int old_pos = ds4_session_pos(slot->session);
@@ -11242,6 +11422,14 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     j->req.cache_read_tokens = cached;
     j->req.cache_write_tokens = prompt_tokens > cached ? prompt_tokens - cached : 0;
 
+    const server_request_memory_plan memory_plan =
+        server_build_request_memory_plan(s,
+                                         slot,
+                                         prompt_tokens,
+                                         cached,
+                                         j->req.max_tokens);
+    server_memory_plan_begin_prefill(s, slot, &memory_plan);
+
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
                                     cache_source, disk_cached, disk_cache_path);
@@ -11341,6 +11529,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, cold_store_len);
         if (server_session_sync(s, slot, &prefix, err, sizeof(err)) != 0) {
+            server_memory_plan_finish_prefill(s, slot, &memory_plan);
             ds4_tokens_free(&prefix);
             ds4_tokens_free(&effective_prompt);
             ds4_session_set_progress(slot->session, NULL, NULL);
@@ -11367,6 +11556,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
 
     if (server_session_sync(s, slot, prompt_for_sync,
                             err, sizeof(err)) != 0) {
+        server_memory_plan_finish_prefill(s, slot, &memory_plan);
         ds4_tokens_free(&effective_prompt);
         ds4_session_set_progress(slot->session, NULL, NULL);
         ds4_session_set_display_progress(slot->session, NULL, NULL);
@@ -11378,6 +11568,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
     }
+    server_memory_plan_finish_prefill(s, slot, &memory_plan);
     free(disk_cache_path);
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
@@ -11506,7 +11697,8 @@ decode_again:
     dsml_decode_tracker_init(&dsml_tracker);
 
     server_generation_enter(s);
-    while (!g_stop_requested && completion < max_tokens &&
+    while (!g_stop_requested && !job_client_disconnected(j) &&
+           completion < max_tokens &&
            ds4_session_pos(slot->session) < ds4_session_ctx(slot->session)) {
         dsml_decode_state dsml_state = j->req.kind == REQ_CHAT && j->req.has_tools ?
             dsml_tracker.decode : DSML_DECODE_OUTSIDE;
@@ -11750,6 +11942,20 @@ decode_again:
         if (stop_decode) break;
     }
     server_generation_leave(s);
+
+    if (job_client_disconnected(j)) {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: %s ctx=%s gen=%d client disconnected; inference cancelled",
+                   j->req.kind == REQ_CHAT ? "chat" : "completion",
+                   ctx_span,
+                   completion);
+        anthropic_stream_free(&anthropic_live);
+        openai_stream_free(&openai_live);
+        responses_stream_free(&responses_live);
+        buf_free(&text);
+        ds4_tokens_free(&effective_prompt);
+        return;
+    }
 
     if (g_stop_requested && strcmp(finish, "error") != 0) {
         finish = "error";
@@ -12282,7 +12488,9 @@ static void *worker_main(void *arg) {
     for (;;) {
         job *j = dequeue(s);
         if (!j) break;
+        ds4_session_set_cancel(s->slots[0].session, job_cancel_cb, j);
         generate_job(s, &s->slots[0], j);
+        ds4_session_set_cancel(s->slots[0].session, NULL, NULL);
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -12307,7 +12515,9 @@ static void *slot_worker_main(void *arg) {
         slot->assigned = NULL;
         pthread_mutex_unlock(&s->mu);
 
+        ds4_session_set_cancel(slot->session, job_cancel_cb, j);
         generate_job(s, slot, j);
+        ds4_session_set_cancel(slot->session, NULL, NULL);
         pthread_mutex_lock(&j->mu);
         j->done = true;
         pthread_cond_signal(&j->cv);
@@ -13081,6 +13291,29 @@ int main(int argc, char **argv) {
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
+    const char *dynamic_memory = getenv("DS4_SERVER_DYNAMIC_MEMORY");
+    s.dynamic_memory_planner =
+        cfg.engine.backend == DS4_BACKEND_METAL &&
+        cfg.engine.ssd_streaming &&
+        slot_count == 1 &&
+        (!dynamic_memory || strcmp(dynamic_memory, "0") != 0);
+    s.memory_working_set_bytes =
+        server_env_mib("DS4_SERVER_WORKING_SET_MIB", 11776);
+    s.memory_pinned_bytes =
+        server_env_mib("DS4_SERVER_PINNED_MIB", 4096);
+    s.memory_reserve_bytes =
+        server_env_mib("DS4_SERVER_MEMORY_RESERVE_MIB", 512);
+    if (s.dynamic_memory_planner) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: per-request memory planner enabled working_set=%.2f GiB expert_lock_budget=%.2f GiB reserve=%.2f GiB",
+                   (double)s.memory_working_set_bytes / 1073741824.0,
+                   (double)s.memory_pinned_bytes / 1073741824.0,
+                   (double)s.memory_reserve_bytes / 1073741824.0);
+    } else if (cfg.engine.ssd_streaming && slot_count > 1) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: per-request memory planner disabled for %d resident sessions",
+                   slot_count);
+    }
     s.slots = xmalloc((size_t)slot_count * sizeof(*s.slots));
     memset(s.slots, 0, (size_t)slot_count * sizeof(*s.slots));
     if (s.batched_mode) {

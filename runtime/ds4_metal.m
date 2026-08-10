@@ -663,6 +663,7 @@ static id<MTLBuffer> g_stream_expert_validate_status_buffer;
 @property(nonatomic, assign) uint64_t offset;
 @property(nonatomic, assign) uint64_t bytes;
 @property(nonatomic, assign) uint8_t owner;
+@property(nonatomic, assign) uint8_t reusable;
 @end
 
 @implementation DS4MetalTensor
@@ -3603,6 +3604,25 @@ void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     }
     g_stream_expert_cache_budget_override = experts;
     ds4_gpu_stream_expert_cache_clear_all(1);
+}
+
+uint32_t ds4_gpu_resize_streaming_expert_cache_budget(
+        uint32_t experts,
+        bool     release_resident) {
+    if (experts > DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES) {
+        experts = DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES;
+    }
+    const uint32_t old_budget = g_stream_expert_cache_budget_override;
+    g_stream_expert_cache_budget_override = experts;
+    if (release_resident && experts < old_budget &&
+        g_stream_expert_cache_entry_count > experts) {
+        /* Entries may share multi-GiB virtual slabs.  Pruning entries alone
+         * recycles their slots but intentionally keeps the slab objects; a
+         * request memory planner needs the stronger operation so munlock and
+         * slab release happen before large prefill scratch is touched. */
+        ds4_gpu_stream_expert_cache_clear_all(0);
+    }
+    return ds4_gpu_stream_expert_cache_configured_count();
 }
 
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
@@ -8046,6 +8066,36 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
     DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
     return (uint8_t *)[obj.buffer contents] + obj.offset;
+}
+
+uint64_t ds4_gpu_tensor_set_reusable(ds4_gpu_tensor *tensor, bool reusable) {
+#if TARGET_OS_OSX && defined(MADV_FREE_REUSABLE) && defined(MADV_FREE_REUSE)
+    if (!tensor) return 0;
+    DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
+    /* Views can overlap an owning allocation.  The workspace walker visits
+     * every field, so advising views as well would double-count and could
+     * issue partially overlapping FREE_REUSABLE ranges. */
+    if (!obj.owner || !obj.buffer || obj.bytes == 0 ||
+        obj.reusable == (uint8_t)(reusable ? 1 : 0)) return 0;
+    void *contents = [obj.buffer contents];
+    if (!contents || obj.offset > (uint64_t)NSUIntegerMax) return 0;
+    const uint64_t page = (uint64_t)getpagesize();
+    uintptr_t start = (uintptr_t)contents + (uintptr_t)obj.offset;
+    uintptr_t aligned = (start + page - 1u) & ~(uintptr_t)(page - 1u);
+    if (aligned < start) return 0;
+    uint64_t leading = (uint64_t)(aligned - start);
+    if (leading >= obj.bytes) return 0;
+    uint64_t bytes = (obj.bytes - leading) & ~(page - 1u);
+    if (bytes == 0 || bytes > (uint64_t)SIZE_MAX) return 0;
+    const int advice = reusable ? MADV_FREE_REUSABLE : MADV_FREE_REUSE;
+    if (madvise((void *)aligned, (size_t)bytes, advice) != 0) return 0;
+    obj.reusable = reusable ? 1 : 0;
+    return bytes;
+#else
+    (void)tensor;
+    (void)reusable;
+    return 0;
+#endif
 }
 
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {

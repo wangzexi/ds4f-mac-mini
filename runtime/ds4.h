@@ -185,6 +185,20 @@ typedef struct {
     uint32_t comp_cap;
 } ds4_context_memory;
 
+/* Physical working-set inputs for a single fixed-model request.  The graph
+ * remains allocated at its session maximum, but graph_bytes prices only the
+ * exact prefill rows the request will touch; untouched shared-buffer pages are
+ * demand-zero and completed prefill pages can be made VM-reusable. */
+typedef struct {
+    uint64_t resident_model_bytes;
+    uint64_t kv_bytes;
+    uint64_t graph_bytes;
+    uint64_t per_expert_bytes;
+    uint32_t configured_cache_experts;
+    uint32_t prefill_tokens;
+    int planned_context_tokens;
+} ds4_request_memory_profile;
+
 typedef struct {
     uint8_t *ptr;
     uint64_t len;
@@ -235,6 +249,15 @@ uint32_t ds4_engine_layer_compress_ratio(ds4_engine *e, uint32_t layer);
 uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 int ds4_engine_embd_dim(ds4_engine *e);
 uint64_t ds4_engine_model_bytes(ds4_engine *e);
+bool ds4_engine_request_memory_profile(
+        ds4_engine                 *e,
+        int                         planned_context_tokens,
+        uint32_t                    prefill_tokens,
+        ds4_request_memory_profile *out);
+uint32_t ds4_engine_resize_streaming_expert_cache(
+        ds4_engine *e,
+        uint32_t    experts,
+        bool        release_resident);
 int ds4_engine_tp_vocab_split(ds4_engine *e);
 bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
                                         uint32_t layer,
@@ -358,6 +381,10 @@ typedef enum {
  * state is refilled from scratch. */
 #define DS4_SESSION_SYNC_INTERRUPTED 2
 int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t errlen);
+/* Reacquire/release the shared batched-prefill pages around a request.  These
+ * do not change tensor addresses or durable KV state. */
+uint64_t ds4_session_prepare_prefill_workspace(ds4_session *s);
+uint64_t ds4_session_release_prefill_workspace(ds4_session *s);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,

@@ -50,6 +50,11 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset,
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
+/* Mark owner-backed shared tensor pages reclaimable between prefill calls.
+ * On Metal, reusable=true uses macOS VM reusable-page accounting and
+ * reusable=false reacquires the range before the GPU touches it again.
+ * Callers gate this Metal-specific operation to Apple builds. */
+uint64_t ds4_gpu_tensor_set_reusable(ds4_gpu_tensor *tensor, bool reusable);
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count);
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes);
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes);
@@ -148,6 +153,13 @@ void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled);
 void ds4_gpu_release_zero_prefix_prefill_mask_cache(void);
 #endif
 void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
+/* Change the live cache ceiling without resetting lifetime statistics.
+ * Growing preserves resident experts.  A shrinking call with
+ * release_resident=true drops the current slabs so their locked physical
+ * pages are returned immediately. */
+uint32_t ds4_gpu_resize_streaming_expert_cache_budget(
+        uint32_t experts,
+        bool     release_resident);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
