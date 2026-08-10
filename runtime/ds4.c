@@ -57457,6 +57457,7 @@ bool ds4_engine_request_memory_profile(
 uint32_t ds4_engine_resize_streaming_expert_cache(
         ds4_engine *e,
         uint32_t    experts,
+        uint32_t    pinned_experts,
         bool        release_resident) {
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
     if (!e || !e->ssd_streaming || e->backend != DS4_BACKEND_METAL) return 0;
@@ -57464,11 +57465,13 @@ uint32_t ds4_engine_resize_streaming_expert_cache(
         experts > e->ssd_streaming_cache_experts) {
         experts = e->ssd_streaming_cache_experts;
     }
+    if (pinned_experts > experts) pinned_experts = experts;
     return ds4_gpu_resize_streaming_expert_cache_budget(
-            experts, release_resident);
+            experts, pinned_experts, release_resident);
 #else
     (void)e;
     (void)experts;
+    (void)pinned_experts;
     (void)release_resident;
     return 0;
 #endif

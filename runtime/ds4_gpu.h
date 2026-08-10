@@ -159,6 +159,7 @@ void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts);
  * pages are returned immediately. */
 uint32_t ds4_gpu_resize_streaming_expert_cache_budget(
         uint32_t experts,
+        uint32_t pinned_experts,
         bool     release_resident);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);

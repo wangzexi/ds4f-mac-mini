@@ -20,7 +20,7 @@ make server
 scripts/run-server.sh
 ```
 
-默认监听 `0.0.0.0:8000`，使用 32K context、600 个专家缓存槽；固定的
+默认监听 `0.0.0.0:8000`，使用 32K context、最多 900 个专家缓存槽；固定的
 `deepseek-v4-flash` 模型 ID 默认直接回答，不进入 thinking。服务保留一个常驻
 session，并启用精确 CPU router、packed expert sidecar 和 Metal
 attention/FFN workspace 复用。可通过以下变量覆盖：
@@ -64,20 +64,36 @@ prefill 新增后缀。生产配置把最小保存长度设为 1 token，短对�
 - `uncached = prompt_tokens - cached_tokens`，决定本轮真正触碰多少 prefill 行；
 - `output = min(max_tokens, 32768 - prompt_tokens)`，决定本轮规划 context；
 - 固定模型常驻页、预计 KV、精确 prefill graph 行数和 512MiB 安全余量先扣除；
-- 剩余工作集与 4GiB 专家锁页预算共同决定专家槽上限，且不超过启动参数的
-  600 槽。
+- M4 实测 Metal prefill 物理驻留约为静态 graph 估计的 4 倍，因此 prefill
+  规划按 `graph_bytes * 4` 计价，decode 仍按精确的单行 graph 计价；
+- 剩余的 8GiB 工作集预算决定总专家槽数，最多 900 槽；4GiB 锁页预算只决定
+  一级 wired cache（当前为 606 槽），额外槽构成可分页的二级缓存。
+
+总槽数和锁页槽数已经解耦。macOS 拒绝继续 `mlock` 时只缩小 wired tier，不能再
+把整个专家缓存从 1000 槽误降到 455 槽。planner-driven 缩容会逐槽 `munlock`，
+并在释放旧 Metal slab 前设置 `MTLPurgeableStateEmpty`，避免驱动缓存旧物理后备、
+再与新 slab 和 prefill workspace 叠加。
 
 预填充结束后，约 2.91GiB 的 batch-only Metal workspace 会通过 macOS
 `MADV_FREE_REUSABLE` 标为可回收；tensor 地址和 KV 不变，下次 prefill 前再用
 `MADV_FREE_REUSE` 重新取得。因此 decode 可以继续使用专家缓存，而不会把上一轮
-预填充草稿永久压在物理内存中。实测 5-token 和 292-token prompt 完成后，server
-RSS 均回到约 4.1GiB；600 槽没有出现 `mlock` 降级。
+预填充草稿永久作为不可回收内存保留。
 
-默认预算为 11.5GiB 进程工作集、4GiB 专家锁页和 512MiB 余量。空机单独测试
-得到的 10.66GiB `mlock` 极限不能全给专家，因为 Metal/KV 工作区也占用系统
-wire budget；曾尝试 1300 槽时只锁到约 4.03GiB，运行时反而降到 455 槽，所以
-生产默认仍为 600。可用上面的三个 `*_MIB` 环境变量继续实验，但修改后必须检查
-日志中是否出现 `could not mlock all buffers`。
+默认预算为 8GiB 动态工作集、4GiB专家锁页、512MiB余量和900总槽。这不是简单
+追求最大的 footprint；实机存在明确的 VM 性能悬崖：
+
+| 总槽 | 短提示 decode | `phys_footprint` | 结果 |
+|---:|---:|---:|---|
+| 600 | 约 2.32 t/s | 约 4.8GB | 原始稳定基线 |
+| 900 | 2.54–2.58 t/s | 约 6.8GB | 当前最优稳定点 |
+| 1000 | 约 2.52 t/s | 约 7.47GB | 无额外收益 |
+| 1050 | 约 1.97 t/s | 约 7.81GB | 开始 VM 抖动 |
+| 1200 | 约 0.31 t/s | 约 8.82GB | 不可用 |
+
+阶段性规划实测：605-token prompt 使用844槽，prefill约36.2秒（16.7 t/s）；
+1005-token prompt 使用682槽，prefill约98.2秒（10.2 t/s）。连续缩容/扩容没有
+`mlock` 失败。修改 `*_WORKING_SET_MIB`、`*_PINNED_MIB` 或总槽上限后必须同时检查
+速度、`phys_footprint`、memory pressure 和日志，不能只以占用更大作为优化成功。
 
 服务器不提供身份验证；只应通过可信局域网或 Tailscale 暴露，不要直接映射到
 公网。
