@@ -8616,6 +8616,10 @@ static server_request_memory_plan server_build_request_memory_plan(
                                            1, &plan.decode)) {
         return plan;
     }
+    /* Prefill owns only the embedding plus one streamed layer. Decode keeps
+     * the complete non-routed trunk after its one-time phase transition. */
+    plan.decode.resident_model_bytes =
+        plan.decode.decode_resident_model_bytes;
     plan.valid = true;
     plan.prompt_tokens = prompt_tokens;
     plan.cached_tokens = cached_tokens;
@@ -8706,11 +8710,13 @@ static void server_memory_plan_finish_prefill(
     const uint64_t footprint_prefill_peak = s->memory_calibration ?
         ds4_engine_task_phys_footprint(s->engine) : 0;
     uint64_t released = ds4_session_release_prefill_workspace(slot->session);
+    const bool shrinking_expert_pool =
+        plan->decode_experts < plan->prefill_experts;
     uint32_t applied = ds4_engine_resize_streaming_expert_cache(
             s->engine,
             plan->decode_experts,
             plan->decode_pinned_experts,
-            false);
+            shrinking_expert_pool);
     uint32_t locked =
         ds4_engine_streaming_expert_cache_locked_count(s->engine);
     if (s->memory_calibration) usleep(250000);

@@ -19671,6 +19671,23 @@ static bool metal_graph_stream_map_layer_decode(
     return ok;
 }
 
+static bool metal_graph_stream_map_prefill_trunk(
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           il) {
+    ds4_model_map_span_vec spans;
+    if (!weights_model_map_decode_layer_spans(weights, il, &spans)) {
+        fprintf(stderr,
+                "ds4: Metal SSD streaming could not build prefill trunk %u spans\n",
+                il);
+        return false;
+    }
+    const bool ok = metal_graph_install_model_spans(
+            model, &spans, "prefill_trunk", (int32_t)il);
+    free(spans.v);
+    return ok;
+}
+
 static bool metal_graph_stream_map_output(
         const ds4_model   *model,
         const ds4_weights *weights) {
@@ -27095,6 +27112,10 @@ static bool metal_graph_upload_prompt_embeddings_hc(
                                                        n_tokens);
 }
 
+static bool metal_graph_exact_prefill_rows_enabled(void) {
+    return getenv("DS4_METAL_EXACT_PREFILL_ROWS") != NULL;
+}
+
 static bool metal_graph_hc_rms_scale_project(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *norm_scratch,
@@ -29225,7 +29246,6 @@ static bool metal_graph_encode_layer_ffn_batch(
          (!decode_items || (uint64_t)n_tokens + (uint32_t)decode_count > g->prefill_cap))) {
         return false;
     }
-
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t mix_hc = 2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
     const uint64_t shared_dim = layer->ffn_gate_shexp->dim[1];
@@ -33746,6 +33766,146 @@ static bool metal_graph_prefill_pipeline_stage_major(
     return ok;
 }
 
+/* Canonical fixed-Mini prefill: retain one layer's non-routed weights, then
+ * run every prompt row through the already accepted single-token decode
+ * arithmetic before advancing to the next layer.  This changes only the I/O
+ * nesting (layer outside token); attention/compressor/router/MoE operations
+ * and their accumulation order remain identical to decode. */
+static bool metal_graph_prefill_layer_major_decode_rows(
+        ds4_gpu_graph *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        const token_vec       *prompt,
+        uint32_t               start,
+        uint32_t               n_tokens,
+        float                 *logits,
+        bool                   show_progress,
+        ds4_session_progress_fn display_progress,
+        void                  *display_progress_ud) {
+    if (!g || !model || !weights || !prompt || n_tokens == 0 ||
+        n_tokens > g->prefill_cap || start > (uint32_t)prompt->len ||
+        n_tokens > (uint32_t)prompt->len - start || g->raw_cap == 0 ||
+        g->placement || g->dspark_capture_enabled) {
+        return false;
+    }
+
+    if (g->ssd_streaming) {
+        g->streaming_static_decode_map_current = false;
+        if (!metal_graph_stream_map_token(model, weights)) return false;
+    }
+    if (!metal_graph_upload_prompt_embeddings_hc(metal_graph_batch_cur_hc(g),
+                                                  metal_graph_prefill_tokens(g),
+                                                  model,
+                                                  weights,
+                                                  prompt,
+                                                  start,
+                                                  n_tokens)) {
+        return false;
+    }
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t hc_bytes = hc_dim * sizeof(float);
+    bool ok = true;
+    for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        if (g->ssd_streaming &&
+            !metal_graph_stream_map_prefill_trunk(model, weights, il)) {
+            ok = false;
+            break;
+        }
+        if (ok) ok = ds4_gpu_begin_commands() != 0;
+        for (uint32_t t = 0; ok && t < n_tokens; t++) {
+            const uint32_t pos = start + t;
+            const uint32_t raw_row = pos % g->raw_cap;
+            const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
+            ds4_gpu_tensor *in_row = metal_graph_tensor_row_view(
+                    metal_graph_batch_cur_hc(g), t, hc_dim);
+            ds4_gpu_tensor *out_row = metal_graph_tensor_row_view(
+                    metal_graph_batch_next_hc(g), t, hc_dim);
+            ok = in_row && out_row &&
+                 ds4_gpu_tensor_copy(metal_graph_cur_hc(g),
+                                     0,
+                                     in_row,
+                                     0,
+                                     hc_bytes) != 0;
+            if (ok) {
+                ok = metal_graph_encode_decode_layer(g,
+                                                     model,
+                                                     &weights->layer[il],
+                                                     il,
+                                                     pos,
+                                                     g->layer_raw_cache[il],
+                                                     g->raw_cap,
+                                                     raw_row,
+                                                     n_raw,
+                                                     prompt->v[pos]);
+            }
+            if (ok) {
+                ok = ds4_gpu_tensor_copy(out_row,
+                                         0,
+                                         metal_graph_after_ffn_hc(g),
+                                         0,
+                                         hc_bytes) != 0;
+            }
+            ds4_gpu_tensor_free(out_row);
+            ds4_gpu_tensor_free(in_row);
+        }
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        else (void)ds4_gpu_synchronize();
+        if (!ok) break;
+
+        ds4_gpu_tensor *tmp = metal_graph_batch_cur_hc(g);
+        g->batch_cur_hc_by_tier[g->active_tier] =
+            metal_graph_batch_next_hc(g);
+        g->batch_next_hc_by_tier[g->active_tier] = tmp;
+        if (show_progress) {
+            fprintf(stderr,
+                    "ds4: exact layer-major prefill layer %u/%u\r",
+                    il + 1u,
+                    (uint32_t)DS4_N_LAYER);
+            fflush(stderr);
+        }
+        if (display_progress) {
+            display_progress(display_progress_ud,
+                             "prefill_display",
+                             (int)(start + n_tokens),
+                             prompt->len);
+        }
+    }
+    if (show_progress) fputc('\n', stderr);
+    if (!ok) return false;
+
+    ds4_gpu_tensor *saved_cur = metal_graph_cur_hc(g);
+    ds4_gpu_tensor *last_hc = NULL;
+    if (logits) {
+        last_hc = metal_graph_tensor_row_view(
+                metal_graph_batch_cur_hc(g), n_tokens - 1u, hc_dim);
+        ok = last_hc != NULL;
+    }
+    if (ok && logits && g->ssd_streaming) {
+        g->streaming_static_decode_map_current = false;
+        ok = metal_graph_stream_map_output(model, weights);
+    }
+    if (ok && logits) {
+        g->cur_hc_by_tier[g->active_tier] = last_hc;
+        ok = ds4_gpu_begin_commands() != 0;
+    }
+    if (ok && logits) {
+        ok = metal_graph_encode_output_head(
+                g, model, weights, weights->output->dim[1]);
+    }
+    if (ok && logits) ok = ds4_gpu_end_commands() != 0;
+    else if (!ok) (void)ds4_gpu_synchronize();
+    g->cur_hc_by_tier[g->active_tier] = saved_cur;
+    ds4_gpu_tensor_free(last_hc);
+    if (ok && logits) {
+        ok = ds4_gpu_tensor_read(metal_graph_logits(g),
+                                 0,
+                                 logits,
+                                 (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    return ok;
+}
+
 static bool metal_graph_prefill_layer_major(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -33767,6 +33927,21 @@ static bool metal_graph_prefill_layer_major(
 
     bool ok = metal_graph_upload_prompt_tokens(metal_graph_prefill_tokens(g), prompt, start, n_tokens);
     if (!ok) return false;
+
+    if (metal_graph_exact_prefill_rows_enabled() &&
+        g->ssd_streaming &&
+        !imatrix) {
+        return metal_graph_prefill_layer_major_decode_rows(g,
+                                                           model,
+                                                           weights,
+                                                           prompt,
+                                                           start,
+                                                           n_tokens,
+                                                           logits,
+                                                           show_progress,
+                                                           display_progress,
+                                                           display_progress_ud);
+    }
 
 #ifdef DS4_ROCM_BUILD
     if (g->ssd_streaming &&
@@ -34399,18 +34574,12 @@ static bool metal_graph_prefill_layer_major(
         ok = last_hc != NULL;
     }
     if (ok && logits && g->ssd_streaming) {
-        const bool static_decode_map =
-            metal_graph_stream_decode_static_map_enabled();
-        const bool static_map_state_cache =
-            static_decode_map &&
-            metal_graph_stream_decode_static_map_state_cache_enabled();
+        /* Keep the large prefill expert/workspace budget alive through the
+         * output head only.  The server shrinks that phase before the first
+         * decode token, whose streaming entry point then loads and retains
+         * the complete non-routed trunk. */
         g->streaming_static_decode_map_current = false;
-        if (static_map_state_cache) {
-            ok = metal_graph_stream_map_decode_static_all(model, weights);
-            if (ok) g->streaming_static_decode_map_current = true;
-        } else {
-            ok = metal_graph_stream_map_output(model, weights);
-        }
+        ok = metal_graph_stream_map_output(model, weights);
     }
     if (ok && logits) {
         g->cur_hc_by_tier[g->active_tier] = last_hc;
@@ -36190,6 +36359,7 @@ struct ds4_engine {
     uint32_t ssd_streaming_full_layers;
     uint32_t ssd_streaming_preload_experts;
     uint64_t startup_model_span_bytes;
+    uint64_t decode_model_span_bytes;
     ds4_ssd_memory_lock simulated_memory;
     bool quality;
     bool glm_mtp;
@@ -52330,6 +52500,7 @@ static void ds4_engine_configure_target_prefill_for_prompt(
     (void)e;
     (void)prompt_tokens;
 #else
+    (void)prompt_tokens;
     if (!e ||
         e->backend != DS4_BACKEND_METAL ||
         !e->ssd_streaming ||
@@ -52339,31 +52510,18 @@ static void ds4_engine_configure_target_prefill_for_prompt(
         return;
     }
 
-    /* Attention and FFN batch workspaces have disjoint lifetimes.  The alias
-     * is exact and gives the page cache more of unified memory at every prompt
-     * length.  An explicit caller value still wins. */
+    /* Attention and FFN batch workspaces have disjoint lifetimes. */
     if (getenv("DS4_METAL_PREFILL_STAGE_ALIAS") == NULL) {
         (void)setenv("DS4_METAL_PREFILL_STAGE_ALIAS", "1", 0);
     }
-
-    /* The measured 8K plan fits only with one current-layer (256 expert)
-     * cache.  Cache slabs are lazy, so this remains a metadata-only resize
-     * before the first prefill.  A warm reusable engine keeps its existing
-     * cache and the validated 4K chunk instead of discarding useful pages. */
-    if (prompt_tokens > 4096u &&
-        e->prefill_chunk == 0 &&
-        ds4_gpu_stream_expert_cache_current_count() == 0) {
-        e->prefill_chunk = 8192u;
-        if (e->ssd_streaming_cache_experts > DS4_N_EXPERT) {
-            e->ssd_streaming_cache_experts = DS4_N_EXPERT;
-            e->ssd_streaming_cache_bytes = 0;
-            ds4_gpu_set_streaming_expert_cache_budget(DS4_N_EXPERT);
-        }
-        fprintf(stderr,
-                "ds4: prefill auto memory: 8K aliased workspace + %u-expert "
-                "current-layer cache for %u prompt tokens\n",
-                e->ssd_streaming_cache_experts,
-                prompt_tokens);
+    /* Canonical layer-major scheduling keeps each trunk layer resident while
+     * every prompt row consumes it.  Reuse decode's single-row arithmetic so
+     * batching changes I/O order, not the accepted numerical stream. */
+    if (getenv("DS4_METAL_EXACT_PREFILL_ROWS") == NULL) {
+        (void)setenv("DS4_METAL_EXACT_PREFILL_ROWS", "1", 0);
+    }
+    if (getenv("DS4_METAL_DISABLE_STREAMING_COLD_DECODE_PREFILL") == NULL) {
+        (void)setenv("DS4_METAL_DISABLE_STREAMING_COLD_DECODE_PREFILL", "1", 0);
     }
 #endif
 }
@@ -56504,6 +56662,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->placement_ctx_hint = opt->placement_ctx_hint;
     e->placement_session_count_hint = opt->placement_session_count_hint;
     e->share_session_prefill_workspace = opt->share_session_prefill_workspace;
+    ds4_engine_configure_target_prefill_for_prompt(e, 0);
     ds4_acquire_instance_lock();
 
     if (opt->simulate_used_memory_bytes != 0 &&
@@ -57108,15 +57267,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         map_output,
                         &spans);
             } else if (ds4_gpu_explicit_model_io_enabled()) {
-                /* Every decode token consumes the complete Q4 trunk.  Own it
-                 * once instead of issuing 43 blocking reads per token.  The
-                 * request planner sees startup_model_span_bytes and gives the
-                 * remaining exact budget to routed-expert slots. */
-                spans_ok = weights_model_map_decode_static_spans(
-                        &e->weights,
-                        true,
-                        true,
-                        &spans);
+                /* Prefill is layer-major, so only the embedding is useful at
+                 * startup.  Each layer replaces this view with its own trunk;
+                 * the complete trunk becomes resident only after prefill has
+                 * released its larger workspace and expert budget. */
+                spans_ok = weights_model_map_token_spans(&e->weights, &spans);
             } else {
                 spans_ok = weights_model_map_token_spans(&e->weights, &spans);
             }
@@ -57150,6 +57305,41 @@ static int ds4_engine_open_internal(ds4_engine **out,
             load_span_count = spans.len;
             e->startup_model_span_bytes =
                 ds4_gpu_explicit_model_io_enabled() ? owned_span_bytes : span_bytes;
+            if (!load_slice && ds4_gpu_explicit_model_io_enabled()) {
+                ds4_model_map_span_vec decode_spans;
+                if (!weights_model_map_decode_static_spans(
+                            &e->weights, true, true, &decode_spans)) {
+                    fprintf(stderr,
+                            "ds4: invalid explicit-I/O decode trunk spans\n");
+                    free(spans.v);
+                    free(offsets);
+                    free(sizes);
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+                uint64_t decode_owned_bytes = 0;
+                for (uint32_t i = 0; i < decode_spans.len; i++) {
+                    const uint64_t offset = decode_spans.v[i].off;
+                    const uint64_t size =
+                        decode_spans.v[i].end - decode_spans.v[i].off;
+                    if (io_page == 0) {
+                        decode_owned_bytes =
+                            ds4_add_sat_u64(decode_owned_bytes, size);
+                        continue;
+                    }
+                    const uint64_t aligned_offset = offset & ~(io_page - 1u);
+                    const uint64_t leading = offset - aligned_offset;
+                    uint64_t owned = align_up(leading + size, io_page);
+                    if (owned > e->model.size - aligned_offset) {
+                        owned = e->model.size - aligned_offset;
+                    }
+                    decode_owned_bytes =
+                        ds4_add_sat_u64(decode_owned_bytes, owned);
+                }
+                e->decode_model_span_bytes = decode_owned_bytes;
+                free(decode_spans.v);
+            }
             if (load_slice) {
                 char load_end[32];
                 if (map_output && load_layer_end == UINT32_MAX) {
@@ -57170,9 +57360,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         (double)span_bytes / 1073741824.0);
             } else if (ds4_gpu_explicit_model_io_enabled()) {
                 fprintf(stderr,
-                        "ds4: explicit I/O loading permanent Q4 trunk, token embedding, and output head (%u spans, %.2f GiB)\n",
+                        "ds4: explicit I/O startup keeps only token embedding (%u spans, %.2f GiB); decode trunk %.2f GiB is deferred\n",
                         spans.len,
-                        (double)span_bytes / 1073741824.0);
+                        (double)span_bytes / 1073741824.0,
+                        (double)e->decode_model_span_bytes / 1073741824.0);
             } else {
                 fprintf(stderr,
                         "ds4: SSD streaming initial %s model map restricted to token embedding (%u spans, %.2f GiB tensor span)\n",
@@ -57181,7 +57372,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         (double)span_bytes / 1073741824.0);
             }
             ds4_gpu_set_model_io_context(
-                    ds4_gpu_explicit_model_io_enabled() ? "startup_trunk" : "startup_token",
+                    "startup_token",
                     -1);
             model_map_ok = ds4_gpu_set_model_map_spans(e->model.map,
                                                         e->model.size,
@@ -57286,6 +57477,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                                        e->model.tensor_data_pos,
                                                        e->model.size - e->model.tensor_data_pos,
                                                        e->model.max_tensor_bytes);
+        }
+        if (e->decode_model_span_bytes == 0) {
+            e->decode_model_span_bytes = e->startup_model_span_bytes;
         }
         if (!model_map_ok) {
             fprintf(stderr,
@@ -57557,6 +57751,7 @@ bool ds4_engine_request_memory_profile(
     planner.placement_session_count_hint = 1;
 
     out->resident_model_bytes = e->startup_model_span_bytes;
+    out->decode_resident_model_bytes = e->decode_model_span_bytes;
     out->kv_bytes = ds4_add_sat_u64(mem.raw_bytes, mem.compressed_bytes);
     out->graph_bytes = engine_per_tier_graph_overhead_bytes(&planner);
     planner.prefill_chunk = 1;

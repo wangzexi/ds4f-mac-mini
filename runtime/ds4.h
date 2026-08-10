@@ -191,7 +191,10 @@ typedef struct {
  * prefill residency from the session's owner-backed Metal workspace instead
  * of treating this logical value as a residency estimate. */
 typedef struct {
+    /* Payload resident while prefill streams one transformer layer at a time. */
     uint64_t resident_model_bytes;
+    /* Complete non-routed trunk retained after the prefill-to-decode switch. */
+    uint64_t decode_resident_model_bytes;
     uint64_t kv_bytes;
     /* One-row graph state that remains resident in both phases. */
     uint64_t fixed_graph_bytes;

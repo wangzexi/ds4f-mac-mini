@@ -12,15 +12,30 @@ When `--metal --ssd-streaming` is active:
 - Metal kernels can bind only ranges covered by those buffers;
 - CPU tensor access is resolved through the same buffers;
 - an unplanned CPU or GPU payload access is logged as `BLOCKED` and fails;
-- the complete Q4 trunk, token embedding, and output head are explicitly read
-  once into permanent owned buffers because every decode token consumes them;
-- the request planner treats those bytes as resident and assigns only the
-  exact remaining budget to routed-expert slots.
+- startup retains only the token embedding; prefill replaces it with one
+  transformer layer at a time and releases that layer after execution;
+- layer-major prefill keeps the selected expert working set and its larger
+  workspace in the memory otherwise occupied by the complete trunk;
+- the canonical fixed-target prefill path changes only the I/O nesting: each
+  transformer layer is read once, while prompt rows execute sequentially with
+  the accepted single-token decode arithmetic inside that layer;
+- prefill maps only the output head for its final logits, then the server
+  releases prefill workspace and shrinks the expert cache;
+- the first decode token explicitly reads the complete Q4 trunk, token
+  embedding, and output head into owned buffers and retains them for later
+  decode tokens;
+- the request planner prices the small streamed prefill residency and the
+  complete decode residency separately.
+
+The canonical prefill path was checked against the frozen mmap/token-major
+baseline over all 129,280 output logits. The dumps are byte-identical
+(`max_abs = 0`, identical greedy token), so the phase-specific residency does
+not introduce a numerical approximation.
 
 Each logical read emits one `ds4-io` record:
 
 ```text
-ds4-io: seq=24 kind=decode_layer layer=22 spans=2 \
+ds4-io: seq=24 kind=prefill_trunk layer=22 spans=2 \
 useful=116314072 io=116359168 read_ms=54.6 rate=2031.1_MiB_s buffers=2
 ```
 
