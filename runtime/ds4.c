@@ -8,10 +8,10 @@
  * narrow: validation accepts the known Flash and Pro layouts and fails early
  * for anything else.
  *
- * Loading is mmap based.  The loader parses only the GGUF header, metadata
- * table, and tensor directory.  Tensor data stays in the kernel page cache
- * until inference touches it, or until Metal wraps slices of the mapping as
- * no-copy MTLBuffers.
+ * The fixed Apple SSD runtime maps only enough of GGUF to parse the header,
+ * metadata, and tensor directory.  It then removes the tensor payload mapping
+ * and explicitly reads every scheduled weight range into owned Metal buffers.
+ * Other backends retain the upstream mmap path.
  */
 
 #include <errno.h>
@@ -2088,6 +2088,7 @@ typedef struct {
     int fd;
     const uint8_t *map;
     uint64_t size;
+    uint64_t mapped_size;
 
     uint32_t version;
     uint64_t n_kv;
@@ -2323,7 +2324,9 @@ static void model_close(ds4_model *m) {
     if (!m) return;
     free(m->kv);
     free(m->tensors);
-    if (m->map) munmap((void *)m->map, (size_t)m->size);
+    if (m->map && m->mapped_size) {
+        munmap((void *)m->map, (size_t)m->mapped_size);
+    }
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
     m->fd = -1;
@@ -2480,6 +2483,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     m->fd = fd;
     m->map = map;
     m->size = (uint64_t)st.st_size;
+    m->mapped_size = (uint64_t)st.st_size;
 
     ds4_cursor c = cursor_at(m, 0);
     uint32_t magic;
@@ -2495,6 +2499,32 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     parse_tensors(m, &c);
 
     if (!metal_mapping && prefetch_cpu) model_prefetch_cpu_mapping(m);
+}
+
+/* Once the explicit Metal views own the initial payload, retain only the GGUF
+ * header, metadata, tensor directory, and the partial page containing its end.
+ * Any accidental CPU/GPU dereference of the old tensor mmap then fails instead
+ * of silently creating an unobservable file-backed page-in. */
+static bool model_drop_tensor_payload_mapping(ds4_model *m) {
+    if (!m || !m->map || m->mapped_size == 0) return false;
+    const uint64_t page = (uint64_t)getpagesize();
+    if (page == 0 || m->tensor_data_pos > UINT64_MAX - (page - 1u)) return false;
+    uint64_t keep = (m->tensor_data_pos + page - 1u) & ~(page - 1u);
+    if (keep >= m->mapped_size) return true;
+    const uint64_t drop = m->mapped_size - keep;
+    if (drop > (uint64_t)SIZE_MAX ||
+        munmap((void *)(m->map + keep), (size_t)drop) != 0) {
+        fprintf(stderr,
+                "ds4-io: failed to remove tensor payload mmap: %s\n",
+                strerror(errno));
+        return false;
+    }
+    m->mapped_size = keep;
+    fprintf(stderr,
+            "ds4-io: tensor payload mmap removed; metadata_map=%llu payload_unmapped=%llu\n",
+            (unsigned long long)keep,
+            (unsigned long long)drop);
+    return true;
 }
 
 static void print_size(uint64_t bytes) {
@@ -3076,6 +3106,20 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
 
 /* Return the in-place tensor payload inside the mapped GGUF. */
 static const void *tensor_data(const ds4_model *m, const ds4_tensor *t) {
+    if (ds4_gpu_explicit_model_io_enabled()) {
+        const void *p = ds4_gpu_model_host_ptr(m->map,
+                                               m->size,
+                                               t->abs_offset,
+                                               t->bytes);
+        if (!p) {
+            fprintf(stderr,
+                    "ds4-io: tensor %.*s bypassed the explicit I/O scheduler\n",
+                    (int)t->name.len,
+                    t->name.ptr);
+            ds4_die("unplanned model payload access");
+        }
+        return p;
+    }
     return m->map + t->abs_offset;
 }
 
@@ -17601,7 +17645,8 @@ static bool metal_graph_alloc(
 static bool metal_graph_install_model_spans(
         const ds4_model              *model,
         const ds4_model_map_span_vec *spans,
-        const char                   *label) {
+        const char                   *label,
+        int32_t                       layer) {
     if (!model || !spans || spans->len == 0) return false;
 
     uint64_t *offsets = xmalloc((size_t)spans->len * sizeof(offsets[0]));
@@ -17611,6 +17656,7 @@ static bool metal_graph_install_model_spans(
         sizes[i] = spans->v[i].end - spans->v[i].off;
     }
 
+    ds4_gpu_set_model_io_context(label, layer);
     const bool ok = ds4_gpu_set_model_map_spans(model->map,
                                                 model->size,
                                                 offsets,
@@ -19352,6 +19398,7 @@ static void metal_graph_stream_readahead_layer(
         const ds4_model   *model,
         const ds4_weights *weights,
         uint32_t           il) {
+    if (ds4_gpu_explicit_model_io_enabled()) return;
     ds4_model_map_span_vec spans;
     if (!weights_model_map_spans(weights, il, il, false, &spans)) return;
     metal_graph_stream_readahead_spans(model, &spans);
@@ -19362,6 +19409,7 @@ static void metal_graph_stream_readahead_layer_decode(
         const ds4_model   *model,
         const ds4_weights *weights,
         uint32_t           il) {
+    if (ds4_gpu_explicit_model_io_enabled()) return;
     ds4_model_map_span_vec spans;
     if (!weights_model_map_decode_layer_spans(weights, il, &spans)) return;
     metal_graph_stream_readahead_spans(model, &spans);
@@ -19371,6 +19419,7 @@ static void metal_graph_stream_readahead_layer_decode(
 static void metal_graph_stream_readahead_output(
         const ds4_model   *model,
         const ds4_weights *weights) {
+    if (ds4_gpu_explicit_model_io_enabled()) return;
     ds4_model_map_span_vec spans;
     if (!weights_model_map_output_spans(weights, &spans)) return;
     metal_graph_stream_readahead_spans(model, &spans);
@@ -19576,7 +19625,7 @@ static bool metal_graph_stream_map_token(
         fprintf(stderr, "ds4: Metal SSD streaming could not build token embedding span\n");
         return false;
     }
-    const bool ok = metal_graph_install_model_spans(model, &spans, "token embedding");
+    const bool ok = metal_graph_install_model_spans(model, &spans, "token_embedding", -1);
     free(spans.v);
     return ok;
 }
@@ -19589,7 +19638,7 @@ static bool metal_graph_stream_map_decode_static_all(
         fprintf(stderr, "ds4: Metal SSD streaming could not build static decode spans\n");
         return false;
     }
-    const bool ok = metal_graph_install_model_spans(model, &spans, "static decode");
+    const bool ok = metal_graph_install_model_spans(model, &spans, "static_decode", -1);
     free(spans.v);
     return ok;
 }
@@ -19603,7 +19652,7 @@ static bool metal_graph_stream_map_layer(
         fprintf(stderr, "ds4: Metal SSD streaming could not build layer %u spans\n", il);
         return false;
     }
-    const bool ok = metal_graph_install_model_spans(model, &spans, "layer");
+    const bool ok = metal_graph_install_model_spans(model, &spans, "prefill_layer", (int32_t)il);
     free(spans.v);
     return ok;
 }
@@ -19617,7 +19666,7 @@ static bool metal_graph_stream_map_layer_decode(
         fprintf(stderr, "ds4: Metal SSD streaming could not build decode layer %u spans\n", il);
         return false;
     }
-    const bool ok = metal_graph_install_model_spans(model, &spans, "decode layer");
+    const bool ok = metal_graph_install_model_spans(model, &spans, "decode_layer", (int32_t)il);
     free(spans.v);
     return ok;
 }
@@ -19630,7 +19679,7 @@ static bool metal_graph_stream_map_output(
         fprintf(stderr, "ds4: Metal SSD streaming could not build output head spans\n");
         return false;
     }
-    const bool ok = metal_graph_install_model_spans(model, &spans, "output head");
+    const bool ok = metal_graph_install_model_spans(model, &spans, "output_head", -1);
     free(spans.v);
     return ok;
 }
@@ -43746,7 +43795,8 @@ static bool glm_graph_forward_tokens(
 #endif
     const bool full_layer_prepare_base =
         glm_graph_stream_prefill_full_layer_prepare_enabled(g,
-                                                            full_layer_prefill);
+                                                            full_layer_prefill) &&
+        !ds4_gpu_explicit_model_io_enabled();
     const bool layer_pagein =
         full_layer_prepare_base &&
         glm_graph_env_present("DS4_ROCM_ENABLE_STREAMING_PREFILL_LAYER_PAGEIN",
@@ -57057,6 +57107,16 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         load_layer_start == 0,
                         map_output,
                         &spans);
+            } else if (ds4_gpu_explicit_model_io_enabled()) {
+                /* Every decode token consumes the complete Q4 trunk.  Own it
+                 * once instead of issuing 43 blocking reads per token.  The
+                 * request planner sees startup_model_span_bytes and gives the
+                 * remaining exact budget to routed-expert slots. */
+                spans_ok = weights_model_map_decode_static_spans(
+                        &e->weights,
+                        true,
+                        true,
+                        &spans);
             } else {
                 spans_ok = weights_model_map_token_spans(&e->weights, &spans);
             }
@@ -57069,15 +57129,27 @@ static int ds4_engine_open_internal(ds4_engine **out,
             uint64_t *offsets = xmalloc((size_t)spans.len * sizeof(offsets[0]));
             uint64_t *sizes = xmalloc((size_t)spans.len * sizeof(sizes[0]));
             uint64_t span_bytes = 0;
+            uint64_t owned_span_bytes = 0;
+            const uint64_t io_page = (uint64_t)getpagesize();
             for (uint32_t i = 0; i < spans.len; i++) {
                 offsets[i] = spans.v[i].off;
                 sizes[i] = spans.v[i].end - spans.v[i].off;
                 span_bytes += sizes[i];
+                if (ds4_gpu_explicit_model_io_enabled() && io_page != 0) {
+                    const uint64_t aligned_offset = offsets[i] & ~(io_page - 1u);
+                    const uint64_t leading = offsets[i] - aligned_offset;
+                    uint64_t owned = align_up(leading + sizes[i], io_page);
+                    if (owned > e->model.size - aligned_offset) {
+                        owned = e->model.size - aligned_offset;
+                    }
+                    owned_span_bytes = ds4_add_sat_u64(owned_span_bytes, owned);
+                }
             }
             load_offsets = offsets;
             load_sizes = sizes;
             load_span_count = spans.len;
-            e->startup_model_span_bytes = span_bytes;
+            e->startup_model_span_bytes =
+                ds4_gpu_explicit_model_io_enabled() ? owned_span_bytes : span_bytes;
             if (load_slice) {
                 char load_end[32];
                 if (map_output && load_layer_end == UINT32_MAX) {
@@ -57096,6 +57168,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         load_end,
                         spans.len,
                         (double)span_bytes / 1073741824.0);
+            } else if (ds4_gpu_explicit_model_io_enabled()) {
+                fprintf(stderr,
+                        "ds4: explicit I/O loading permanent Q4 trunk, token embedding, and output head (%u spans, %.2f GiB)\n",
+                        spans.len,
+                        (double)span_bytes / 1073741824.0);
             } else {
                 fprintf(stderr,
                         "ds4: SSD streaming initial %s model map restricted to token embedding (%u spans, %.2f GiB tensor span)\n",
@@ -57103,6 +57180,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
                         spans.len,
                         (double)span_bytes / 1073741824.0);
             }
+            ds4_gpu_set_model_io_context(
+                    ds4_gpu_explicit_model_io_enabled() ? "startup_trunk" : "startup_token",
+                    -1);
             model_map_ok = ds4_gpu_set_model_map_spans(e->model.map,
                                                         e->model.size,
                                                         load_offsets,
@@ -57258,6 +57338,17 @@ static int ds4_engine_open_internal(ds4_engine **out,
                                              load_span_count)) {
             fprintf(stderr, "ds4: %s failed to prepare optional model cache\n",
                     ds4_backend_name(e->backend));
+            free(load_offsets);
+            free(load_sizes);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
+        }
+        if (e->ssd_streaming &&
+            ds4_gpu_explicit_model_io_enabled() &&
+            !model_drop_tensor_payload_mapping(&e->model)) {
+            fprintf(stderr,
+                    "ds4: explicit model I/O could not remove the tensor payload mapping\n");
             free(load_offsets);
             free(load_sizes);
             ds4_engine_close(e);

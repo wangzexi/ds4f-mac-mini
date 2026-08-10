@@ -100,6 +100,14 @@ int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
+/* Fixed Apple/SSD runtime: model payloads are read explicitly into owned
+ * shared Metal buffers.  The mmap pointer remains only a logical model id. */
+int ds4_gpu_explicit_model_io_enabled(void);
+void ds4_gpu_set_model_io_context(const char *kind, int32_t layer);
+const void *ds4_gpu_model_host_ptr(const void *model_map,
+                                   uint64_t model_size,
+                                   uint64_t offset,
+                                   uint64_t bytes);
 int ds4_gpu_set_model_fd_for_map(int fd, const void *model_map);
 int ds4_gpu_build_derived_artifacts(const void *model_map, uint64_t model_size,
                                     const char *model_path);

@@ -306,6 +306,10 @@ static id<MTLBuffer> g_moe_q4_up_slots_buffer;
 static id<MTLBuffer> g_moe_q4_down_slots_buffer;
 static id<MTLBuffer> g_attn_out_group_ids_buffer;
 static int g_model_fd = -1;
+static int g_model_fd_owned;
+static char g_model_io_kind[40] = "unspecified";
+static int32_t g_model_io_layer = -1;
+static uint64_t g_model_io_sequence;
 static int g_stream_expert_pack_fd = -1;
 static int g_stream_expert_pack_checked;
 static uint64_t g_stream_expert_pack_data_offset;
@@ -549,6 +553,8 @@ typedef struct {
     uint64_t model_offset;
     uint64_t bytes;
 } ds4_gpu_model_view;
+
+static void ds4_gpu_stream_full_expert_addr_clear_layer(uint32_t layer);
 
 static ds4_gpu_model_view g_model_views[DS4_METAL_MAX_MODEL_VIEWS];
 static uint32_t g_model_view_count;
@@ -1615,6 +1621,13 @@ static void ds4_gpu_progress_failed(void) {
 }
 
 static void ds4_gpu_model_views_clear(void) {
+    if (g_ssd_streaming_mode) {
+        for (uint32_t layer = 0;
+             layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
+             layer++) {
+            ds4_gpu_stream_full_expert_addr_clear_layer(layer);
+        }
+    }
     for (uint32_t i = 0; i < g_model_view_count; i++) {
         g_model_views[i].buffer = nil;
         g_model_views[i].model_map = NULL;
@@ -3603,8 +3616,20 @@ void ds4_gpu_set_ssd_streaming(bool enabled) {
     ds4_gpu_stream_expert_cache_clear_all(1);
     if (g_ssd_streaming_mode) {
         fprintf(stderr,
-                "ds4: Metal SSD streaming mode enabled; full model residency and warmup are skipped\n");
+                "ds4: Metal explicit model I/O enabled; mmap payload access, full residency, and warmup are disabled\n");
     }
+}
+
+int ds4_gpu_explicit_model_io_enabled(void) {
+    return g_ssd_streaming_mode;
+}
+
+void ds4_gpu_set_model_io_context(const char *kind, int32_t layer) {
+    snprintf(g_model_io_kind,
+             sizeof(g_model_io_kind),
+             "%s",
+             kind && kind[0] ? kind : "unspecified");
+    g_model_io_layer = layer;
 }
 
 void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
@@ -9419,7 +9444,9 @@ void ds4_gpu_cleanup(void) {
         g_stream_expert_pack_checked = 0;
         g_stream_expert_pack_data_offset = 0;
         g_stream_expert_pack_size = 0;
+        if (g_model_fd_owned && g_model_fd >= 0) close(g_model_fd);
         g_model_fd = -1;
+        g_model_fd_owned = 0;
         g_model_map_ptr = NULL;
         g_model_map_size = 0;
         g_model_mapped_offset = 0;
@@ -10441,6 +10468,137 @@ int ds4_gpu_set_model_map_spans(
         uint64_t max_tensor_bytes) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
     if (!model_map || model_size == 0 || !offsets || !sizes || count == 0) return 0;
+    if (g_ssd_streaming_mode) {
+        if (g_model_fd < 0) {
+            fprintf(stderr, "ds4: explicit model I/O has no model file descriptor\n");
+            return 0;
+        }
+        if (ds4_gpu_model_views_cover_spans(model_map,
+                                            model_size,
+                                            offsets,
+                                            sizes,
+                                            count)) {
+            return 1;
+        }
+
+        @autoreleasepool {
+            const double started_ms = ds4_gpu_now_ms();
+            uint64_t useful_bytes = 0;
+            uint64_t io_bytes = 0;
+            ds4_gpu_model_residency_clear();
+            ds4_gpu_model_views_clear();
+
+            const uint64_t page = (uint64_t)getpagesize();
+            for (uint32_t i = 0; i < count; i++) {
+                if (offsets[i] > model_size || sizes[i] == 0 ||
+                    sizes[i] > model_size - offsets[i]) {
+                    fprintf(stderr,
+                            "ds4: explicit model span %u is outside the GGUF file\n",
+                            i);
+                    ds4_gpu_model_views_clear();
+                    return 0;
+                }
+                if (g_model_view_count == DS4_METAL_MAX_MODEL_VIEWS) {
+                    fprintf(stderr, "ds4: explicit model view table is full\n");
+                    ds4_gpu_model_views_clear();
+                    return 0;
+                }
+
+                const uint64_t file_offset = offsets[i] & ~(page - 1u);
+                const uint64_t leading = offsets[i] - file_offset;
+                if (sizes[i] > UINT64_MAX - leading) {
+                    ds4_gpu_model_views_clear();
+                    return 0;
+                }
+                uint64_t bytes = round_up_u64(leading + sizes[i], page);
+                if (bytes > model_size - file_offset) bytes = model_size - file_offset;
+                if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax ||
+                    bytes > (uint64_t)[g_device maxBufferLength]) {
+                    fprintf(stderr,
+                            "ds4: explicit model span %u has unsupported size %.2f MiB\n",
+                            i,
+                            ds4_gpu_mib(bytes));
+                    ds4_gpu_model_views_clear();
+                    return 0;
+                }
+
+                id<MTLBuffer> buffer =
+                    [g_device newBufferWithLength:(NSUInteger)bytes
+                                           options:MTLResourceStorageModeShared];
+                if (!buffer) {
+                    fprintf(stderr,
+                            "ds4: explicit model buffer allocation failed for %.2f MiB\n",
+                            ds4_gpu_mib(bytes));
+                    ds4_gpu_model_views_clear();
+                    return 0;
+                }
+                buffer.label = [NSString stringWithFormat:@"ds4_explicit_%s_%d_%u",
+                                g_model_io_kind,
+                                g_model_io_layer,
+                                i];
+
+                uint8_t *dst = (uint8_t *)[buffer contents];
+                uint64_t done = 0;
+                while (done < bytes) {
+                    const uint64_t remaining = bytes - done;
+                    const size_t chunk = remaining > 8u * 1024u * 1024u ?
+                        8u * 1024u * 1024u : (size_t)remaining;
+                    ssize_t got;
+                    do {
+                        got = pread(g_model_fd,
+                                    dst + done,
+                                    chunk,
+                                    (off_t)(file_offset + done));
+                    } while (got < 0 && errno == EINTR);
+                    if (got <= 0) {
+                        fprintf(stderr,
+                                "ds4: explicit model pread failed kind=%s layer=%d "
+                                "offset=%llu done=%llu: %s\n",
+                                g_model_io_kind,
+                                g_model_io_layer,
+                                (unsigned long long)file_offset,
+                                (unsigned long long)done,
+                                got == 0 ? "unexpected EOF" : strerror(errno));
+                        ds4_gpu_model_views_clear();
+                        return 0;
+                    }
+                    done += (uint64_t)got;
+                }
+                [buffer didModifyRange:NSMakeRange(0, (NSUInteger)bytes)];
+
+                ds4_gpu_model_view *view = &g_model_views[g_model_view_count++];
+                view->buffer = buffer;
+                view->model_map = model_map;
+                view->model_size = model_size;
+                view->model_offset = file_offset;
+                view->bytes = bytes;
+                useful_bytes += sizes[i];
+                io_bytes += bytes;
+            }
+
+            g_model_map_ptr = model_map;
+            g_model_map_size = model_size;
+            g_model_mapped_offset = offsets[0];
+            g_model_mapped_size = io_bytes;
+            g_model_mapped_max_tensor_bytes = max_tensor_bytes;
+            const double elapsed_ms = ds4_gpu_now_ms() - started_ms;
+            const double mib_s = elapsed_ms > 0.0 ?
+                ((double)io_bytes / 1048576.0) / (elapsed_ms / 1000.0) : 0.0;
+            fprintf(stderr,
+                    "ds4-io: seq=%llu kind=%s layer=%d spans=%u "
+                    "useful=%llu io=%llu read_ms=%.3f rate=%.2f_MiB_s buffers=%u\n",
+                    (unsigned long long)++g_model_io_sequence,
+                    g_model_io_kind,
+                    g_model_io_layer,
+                    count,
+                    (unsigned long long)useful_bytes,
+                    (unsigned long long)io_bytes,
+                    elapsed_ms,
+                    mib_s,
+                    g_model_view_count);
+            return 1;
+        }
+    }
     if (count == 1) {
         return ds4_gpu_set_model_map_range(model_map,
                                            model_size,
@@ -10508,8 +10666,55 @@ int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
 }
 
 int ds4_gpu_set_model_fd(int fd) {
-    g_model_fd = fd;
+    if (g_model_fd_owned && g_model_fd >= 0) close(g_model_fd);
+    g_model_fd = -1;
+    g_model_fd_owned = 0;
+    if (fd < 0) return 0;
+    const int owned = dup(fd);
+    if (owned < 0) {
+        fprintf(stderr, "ds4: cannot duplicate model fd for explicit I/O: %s\n",
+                strerror(errno));
+        return 0;
+    }
+#if defined(F_NOCACHE)
+    if (fcntl(owned, F_NOCACHE, 1) != 0) {
+        fprintf(stderr, "ds4: cannot enable F_NOCACHE for model I/O: %s\n",
+                strerror(errno));
+        close(owned);
+        return 0;
+    }
+#endif
+    g_model_fd = owned;
+    g_model_fd_owned = 1;
+    fprintf(stderr, "ds4-io: model fd duplicated with F_NOCACHE; all payload reads are explicit\n");
     return 1;
+}
+
+const void *ds4_gpu_model_host_ptr(const void *model_map,
+                                   uint64_t model_size,
+                                   uint64_t offset,
+                                   uint64_t bytes) {
+    if (!g_ssd_streaming_mode) return NULL;
+    if (!model_map || bytes == 0 || offset > model_size ||
+        bytes > model_size - offset) return NULL;
+    const uint64_t end = offset + bytes;
+    for (uint32_t i = 0; i < g_model_view_count; i++) {
+        const ds4_gpu_model_view *view = &g_model_views[i];
+        if (view->model_map != model_map || view->model_size != model_size) continue;
+        const uint64_t view_end = view->model_offset + view->bytes;
+        if (offset >= view->model_offset && end <= view_end) {
+            return (const uint8_t *)[view->buffer contents] +
+                   (offset - view->model_offset);
+        }
+    }
+    fprintf(stderr,
+            "ds4-io: BLOCKED unplanned CPU weight access offset=%llu bytes=%llu "
+            "kind=%s layer=%d\n",
+            (unsigned long long)offset,
+            (unsigned long long)bytes,
+            g_model_io_kind,
+            g_model_io_layer);
+    return NULL;
 }
 
 static int ds4_gpu_model_views_cover_range(
@@ -10612,6 +10817,27 @@ static id<MTLBuffer> ds4_gpu_wrap_model_exact_range_impl(
         model_size == 0 || offset > model_size || len > model_size - offset) {
         fprintf(stderr, "ds4: Metal exact model range is outside the mapped model\n");
         return nil;
+    }
+
+    if (g_ssd_streaming_mode) {
+        uint64_t owned_inner = 0;
+        id<MTLBuffer> owned = ds4_gpu_wrap_model_range(model_map,
+                                                       model_size,
+                                                       offset,
+                                                       len,
+                                                       &owned_inner);
+        if (!owned) {
+            fprintf(stderr,
+                    "ds4-io: BLOCKED unplanned GPU weight access offset=%llu "
+                    "bytes=%llu kind=%s layer=%d\n",
+                    (unsigned long long)offset,
+                    (unsigned long long)len,
+                    g_model_io_kind,
+                    g_model_io_layer);
+            return nil;
+        }
+        if (inner_offset) *inner_offset = owned_inner;
+        return owned;
     }
 
     const uint64_t page = (uint64_t)getpagesize();
@@ -11195,6 +11421,15 @@ static int ds4_gpu_stream_expert_pack_source(
             close(fd);
             return 0;
         }
+#if defined(F_NOCACHE)
+        if (fcntl(fd, F_NOCACHE, 1) != 0) {
+            fprintf(stderr,
+                    "ds4: cannot enable F_NOCACHE for packed experts: %s\n",
+                    strerror(errno));
+            close(fd);
+            return 0;
+        }
+#endif
         g_stream_expert_pack_fd = fd;
         g_stream_expert_pack_data_offset = header_data_offset;
         g_stream_expert_pack_size = (uint64_t)st.st_size;
@@ -11301,6 +11536,16 @@ static void ds4_gpu_stream_expert_cache_note_pread(
         }
         g_stream_expert_cache_layer_pread_ms[layer] += ms;
     }
+    const double mib_s = ms > 0.0 ?
+        ((double)bytes / 1048576.0) / (ms / 1000.0) : 0.0;
+    fprintf(stderr,
+            "ds4-io: seq=%llu kind=expert layer=%u io=%llu read_ms=%.3f "
+            "rate=%.2f_MiB_s\n",
+            (unsigned long long)++g_model_io_sequence,
+            layer,
+            (unsigned long long)bytes,
+            ms,
+            mib_s);
 }
 
 static uint32_t ds4_gpu_stream_expert_pread_thread_limit(void) {
