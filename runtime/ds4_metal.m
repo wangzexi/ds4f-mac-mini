@@ -15466,17 +15466,21 @@ void ds4_gpu_stream_expert_cache_release_layer_keep_recent(uint32_t layer,
             NSUInteger dst_gate_inner = 0;
             NSUInteger dst_up_inner = 0;
             NSUInteger dst_down_inner = 0;
-            if (!src_gate || !src_up || !src_down ||
-                !ds4_gpu_stream_expert_alloc_slab_slot(gate_bytes,
-                                                        down_bytes,
-                                                        &dst_gate,
-                                                        &dst_up,
-                                                        &dst_down,
-                                                        &dst_gate_inner,
-                                                        &dst_up_inner,
-                                                        &dst_down_inner)) {
+            if (gate_bytes > UINT64_MAX - gate_bytes ||
+                gate_bytes * 2ull > UINT64_MAX - down_bytes) {
                 continue;
             }
+            const uint64_t compact_bytes = gate_bytes * 2ull + down_bytes;
+            __strong id<MTLBuffer> compact_buffer =
+                ds4_gpu_stream_expert_alloc_buffer(
+                        compact_bytes, @"ds4_compact_tail_expert");
+            if (!src_gate || !src_up || !src_down || !compact_buffer) continue;
+            dst_gate = compact_buffer;
+            dst_up = compact_buffer;
+            dst_down = compact_buffer;
+            dst_gate_inner = 0;
+            dst_up_inner = (NSUInteger)gate_bytes;
+            dst_down_inner = (NSUInteger)(gate_bytes * 2ull);
             memcpy((uint8_t *)[dst_gate contents] + dst_gate_inner,
                    (const uint8_t *)[src_gate contents] + src_gate_inner,
                    (size_t)gate_bytes);
