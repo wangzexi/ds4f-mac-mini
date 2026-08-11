@@ -21442,23 +21442,20 @@ static bool metal_graph_decode_cpu_router(
             long effective_mass_pct = mass_pct;
             const char *entropy_text =
                 getenv("DS4F_SPEED_CACHE_AWARE_MAX_ENTROPY_PCT");
-            float normalized_entropy = 1.0f;
-            if (total_mass > 0.0f) {
-                float entropy = 0.0f;
-                for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
-                    const float p = weights[i] / total_mass;
-                    if (p > 0.0f) entropy -= p * logf(p);
-                }
-                const float max_entropy = logf((float)DS4_N_EXPERT_USED);
-                normalized_entropy =
-                    max_entropy > 0.0f ? entropy / max_entropy : 0.0f;
-            }
             if (entropy_text && entropy_text[0] && total_mass > 0.0f) {
                 char *entropy_end = NULL;
                 const long max_entropy_pct =
                     strtol(entropy_text, &entropy_end, 10);
                 if (entropy_end != entropy_text && *entropy_end == '\0' &&
                     max_entropy_pct >= 1 && max_entropy_pct <= 100) {
+                    float entropy = 0.0f;
+                    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+                        const float p = weights[i] / total_mass;
+                        if (p > 0.0f) entropy -= p * logf(p);
+                    }
+                    const float max_entropy = logf((float)DS4_N_EXPERT_USED);
+                    const float normalized_entropy =
+                        max_entropy > 0.0f ? entropy / max_entropy : 0.0f;
                     if (normalized_entropy * 100.0f >
                         (float)max_entropy_pct) {
                         effective_mass_pct = 100;
@@ -21491,25 +21488,10 @@ static bool metal_graph_decode_cpu_router(
             const char *drop_text =
                 getenv("DS4F_SPEED_CACHE_AWARE_DROP_MISS_BELOW_TOP_PCT");
             if (drop_text && drop_text[0] && kept > 1u) {
-                bool entropy_allows_drop = true;
-                const char *drop_entropy_text = getenv(
-                    "DS4F_SPEED_CACHE_AWARE_DROP_MISS_MAX_ENTROPY_PCT");
-                if (drop_entropy_text && drop_entropy_text[0]) {
-                    char *drop_entropy_end = NULL;
-                    const long drop_entropy_pct = strtol(drop_entropy_text,
-                                                         &drop_entropy_end,
-                                                         10);
-                    if (drop_entropy_end != drop_entropy_text &&
-                        *drop_entropy_end == '\0' &&
-                        drop_entropy_pct >= 1 && drop_entropy_pct <= 100) {
-                        entropy_allows_drop = normalized_entropy * 100.0f <=
-                            (float)drop_entropy_pct;
-                    }
-                }
                 char *drop_end = NULL;
                 const long drop_pct = strtol(drop_text, &drop_end, 10);
                 if (drop_end != drop_text && *drop_end == '\0' &&
-                    drop_pct >= 1 && drop_pct < 100 && entropy_allows_drop) {
+                    drop_pct >= 1 && drop_pct < 100) {
                     float top_weight = 0.0f;
                     for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
                         if (keep[i] && weights[i] > top_weight) {
