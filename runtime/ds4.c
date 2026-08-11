@@ -27217,6 +27217,42 @@ static bool metal_graph_dspark_capture_verified_suffix_layer(
 
 /* Encode a full single-token decode step on Metal.  This is the generation
  * hot path: update caches, run all layers, then produce logits. */
+static bool metal_graph_decode_prefetch_next_hash_route(
+        ds4_gpu_graph       *g,
+        const ds4_model     *model,
+        const ds4_weights   *weights,
+        uint32_t             next_layer,
+        int                  token) {
+    const char *enabled =
+        getenv("DS4_METAL_DECODE_HASH_ROUTE_PREFETCH");
+    if (!g || !model || !weights || !enabled || !enabled[0] ||
+        strcmp(enabled, "0") == 0 || !g->ssd_streaming ||
+        next_layer == 0 || next_layer >= DS4_N_HASH_LAYER ||
+        next_layer >= DS4_N_LAYER) {
+        return true;
+    }
+
+    const ds4_layer_weights *layer = &weights->layer[next_layer];
+    uint64_t gate_expert_bytes = 0;
+    uint64_t down_expert_bytes = 0;
+    if (!streaming_layer_gate_down_expert_bytes(layer,
+                                                &gate_expert_bytes,
+                                                &down_expert_bytes)) {
+        return false;
+    }
+    int selected[DS4_MAX_EXPERT_USED];
+    int32_t selected_i32[DS4_MAX_EXPERT_USED];
+    layer_hash_selected_experts(selected, model, layer, token);
+    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+        selected_i32[i] = (int32_t)selected[i];
+    }
+    const ds4_gpu_stream_expert_table table =
+        graph_stream_expert_table_make(model, layer, next_layer,
+                                       gate_expert_bytes, down_expert_bytes);
+    return ds4_gpu_stream_expert_cache_begin_selected_load(
+            &table, selected_i32, DS4_N_EXPERT_USED) != 0;
+}
+
 static bool metal_graph_encode_token_raw_swa(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -27276,6 +27312,13 @@ static bool metal_graph_encode_token_raw_swa(
         g->cur_hc_by_tier[g->active_tier] = metal_graph_after_ffn_hc(g);
         g->after_ffn_hc_by_tier[g->active_tier] = tmp;
         if (ok) ok = metal_graph_dspark_capture_decode_layer(g, il);
+        /* Layers 1 and 2 use token-ID hash routing. Their exact top-six are
+         * known before their input hidden state exists, so start the next
+         * layer's selected load while this layer's already-encoded MoE runs.
+         * This is residency-only and intentionally opt-in until it is shown
+         * not to contend with the Mini's single SSD queue. */
+        if (ok) ok = metal_graph_decode_prefetch_next_hash_route(
+                g, model, weights, il + 1u, token);
         /* A TP gate uses one monotonic shared event for the whole token. A
          * later command buffer may signal a higher value while the prefix is
          * blocked at an earlier gate, making the transport consume a slab
