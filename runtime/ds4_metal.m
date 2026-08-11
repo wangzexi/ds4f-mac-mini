@@ -3806,7 +3806,7 @@ uint32_t ds4_gpu_resize_streaming_expert_cache_budget(
     } else if (release_resident && shrinking_total && resident_bytes != 0) {
         fprintf(stderr,
                 "ds4: preserve streaming expert cache across phase shrink "
-                "resident=%.2f GiB target=%.2f GiB\\n",
+                "resident=%.2f GiB target=%.2f GiB\n",
                 ds4_gpu_gib(resident_bytes), ds4_gpu_gib(target_bytes));
     }
     /* Lowering only the phase lock target must not throw away hot wired
@@ -16086,6 +16086,27 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
                                                       gate_expert_bytes,
                                                       down_expert_bytes)) {
             continue;
+        }
+        if (layer == 0 &&
+            getenv("DS4_METAL_HASH_LAYER0_CACHE_TRACE") != NULL) {
+            fprintf(stderr,
+                    "ds4: hash-l0 cache miss expert=%d valid=%u map=%p/%p "
+                    "size=%llu/%llu offsets=%llu,%llu,%llu/%llu,%llu,%llu "
+                    "bytes=%llu,%llu/%llu,%llu\n",
+                    selected_ids[i], e->valid,
+                    e->model_map, model_map,
+                    (unsigned long long)e->model_size,
+                    (unsigned long long)model_size,
+                    (unsigned long long)e->gate_abs_offset,
+                    (unsigned long long)e->up_abs_offset,
+                    (unsigned long long)e->down_abs_offset,
+                    (unsigned long long)p->gate_abs_offsets[i],
+                    (unsigned long long)p->up_abs_offsets[i],
+                    (unsigned long long)p->down_abs_offsets[i],
+                    (unsigned long long)e->gate_expert_bytes,
+                    (unsigned long long)e->down_expert_bytes,
+                    (unsigned long long)gate_expert_bytes,
+                    (unsigned long long)down_expert_bytes);
         }
 
         uint32_t source = UINT32_MAX;
