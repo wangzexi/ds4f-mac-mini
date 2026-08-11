@@ -40,6 +40,20 @@ e62ac715fd77449a655d2319b8c74b0cc0d11dd81067cccb640f4d89a689aa3d
 staging 与 slab 预留）而不是逻辑条目数判断。若下一阶段装不下，缓存仍会整体释放，
 以保证 16GB 机器不因保留热缓存进入内存压力。
 
+## 连续追问的 Decode 主干复用
+
+一次 Decode 会读取完整非路由主干的 90 个 span（4.60 GiB）。旧路径在下一轮
+Prefill 一开始又把这份 map 替换成逐层 map，因而下一次首 token 必须再次读取同一
+4.60 GiB。现在只要同一 server 的上轮 Decode map 仍在，增量 Prefill 直接在它上面
+执行；路由专家仍按原有逐层 exact 调度，KV 恢复和模型数学均不变。
+
+内存规划会先把这份主干计入 Prefill 基础占用，并把专家缓存从短 Prefill 的约
+10.65 GiB 自动下调到约 6.33 GiB，故不是把两份模型叠加。2026-08-12 的 Mini 两轮
+回归中，第一轮 7-token prompt + 1-token output 后，第二轮复用 8-token KV 并处理
+5-token 后缀：输出 token 与旧路径相同（`I`），第二轮没有 `static_decode` SSD read，
+总时延由 7.57 s 降至 3.74 s（Prefill 4.24→2.75 s，首 Decode 3.34→0.99 s）。
+服务重启、没有上一轮 Decode，或内存计划不允许保留时，仍安全回退到原来的完整读取。
+
 cache-aware router 的初步速度档位：
 
 | retained router mass | generation | 观察 |

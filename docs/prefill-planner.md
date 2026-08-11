@@ -20,6 +20,15 @@ disk-KV hit.  The older token-major suffix path is disabled for this fixed
 Flash runtime: it bypassed the SSD pipeline and could retain experts from many
 layers at once.
 
+After one Decode has installed its complete non-routed static map, the next
+exact suffix Prefill reuses that map rather than replacing it with per-layer
+trunk maps. The request memory plan prices the 4.60 GiB static trunk before it
+chooses the Prefill expert budget, so this is a replacement of expert-cache
+headroom, not an unbounded extra allocation. Router/expert scheduling remains
+layer-major and exact. If no retained Decode map exists (server start, cold
+request, or an incompatible backend), Prefill uses the normal streamed-trunk
+path below.
+
 | Prompt rows | Cold learned-router staging | KV-prefix heat staging |
 | ---: | ---: | ---: |
 | 1-255 | wait for Router, then exact-read | disabled by default (measured faster) |
