@@ -17,14 +17,14 @@ the I/O schedule:
 
 | Prompt rows | Cold learned-router staging | Lookahead |
 | ---: | ---: | ---: |
-| 1-511 | wait for Router, then exact-read | trunk only |
-| 512+ | all 256 experts | 1 layer |
+| 1-255 | wait for Router, then exact-read | trunk only |
+| 256+ | all 256 experts | 1 layer |
 
 For layers 3 and later, cold speculative Prefill is all-or-nothing. Short and
 medium prompts wait for the actual Router result, avoiding low-precision
 partial guesses. Long prompts read all experts in packed-file order when the
 measured previous-layer compute window can hide the full-layer transfer. The
-fixed-Mini default crossover is 512 uncached tokens and can be overridden with
+fixed-Mini default crossover is 256 uncached tokens and can be overridden with
 `DS4_METAL_PREFILL_FULL_EXPERT_MIN_TOKENS` for profiling. Hash layer 0 is
 fully resident before the server listens; hash layers 1 and 2 use exact
 token-ID unions. A completed layer is released immediately.
@@ -76,6 +76,8 @@ and completion while future-layer reads may run in the background.
 - The retired fixed Flash hotlist covered only 28 of 74 experts on the
   101-token L3 fixture while reading 100 unused experts; it is no longer part
   of Prefill or Decode cache decisions.
+- On the same 302-token prompt, exact demand reads measured 5.27 t/s and full
+  one-layer lookahead measured 7.63 t/s, setting the default crossover at 256.
 - 300-row fixture, 256 experts x one layer: byte-identical to demand loading;
   60.15 s to 40.11 s (about 33%).
 

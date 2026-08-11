@@ -19725,11 +19725,11 @@ static uint32_t metal_graph_prefill_full_expert_prefetch_min_tokens(void) {
             return parsed > UINT32_MAX ? UINT32_MAX : (uint32_t)parsed;
         }
     }
-    /* A complete Flash expert layer takes about 0.97 s to stream on the fixed
-     * M4 Mini. Measured layer compute hides that read at roughly 512+ prompt
-     * tokens. Below that point there is no trustworthy cold-start ranking, so
-     * exact Router-selected reads are cheaper than speculative partial I/O. */
-    return 512u;
+    /* A complete Flash expert layer takes about 0.8-0.97 s to stream on the
+     * fixed M4 Mini. At 302 prompt tokens full one-layer lookahead measured
+     * 7.63 t/s versus 5.27 t/s for exact demand reads, while short prompts do
+     * better without an untrusted partial guess. */
+    return 256u;
 }
 
 static uint32_t metal_graph_prefill_expert_prefetch_count(
