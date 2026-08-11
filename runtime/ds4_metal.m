@@ -11859,11 +11859,13 @@ static int ds4_gpu_stream_expert_pack_source(
         }
         const uint64_t slot_bytes = gate_expert_bytes * 2u + down_expert_bytes;
         const uint64_t slots = (uint64_t)pack_layers * pack_experts;
+        const int allow_same_experts =
+            getenv("DS4_METAL_STREAMING_EXPERT_PACK_ALLOW_SAME_EXPERTS") != NULL;
         struct stat st;
         const int valid =
             got == (ssize_t)sizeof(header) &&
             memcmp(header, "DS4FPK1", 7) == 0 &&
-            header_model_size == model_size &&
+            (header_model_size == model_size || allow_same_experts) &&
             header_layers == pack_layers &&
             header_experts == pack_experts &&
             header_gate_bytes == gate_expert_bytes &&
@@ -11877,6 +11879,11 @@ static int ds4_gpu_stream_expert_pack_source(
             fprintf(stderr, "ds4: packed expert sidecar header does not match this model\n");
             close(fd);
             return 0;
+        }
+        if (header_model_size != model_size) {
+            fprintf(stderr,
+                    "ds4: packed expert sidecar accepts model-size mismatch "
+                    "because same-experts mode is explicitly enabled\n");
         }
 #if defined(F_NOCACHE)
         if (fcntl(fd, F_NOCACHE, 1) != 0) {
