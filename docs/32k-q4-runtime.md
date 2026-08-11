@@ -126,6 +126,11 @@ tail expert 均约 4.70--4.76 s，输出文本相同。它会扰乱全局专家�
 Decode 分别为 2.50 s（1.60 t/s）和 2.53 s（1.58 t/s）。额外 0.50 GiB 没有可测
 收益，因此正式配置仍保持 11.50 GiB，把余量留给 Metal 和系统而非盲目扩张缓存。
 
+短专家读取的 `F_RDADVISE` 也保留开启。相同干净服务、相同 13-token prompt +
+4-token 输出中，关闭 `DS4_METAL_DISABLE_STREAMING_EXPERT_READAHEAD=1` 后 Prefill
+从 6.35 s 增至 6.70 s，Decode 从 2.50 s 增至 2.71 s；此前对“完整 staged layer”
+的否决不适用于这条按 selected experts 读取的路径。
+
 真实 server 的内存检查进一步否决了把它设为默认：5-token 输入、2-token输出时，
 开启 6-entry handoff 的进程 RSS 约为 7.1 GiB，而空闲默认服务约 2.0 GiB。
 原因不是逻辑条目数，而是这些条目仍引用各层完整的 Prefill staging buffer。除非先将
