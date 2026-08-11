@@ -19869,6 +19869,16 @@ static uint32_t metal_graph_prefill_prefetch_lookahead(void) {
     return 3u;
 }
 
+/* The normal schedule starts light trunk reads before the next full expert
+ * layer.  The two streams share the Mini SSD, so keep an opt-in ordering
+ * switch for calibration: start the next layer's critical 256-expert read
+ * first, then queue the non-critical trunk lookahead.  This is only I/O
+ * launch order; it cannot affect the numerical graph. */
+static bool metal_graph_prefill_expert_prefetch_priority(void) {
+    const char *env = getenv("DS4_METAL_PREFILL_EXPERT_PREFETCH_PRIORITY");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
 static uint32_t metal_graph_prefill_io_chunk_mib(void) {
     const char *env = getenv("DS4_METAL_EXPLICIT_PREFETCH_CHUNK_MIB");
     if (env && env[0]) {
@@ -34362,10 +34372,16 @@ static bool metal_graph_prefill_layer_major_decode_rows(
                 metal_graph_prefill_expert_prefetch_count(n_tokens) ==
                     DS4_N_EXPERT ? 1u :
                     metal_graph_prefill_prefetch_lookahead();
-            for (uint32_t d = 1; d <= lookahead && il + d < DS4_N_LAYER; d++) {
-                (void)metal_graph_prefetch_prefill_trunk(model,
-                                                         weights,
-                                                         il + d);
+            const bool expert_prefetch_priority =
+                metal_graph_prefill_expert_prefetch_priority();
+            if (!expert_prefetch_priority) {
+                for (uint32_t d = 1;
+                     d <= lookahead && il + d < DS4_N_LAYER;
+                     d++) {
+                    (void)metal_graph_prefetch_prefill_trunk(model,
+                                                             weights,
+                                                             il + d);
+                }
             }
             const uint32_t next = il + 1u;
             if (next < DS4_N_LAYER) {
@@ -34398,6 +34414,15 @@ static bool metal_graph_prefill_layer_major_decode_rows(
                                 n_tokens,
                                 il);
                     }
+                }
+            }
+            if (expert_prefetch_priority) {
+                for (uint32_t d = 1;
+                     d <= lookahead && il + d < DS4_N_LAYER;
+                     d++) {
+                    (void)metal_graph_prefetch_prefill_trunk(model,
+                                                             weights,
+                                                             il + d);
                 }
             }
             if (il + 1u == DS4_N_LAYER) {
