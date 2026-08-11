@@ -19643,9 +19643,26 @@ static bool metal_graph_stream_map_decode_static_all(
 /* This tag cannot collide with a transformer layer number. */
 #define DS4_METAL_PREFETCH_STATIC_DECODE_TAG UINT32_MAX
 
-static bool metal_graph_prefill_static_decode_prefetch_enabled(void) {
+static uint32_t metal_graph_prefill_static_decode_prefetch_max_tokens(void) {
+    uint32_t max_tokens = 1024u;
+    const char *env = getenv(
+            "DS4_METAL_PREFILL_STATIC_DECODE_PREFETCH_MAX_TOKENS");
+    if (env && env[0]) {
+        char *end = NULL;
+        const unsigned long value = strtoul(env, &end, 10);
+        if (end != env && *end == '\0' && value != 0 &&
+            value <= UINT32_MAX) {
+            max_tokens = (uint32_t)value;
+        }
+    }
+    return max_tokens;
+}
+
+static bool metal_graph_prefill_static_decode_prefetch_enabled(
+        uint32_t n_tokens) {
     const char *env = getenv("DS4_METAL_PREFILL_STATIC_DECODE_PREFETCH");
-    return env && env[0] && strcmp(env, "0") != 0;
+    return env && env[0] && strcmp(env, "0") != 0 &&
+        n_tokens <= metal_graph_prefill_static_decode_prefetch_max_tokens();
 }
 
 /*
@@ -19657,8 +19674,9 @@ static bool metal_graph_prefill_static_decode_prefetch_enabled(void) {
  */
 static bool metal_graph_prefetch_decode_static_all(
         const ds4_model   *model,
-        const ds4_weights *weights) {
-    if (!metal_graph_prefill_static_decode_prefetch_enabled() ||
+        const ds4_weights *weights,
+        uint32_t           n_tokens) {
+    if (!metal_graph_prefill_static_decode_prefetch_enabled(n_tokens) ||
         !metal_graph_stream_decode_static_map_enabled()) {
         return false;
     }
@@ -34384,7 +34402,9 @@ static bool metal_graph_prefill_layer_major_decode_rows(
             }
             if (il + 1u == DS4_N_LAYER) {
                 static_decode_prefetch_started =
-                    metal_graph_prefetch_decode_static_all(model, weights);
+                    metal_graph_prefetch_decode_static_all(model,
+                                                          weights,
+                                                          n_tokens);
             }
         }
         const double compute_started = layer_profile ? now_sec() : 0.0;
