@@ -9715,6 +9715,10 @@ static int ds4_gpu_quant_row_bytes(
     case DS4_METAL_TENSOR_Q4_0:
         *row_bytes_out = (((uint64_t)n_embd + 31u) / 32u) * 18u;
         return 1;
+    case DS4_METAL_TENSOR_Q2_K:
+        if ((n_embd % 256u) != 0) return 0;
+        *row_bytes_out = ((uint64_t)n_embd / 256u) * 84u;
+        return 1;
     case DS4_METAL_TENSOR_Q4_K:
         if ((n_embd % 256u) != 0) return 0;
         *row_bytes_out = ((uint64_t)n_embd / 256u) * 144u;
