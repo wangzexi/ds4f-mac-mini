@@ -19746,6 +19746,40 @@ static uint32_t metal_graph_prefill_expert_prefetch_count(
         0u : DS4_N_EXPERT;
 }
 
+/* Heat is attached to the restored KV prefix, so it is meaningful for a
+ * continuing request but intentionally absent for a cold prompt.  Keep the
+ * speculative buffer modest below the measured full-layer crossover: it is
+ * enough to cover the high-probability experts while the first Router result
+ * is becoming available, and can be discarded at the first expert boundary. */
+static uint32_t metal_graph_prefill_hot_expert_prefetch_count(
+        uint32_t n_tokens) {
+    if (n_tokens < 16u) return 12u;
+    if (n_tokens < 64u) return 24u;
+    if (n_tokens < 256u) return 64u;
+    return DS4_N_EXPERT;
+}
+
+static void metal_graph_prefill_sort_hot_groups_by_address(
+        int32_t *expert_ids,
+        uint32_t n_experts) {
+    /* Preserve heat priority between groups, but issue each 8-expert group in
+     * packed-file order.  On the Mini this is the useful compromise between
+     * predicted-hit order and SSD locality. */
+    for (uint32_t begin = 0; begin < n_experts; begin += 8u) {
+        uint32_t end = begin + 8u;
+        if (end > n_experts) end = n_experts;
+        for (uint32_t i = begin + 1u; i < end; i++) {
+            const int32_t value = expert_ids[i];
+            uint32_t j = i;
+            while (j > begin && expert_ids[j - 1u] > value) {
+                expert_ids[j] = expert_ids[j - 1u];
+                j--;
+            }
+            expert_ids[j] = value;
+        }
+    }
+}
+
 static uint32_t metal_graph_prefill_prefetch_lookahead(void) {
     const char *env = getenv("DS4_METAL_PREFILL_PREFETCH_LOOKAHEAD");
     if (env && env[0]) {
@@ -19894,16 +19928,28 @@ static bool metal_graph_prefetch_prefill_expert_layer(
         uint32_t           il,
         uint32_t           n_tokens,
         uint32_t           protect_layer) {
-    const uint32_t n_prefetch =
+    const uint32_t cold_count =
         metal_graph_prefill_expert_prefetch_count(n_tokens);
-    if (n_prefetch == 0) return false;
-    /* Cold learned-layer Prefill is deliberately all-or-nothing. Partial
-     * prefetch without prompt-local route heat is only a disguised fixed
-     * expert bias and can delay the exact Router-selected reads. */
-    if (n_prefetch != DS4_N_EXPERT) return false;
     int32_t expert_ids[DS4_N_EXPERT];
-    for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
-        expert_ids[expert] = (int32_t)expert;
+    uint32_t n_prefetch = 0;
+    if (cold_count == DS4_N_EXPERT) {
+        /* No prefix history: retain the measured full-layer policy for long
+         * prompts. Packed order is optimal when every expert is requested. */
+        n_prefetch = DS4_N_EXPERT;
+        for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+            expert_ids[expert] = (int32_t)expert;
+        }
+    } else {
+        const uint32_t target =
+            metal_graph_prefill_hot_expert_prefetch_count(n_tokens);
+        n_prefetch = ds4_gpu_stream_expert_cache_rank_route_heat(
+                il, expert_ids, target);
+        if (n_prefetch == 0) return false;
+        metal_graph_prefill_sort_hot_groups_by_address(expert_ids, n_prefetch);
+        fprintf(stderr,
+                "ds4: heat prefill candidates layer=%u tokens=%u experts=%u "
+                "groups=8 source=kv-route-heat\n",
+                il, n_tokens, n_prefetch);
     }
     return metal_graph_prefetch_prefill_expert_layer_selected(model,
                                                                weights,
@@ -34136,9 +34182,17 @@ static bool metal_graph_prefill_layer_major_decode_rows(
                 ok = false;
                 break;
             }
-            (void)metal_graph_activate_prefill_expert_layer(model,
-                                                            weights,
-                                                            il);
+            /* Hash layers have exact token-ID unions, and long learned layers
+             * intentionally stage all 256 experts.  A short learned layer is
+             * different: leave its heat-ordered I/O live until its first
+             * Router result reconciles completed slots and cancels the rest. */
+            if (il < DS4_N_HASH_LAYER ||
+                metal_graph_prefill_expert_prefetch_count(n_tokens) ==
+                    DS4_N_EXPERT) {
+                (void)metal_graph_activate_prefill_expert_layer(model,
+                                                                weights,
+                                                                il);
+            }
             const uint32_t lookahead =
                 metal_graph_prefill_expert_prefetch_count(n_tokens) ==
                     DS4_N_EXPERT ? 1u :

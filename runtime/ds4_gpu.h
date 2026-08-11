@@ -215,6 +215,12 @@ int ds4_gpu_stream_expert_cache_import_route_heat(
         uint32_t     n_layers,
         uint32_t     n_experts,
         uint64_t     token_clock);
+/* Return prompt-local experts ordered by decayed Router-weight heat.  Zero
+ * means this KV prefix has no learned-router history for the layer. */
+uint32_t ds4_gpu_stream_expert_cache_rank_route_heat(
+        uint32_t layer,
+        int32_t *expert_ids,
+        uint32_t capacity);
 void ds4_gpu_stream_expert_cache_release_resident(void);
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,

@@ -656,6 +656,7 @@ typedef struct {
     double start_ms;
     double read_ms;
     uint32_t n_experts;
+    volatile uint32_t completed_experts;
     uint32_t reserved_experts;
     int source_fd;
     volatile int cancel;
@@ -12915,6 +12916,44 @@ int ds4_gpu_stream_expert_cache_import_route_heat(
     return 1;
 }
 
+uint32_t ds4_gpu_stream_expert_cache_rank_route_heat(
+        uint32_t layer,
+        int32_t *expert_ids,
+        uint32_t capacity) {
+    if (!expert_ids ||
+        layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        capacity == 0) {
+        return 0;
+    }
+    ds4_gpu_stream_expert_cache_maybe_decay_route_hotness();
+    if (capacity > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+        capacity = DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+    }
+
+    uint32_t n = 0;
+    for (uint32_t expert = 0;
+         expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+         expert++) {
+        const float heat = g_stream_expert_cache_route_hotness[layer][expert];
+        if (!isfinite(heat) || heat <= 0.0f) continue;
+        uint32_t at = n;
+        while (at != 0) {
+            const uint32_t previous = (uint32_t)expert_ids[at - 1u];
+            const float previous_heat =
+                g_stream_expert_cache_route_hotness[layer][previous];
+            if (previous_heat > heat ||
+                (previous_heat == heat && previous < expert)) {
+                break;
+            }
+            if (at < capacity) expert_ids[at] = expert_ids[at - 1u];
+            at--;
+        }
+        if (at < capacity) expert_ids[at] = (int32_t)expert;
+        if (n < capacity) n++;
+    }
+    return n;
+}
+
 static void ds4_gpu_stream_expert_cache_maybe_decay_route_hotness(void) {
     if (g_stream_expert_cache_decode_tokens == 0) return;
     if (g_stream_expert_cache_hotness_decay_token == 0) {
@@ -14830,6 +14869,7 @@ static void ds4_gpu_stream_expert_layer_prefetch_clear(
     p->start_ms = 0.0;
     p->read_ms = 0.0;
     p->n_experts = 0;
+    p->completed_experts = 0;
     p->reserved_experts = 0;
     p->source_fd = -1;
     p->cancel = 0;
@@ -14885,6 +14925,12 @@ static void *ds4_gpu_stream_expert_layer_prefetch_thread_main(void *opaque) {
                 done += (uint64_t)got;
                 total += (uint64_t)got;
             }
+            if (ok) {
+                /* Publish only complete packed slots.  The scheduler may
+                 * cancel after any slot and safely salvage these bytes. */
+                __atomic_store_n(&p->completed_experts, i + 1u,
+                                 __ATOMIC_RELEASE);
+            }
         }
         if (ok) {
             [p->buffer didModifyRange:NSMakeRange(
@@ -14898,6 +14944,122 @@ static void *ds4_gpu_stream_expert_layer_prefetch_thread_main(void *opaque) {
         }
     }
     return NULL;
+}
+
+/* The learned Router becomes available after a speculative layer read has
+ * started.  Stop at an expert boundary, copy any already-complete *selected*
+ * slots into normal cache ownership, then free the large speculative buffer.
+ * Keeping only selected slots is essential: a partially-read 256-expert slab
+ * must not remain resident just because one of its experts happened to hit. */
+static uint32_t ds4_gpu_stream_expert_layer_prefetch_reconcile_selected(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *selected_ids,
+        uint32_t                           n_selected) {
+    if (!table || !selected_ids || n_selected == 0 ||
+        n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED) {
+        return 0;
+    }
+    ds4_gpu_stream_expert_layer_prefetch *p =
+        ds4_gpu_stream_expert_layer_prefetch_find(table->layer);
+    if (!p) return 0;
+
+    p->cancel = 1;
+    (void)pthread_join(p->thread, NULL);
+    uint32_t complete = __atomic_load_n(&p->completed_experts,
+                                        __ATOMIC_ACQUIRE);
+    if (complete > p->n_experts) complete = p->n_experts;
+
+    /* The reservation described the temporary slab; release it before taking
+     * the six normal cache slots used by the Router's true answer. */
+    if (g_stream_expert_layer_prefetch_reserved_experts >=
+        p->reserved_experts) {
+        g_stream_expert_layer_prefetch_reserved_experts -= p->reserved_experts;
+    } else {
+        g_stream_expert_layer_prefetch_reserved_experts = 0;
+    }
+    p->reserved_experts = 0;
+
+    uint32_t recovered = 0;
+    uint64_t copied_bytes = 0;
+    uint8_t *source = p->buffer ? (uint8_t *)[p->buffer contents] : NULL;
+    for (uint32_t s = 0; source && s < n_selected; s++) {
+        const int32_t selected = selected_ids[s];
+        if (selected < 0 || (uint32_t)selected >= table->n_total_expert) {
+            continue;
+        }
+        uint32_t index = UINT32_MAX;
+        for (uint32_t i = 0; i < complete; i++) {
+            if (p->expert_ids[i] == selected) {
+                index = i;
+                break;
+            }
+        }
+        if (index == UINT32_MAX) continue;
+
+        const uint64_t gate_rel = (uint64_t)(uint32_t)selected *
+                                  table->gate_expert_bytes;
+        const uint64_t down_rel = (uint64_t)(uint32_t)selected *
+                                  table->down_expert_bytes;
+        ds4_gpu_stream_expert_cache_entry *existing =
+            &g_stream_expert_cache[table->layer][(uint32_t)selected];
+        if (ds4_gpu_stream_expert_cache_entry_matches(
+                    existing, table->model_map, table->model_size,
+                    table->gate_offset + gate_rel,
+                    table->up_offset + gate_rel,
+                    table->down_offset + down_rel,
+                    table->gate_expert_bytes, table->down_expert_bytes)) {
+            continue;
+        }
+
+        __strong id<MTLBuffer> gate = nil;
+        __strong id<MTLBuffer> up = nil;
+        __strong id<MTLBuffer> down = nil;
+        NSUInteger gate_inner = 0, up_inner = 0, down_inner = 0;
+        const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
+        const int force_reuse = budget != 0 &&
+            g_stream_expert_cache_entry_count >= budget;
+        if (!ds4_gpu_stream_expert_cache_prepare_load_buffers(
+                    table->layer, (uint32_t)selected, table->layer,
+                    selected_ids, n_selected,
+                    table->gate_expert_bytes, table->down_expert_bytes,
+                    force_reuse, &gate, &up, &down,
+                    &gate_inner, &up_inner, &down_inner)) {
+            continue;
+        }
+        uint8_t *slot = source + (uint64_t)index * p->slot_bytes;
+        uint8_t *gate_dst = (uint8_t *)[gate contents] + gate_inner;
+        uint8_t *up_dst = (uint8_t *)[up contents] + up_inner;
+        uint8_t *down_dst = (uint8_t *)[down contents] + down_inner;
+        if (!gate_dst || !up_dst || !down_dst) continue;
+        memcpy(gate_dst, slot, (size_t)table->gate_expert_bytes);
+        memcpy(up_dst, slot + table->gate_expert_bytes,
+               (size_t)table->gate_expert_bytes);
+        memcpy(down_dst, slot + table->gate_expert_bytes * 2ull,
+               (size_t)table->down_expert_bytes);
+        [gate didModifyRange:NSMakeRange(gate_inner,
+                                         (NSUInteger)table->gate_expert_bytes)];
+        [up didModifyRange:NSMakeRange(up_inner,
+                                       (NSUInteger)table->gate_expert_bytes)];
+        [down didModifyRange:NSMakeRange(down_inner,
+                                         (NSUInteger)table->down_expert_bytes)];
+        if (!ds4_gpu_stream_expert_cache_install_loaded(
+                    table->model_map, table->model_size, table->layer,
+                    (uint32_t)selected, table->gate_offset + gate_rel,
+                    table->up_offset + gate_rel, table->down_offset + down_rel,
+                    table->gate_expert_bytes, table->down_expert_bytes,
+                    gate, up, down, gate_inner, up_inner, down_inner)) {
+            continue;
+        }
+        recovered++;
+        copied_bytes += p->slot_bytes;
+    }
+    fprintf(stderr,
+            "ds4-io: kind=expert_prefetch_reconcile layer=%u candidates=%u "
+            "complete=%u recovered=%u copied=%llu cancelled=%u\n",
+            table->layer, p->n_experts, complete, recovered,
+            (unsigned long long)copied_bytes, p->cancel ? 1u : 0u);
+    ds4_gpu_stream_expert_layer_prefetch_clear(p);
+    return recovered;
 }
 
 int ds4_gpu_stream_expert_layer_prefetch_begin(
@@ -15521,6 +15683,12 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         return 1;
     }
     if (!g_initialized && !ds4_gpu_init()) return 0;
+
+    /* A short/medium Prefill may be speculatively streaming prompt-local hot
+     * experts for this learned layer. Reconcile it at the first real Router
+     * answer; normal selected loading below fills any miss. */
+    (void)ds4_gpu_stream_expert_layer_prefetch_reconcile_selected(
+            table, selected_ids, n_selected);
 
     if (ds4_gpu_stream_expert_pending_load_matches(model_map,
                                                    model_size,

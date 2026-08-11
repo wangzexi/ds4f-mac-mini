@@ -15,19 +15,27 @@ layers never use a corpus-global fixed expert order.
 The exact layer-major path keeps decode arithmetic unchanged and varies only
 the I/O schedule:
 
-| Prompt rows | Cold learned-router staging | Lookahead |
+| Prompt rows | Cold learned-router staging | KV-prefix heat staging |
 | ---: | ---: | ---: |
-| 1-255 | wait for Router, then exact-read | trunk only |
-| 256+ | all 256 experts | 1 layer |
+| 1-15 | wait for Router, then exact-read | 12 candidates |
+| 16-63 | wait for Router, then exact-read | 24 candidates |
+| 64-255 | wait for Router, then exact-read | 64 candidates |
+| 256+ | all 256 experts | all 256 experts |
 
-For layers 3 and later, cold speculative Prefill is all-or-nothing. Short and
-medium prompts wait for the actual Router result, avoiding low-precision
-partial guesses. Long prompts read all experts in packed-file order when the
-measured previous-layer compute window can hide the full-layer transfer. The
-fixed-Mini default crossover is 256 uncached tokens and can be overridden with
-`DS4_METAL_PREFILL_FULL_EXPERT_MIN_TOKENS` for profiling. Hash layer 0 is
-fully resident before the server listens; hash layers 1 and 2 use exact
-token-ID unions. A completed layer is released immediately.
+For layers 3 and later, a cold prompt keeps the conservative all-or-nothing
+policy: short and medium prompts wait for the actual Router result, while long
+prompts read all experts in packed-file order. A KV-prefix hit additionally
+restores decayed Router-weight heat. Below the 256-token full-layer crossover,
+that heat selects 12/24/64 candidates. They are sorted by heat, then each
+eight-expert priority group is put in packed-file order for SSD locality.
+
+The candidate reader publishes only fully-read expert slots. When the first
+real Router result for that layer arrives, it stops at the next slot boundary,
+copies completed selected slots into ordinary cache ownership, releases the
+speculative slab, and reads only the selected misses. Thus an unneeded partial
+slab never becomes a long-lived 1.69 GiB allocation. Hash layer 0 is fully
+resident before the server listens; hash layers 1 and 2 use exact token-ID
+unions. A completed layer is released immediately.
 
 Complete learned-layer 256-expert staging is intentionally one layer ahead.
 Holding three complete 1.69 GiB Metal expert layers produced different
@@ -39,8 +47,10 @@ loading and still reduced the measured 300-row run from 60.15 s to 40.11 s.
 - Model and packed-expert descriptors use `F_NOCACHE`.
 - Trunk and expert staging own their Metal buffers; activation never rereads a
   prefetched payload.
-- Reads are cancellable between 32 MiB chunks. The tested 2/8/16/32/64 MiB
-  times for the 100-row fixture were 26.26/26.10/26.06/25.95/26.00 s.
+- Candidate reads are cancellable at an expert boundary (and the underlying
+  expert read remains cancellable between 32 MiB chunks). The tested
+  2/8/16/32/64 MiB times for the 100-row fixture were
+  26.26/26.10/26.06/25.95/26.00 s.
 - The exact row loop also polls the request cancellation callback. A client
   disconnect stops the current layer, cancels every queued read, releases its
   staging buffers, and leaves the server ready for the next request.
