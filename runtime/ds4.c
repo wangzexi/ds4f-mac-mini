@@ -34119,6 +34119,10 @@ static bool metal_graph_prefill_layer_major_decode_rows(
     }
     bool ok = true;
     bool interrupted = false;
+    const char *layer_profile_env =
+        getenv("DS4_METAL_PREFILL_LAYER_PROFILE");
+    const bool layer_profile = layer_profile_env && layer_profile_env[0] &&
+        strcmp(layer_profile_env, "0") != 0;
     uint32_t interrupted_layer = UINT32_MAX;
     uint32_t interrupted_row = UINT32_MAX;
     int32_t hash_expert_ids[DS4_N_HASH_LAYER][DS4_N_EXPERT];
@@ -34146,6 +34150,7 @@ static bool metal_graph_prefill_layer_major_decode_rows(
                 hash_expert_counts[il]);
     }
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
+        const double layer_started = layer_profile ? now_sec() : 0.0;
         if (cancel && cancel(cancel_ud)) {
             interrupted = true;
             interrupted_layer = il;
@@ -34203,6 +34208,7 @@ static bool metal_graph_prefill_layer_major_decode_rows(
                 }
             }
         }
+        const double compute_started = layer_profile ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         for (uint32_t t = 0; ok && t < n_tokens; t++) {
             if (cancel && cancel(cancel_ud)) {
@@ -34249,6 +34255,17 @@ static bool metal_graph_prefill_layer_major_decode_rows(
         }
         if (ok) ok = ds4_gpu_end_commands() != 0;
         else (void)ds4_gpu_synchronize();
+        const double compute_finished = layer_profile ? now_sec() : 0.0;
+        if (layer_profile) {
+            fprintf(stderr,
+                    "ds4-prefill-layer: layer=%u tokens=%u prepare_ms=%.3f "
+                    "compute_ms=%.3f total_ms=%.3f\n",
+                    il,
+                    n_tokens,
+                    (compute_started - layer_started) * 1000.0,
+                    (compute_finished - compute_started) * 1000.0,
+                    (compute_finished - layer_started) * 1000.0);
+        }
         if (!ok) break;
         if (g->ssd_streaming) {
             /* A completed prefill layer is never revisited by this request.

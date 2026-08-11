@@ -65,6 +65,11 @@ expert count. The append is tiny and occurs after activation, outside the
 weight-read critical path. Run `scripts/summarize-prefill-measurements.py` to
 aggregate the table by kind and layer.
 
+Set `DS4_METAL_PREFILL_LAYER_PROFILE=1` to log `prepare_ms`, `compute_ms`, and
+`total_ms` for every exact layer-major Prefill layer. `prepare_ms` includes
+activation waits for the current layer; `compute_ms` measures command encoding
+and completion while future-layer reads may run in the background.
+
 ## Numerical and performance gates
 
 - 11-row canonical fixture: all 129,280 logits byte-identical to the frozen
