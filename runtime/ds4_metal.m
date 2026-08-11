@@ -11514,13 +11514,24 @@ static int ds4_gpu_stream_expert_split_worthwhile(
         uint32_t resident_mask,
         uint32_t missing_mask) {
     if (resident_mask == 0 || missing_mask == 0) return 0;
+    uint32_t min_missing = 3u;
+    const char *env = getenv("DS4_METAL_STREAMING_EXPERT_SPLIT_MIN_MISSES");
+    if (env && env[0]) {
+        char *end = NULL;
+        unsigned long value = strtoul(env, &end, 10);
+        if (end != env && *end == '\0' && value >= 1u && value <= 6u) {
+            min_missing = (uint32_t)value;
+        }
+    }
     /*
      * The split path pays an extra command stage and a second routed-expert
      * bind.  It is worthwhile when several experts are missing and their SSD
      * reads can be hidden by resident expert work.  With one or two misses,
-     * especially in large caches, a single unsplit routed pass is faster.
+     * especially in large caches, a single unsplit routed pass was faster in
+     * the original measurement. Keep that production default, but make the
+     * crossover reproducible as cache capacity and wired residency change.
      */
-    return ds4_gpu_stream_expert_popcount(missing_mask) >= 3u;
+    return ds4_gpu_stream_expert_popcount(missing_mask) >= min_missing;
 }
 
 static void ds4_gpu_stream_expert_timing_note_selected(
