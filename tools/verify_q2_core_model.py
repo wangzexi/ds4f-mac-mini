@@ -17,6 +17,8 @@ EXPECTED_Q2_CHANGES = 258
 def expected_q2(name: str) -> bool:
     if "_shexp.weight" in name:
         return True
+    if ".indexer." in name or "indexer_" in name:
+        return False
     return name.endswith((
         ".attn_kv.weight",
         ".attn_q_a.weight",
