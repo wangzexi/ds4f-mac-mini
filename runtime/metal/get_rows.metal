@@ -29,6 +29,13 @@ struct ds4_get_rows_block_q4_0 {
     uchar qs[16];
 };
 
+struct ds4_get_rows_block_q2_K {
+    uchar scales[16];
+    uchar qs[64];
+    half d;
+    half dmin;
+};
+
 struct ds4_get_rows_block_q4_K {
     half d;
     half dmin;
@@ -143,6 +150,45 @@ kernel void kernel_get_rows_q4_0_f32(
             const uint8_t packed = qb->qs[(uint)(i & 15)];
             const uint8_t q = (i < 16) ? (packed & 0x0f) : (packed >> 4);
             out[idx] = d * ((float)q - 8.0f);
+        }
+    }
+}
+
+kernel void kernel_get_rows_q2_K_f32(
+        constant ds4_metal_args_get_rows_q8_0 & args,
+        device const char    * src0,
+        device const char    * src1,
+        device       char    * dst,
+        uint3                  tgpig[[threadgroup_position_in_grid]],
+        ushort                 tiitg[[thread_index_in_threadgroup]],
+        ushort3                ntg [[threads_per_threadgroup]]) {
+    const int32_t block = (int32_t)tgpig.x;
+    const int32_t tok_i = (int32_t)tgpig.y;
+    if (tok_i >= args.n_tokens) return;
+
+    const int32_t token =
+        ((const device int32_t *)(src1 + (uint64_t)tok_i*args.token_stride))[0];
+    if (token < 0 || token >= args.n_vocab) return;
+
+    const device ds4_get_rows_block_q2_K *row =
+        (const device ds4_get_rows_block_q2_K *)(src0 +
+                                                  (uint64_t)token * args.src_row_bytes);
+    const device ds4_get_rows_block_q2_K *qb = row + block;
+    device float *out =
+        (device float *)(dst + (uint64_t)tok_i * args.dst_row_bytes);
+
+    const int32_t i0 = block * 256;
+    for (int32_t i = (int32_t)tiitg; i < 256; i += (int32_t)ntg.x) {
+        const int32_t idx = i0 + i;
+        if (idx < args.n_embd) {
+            const uint group = (uint)i / 16u;
+            const uint l = (uint)i & 15u;
+            const uint q_base = 32u * (group / 8u) + 16u * (group & 1u);
+            const uint shift = ((group / 2u) & 3u) * 2u;
+            const uint q = ((uint)qb->qs[q_base + l] >> shift) & 0x03u;
+            const uint sc = (uint)qb->scales[group];
+            out[idx] = (float)qb->d * (float)(sc & 0x0fu) * (float)q -
+                       (float)qb->dmin * (float)(sc >> 4u);
         }
     }
 }

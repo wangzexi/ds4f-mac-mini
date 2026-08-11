@@ -63,6 +63,7 @@ static id<MTLComputePipelineState> g_get_rows_f16_pipeline;
 static id<MTLComputePipelineState> g_get_rows_i32_pipeline;
 static id<MTLComputePipelineState> g_get_rows_q8_0_pipeline;
 static id<MTLComputePipelineState> g_get_rows_q4_0_pipeline;
+static id<MTLComputePipelineState> g_get_rows_q2_K_pipeline;
 static id<MTLComputePipelineState> g_get_rows_q4_K_pipeline;
 static id<MTLComputePipelineState> g_repeat_f32_pipeline;
 static id<MTLComputePipelineState> g_concat_pipeline;
@@ -6123,6 +6124,23 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
+        fn = [library newFunctionWithName:@"kernel_get_rows_q2_K_f32"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_get_rows_q2_K_f32 function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        g_get_rows_q2_K_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_get_rows_q2_K_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_get_rows_q2_K_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
         fn = [library newFunctionWithName:@"kernel_get_rows_q4_K_f32"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_get_rows_q4_K_f32 function not found\n");
@@ -9365,6 +9383,7 @@ void ds4_gpu_cleanup(void) {
         g_get_rows_i32_pipeline = nil;
         g_get_rows_q8_0_pipeline = nil;
         g_get_rows_q4_0_pipeline = nil;
+        g_get_rows_q2_K_pipeline = nil;
         g_get_rows_q4_K_pipeline = nil;
         g_repeat_f32_pipeline = nil;
         g_concat_pipeline = nil;
@@ -9851,6 +9870,9 @@ static int ds4_gpu_encode_get_rows_quant(
     if (weight_type == DS4_METAL_TENSOR_Q4_0) {
         pipeline = g_get_rows_q4_0_pipeline;
         block_width = 32u;
+    } else if (weight_type == DS4_METAL_TENSOR_Q2_K) {
+        pipeline = g_get_rows_q2_K_pipeline;
+        block_width = 256u;
     } else if (weight_type == DS4_METAL_TENSOR_Q4_K) {
         pipeline = g_get_rows_q4_K_pipeline;
         block_width = 256u;
