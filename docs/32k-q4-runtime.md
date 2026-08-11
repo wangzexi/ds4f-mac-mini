@@ -46,6 +46,10 @@ Decode 的 cache-hit/miss split 也以 950 槽 exact 路径重新测过。默认
 
 2026-08-11 在当前 600-slot Mini 部署上，以 `你好` 生成 32 token 的新对照为：exact 为 1.95 token/s，30% mass turbo 为 4.49 token/s，20% mass 为 4.55 token/s。20% 的收益不足 2%，却在第一个生成 token 即与 exact 分叉，不能作为可用档位。当前瓶颈不是再少保留一个专家，而是让保留集合更常命中真正需要的专家。
 
+相同提示在服务实际 decode 档位附近的 950 槽重测，30% turbo 为 4.67 t/s；
+缓存变大带来小幅收益，但仍未稳定达到 5 t/s，且第一生成 token 即与 exact
+分叉。它继续只作为显式极速实验，不进入服务默认配置。
+
 ## 预填充 workspace 复用
 
 预填充是 layer-major：同一批 token 完成某层 attention 后才进入该层 FFN。因此 attention-only 和 FFN-only 中间 tensor 生命周期不重叠。`DS4_METAL_PREFILL_STAGE_ALIAS=1` 会释放独立 FFN batch buffer，并让它们成为已结束 attention buffer 的不重叠 view；KV、跨阶段 HC、权重和计算公式均不改变。
