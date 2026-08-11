@@ -14061,6 +14061,40 @@ static void ds4_gpu_stream_expert_cache_prune_layer(
     }
 }
 
+/*
+ * The first three Flash MoE layers route from the token-id hash.  Their
+ * selected experts are deliberately close to uniform, so global LFU treats
+ * them as cold and evicts them even though layer 0 was filled at startup.
+ *
+ * This is an experiment-only residency partition.  It changes no routing or
+ * numerical work: it merely reserves complete hash-layer rows from the
+ * global cache.  Keep it opt-in until a cache-budget sweep proves that the
+ * saved hash misses outweighs the learned-router capacity it consumes.
+ */
+static uint32_t ds4_gpu_stream_expert_cache_pinned_hash_layers(void) {
+    static int checked = 0;
+    static uint32_t pinned = 0;
+    if (!checked) {
+        const char *env = getenv("DS4_METAL_STREAMING_EXPERT_PIN_HASH_LAYERS");
+        if (env && env[0]) {
+            char *end = NULL;
+            unsigned long value = strtoul(env, &end, 10);
+            if (end != env && *end == '\0') {
+                pinned = (uint32_t)value;
+                if (pinned > 3u) pinned = 3u;
+            }
+        }
+        checked = 1;
+    }
+
+    /* Never reserve more rows than the current cache can hold. */
+    const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
+    while (pinned != 0 && pinned * DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT > budget) {
+        pinned--;
+    }
+    return pinned;
+}
+
 static int ds4_gpu_stream_expert_cache_entry_protected(
         uint32_t layer,
         uint32_t expert,
@@ -14071,6 +14105,9 @@ static int ds4_gpu_stream_expert_cache_entry_protected(
         expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
         ds4_gpu_stream_expert_cache_entry_inflight(
                 &g_stream_expert_cache[layer][expert])) {
+        return 1;
+    }
+    if (layer < ds4_gpu_stream_expert_cache_pinned_hash_layers()) {
         return 1;
     }
     return layer == protect_layer &&
