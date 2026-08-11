@@ -77,11 +77,15 @@ stays at 9. This is enabled by the production launcher; set
 Shorter candidate reads deliberately remain slot-cancellable and serial.
 
 The server deliberately retains a 2,048-row idle scheduling quantum even
-though the shared workspace can hold 4,096 rows.  A 3,971-row one-shot trial
-kept SSD activation waits near zero but took roughly 12 seconds per layer,
-whereas the established two-2,048-row path completed the same request at about
-19.2 token/s.  The current exact per-row layer kernel therefore scales
-unfavorably past 2K; increasing the outer quantum is not a prefill speedup.
+though a test workspace can hold 8,192 rows.  On the current service path,
+the first 2,048 rows of a 14.75K cold prompt completed at 10.83 token/s.  A
+separate 3,982-row one-shot HTTP request, with the same 8K workspace and the
+same exact layer-major path, took 368.35 s (10.81 token/s).  In both runs SSD
+expert activation waits stayed at roughly 0.002–0.008 ms.  The current exact
+per-row kernel therefore scales without a meaningful batching gain past 2K;
+increasing the outer quantum is not a service Prefill speedup.  The
+`--idle-prefill-quantum` switch exists only to reproduce this calibration; its
+production default remains 2,048.
 
 ## Rejected scheduler experiments
 
