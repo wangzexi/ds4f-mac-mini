@@ -9285,7 +9285,8 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
  *   creation time, last-used time, payload byte count
  *   rendered text byte count + rendered text for human inspection
  *   DS4 engine payload written by ds4_session_save_payload()
- *   optional tool-id map section
+ *   route-heat trailer (actual Router weights + decay clock)
+ *   optional tool-id map nested in that trailer
  *
  * The filename is SHA1(cache text bytes), not SHA1(token ids).  For ordinary
  * checkpoints the cache text is the rendered token prefix.  For live hidden
@@ -9293,7 +9294,9 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
  * contains sampled reasoning KV, but the lookup key must be what the client can
  * replay after a process restart or session switch.
  *
- * The optional tool-id map is not part of model state, but it is needed to
+ * Route heat is part of the prefix state: it is restored only with the exact
+ * KV entry and is reset when an older entry has no heat trailer. The optional
+ * tool-id map is not part of model state, but it is needed to
  * render future client JSON back to the exact DSML sampled by the model.  We
  * persist only mappings whose DSML block appears in the saved cache text.
  */
@@ -9303,11 +9306,17 @@ static void apply_anthropic_stream_tool_ids(tool_calls *calls,
 #define KV_EXT_TOOL_MAP DS4_KVSTORE_EXT_TOOL_MAP
 #define KV_EXT_RESPONSES_VISIBLE DS4_KVSTORE_EXT_RESPONSES_VISIBLE
 #define KV_EXT_THINKING_VISIBLE DS4_KVSTORE_EXT_THINKING_VISIBLE
+#define KV_EXT_ROUTE_HEAT DS4_KVSTORE_EXT_ROUTE_HEAT
 #define KV_TOOL_MAP_MAGIC0 'K'
 #define KV_TOOL_MAP_MAGIC1 'T'
 #define KV_TOOL_MAP_MAGIC2 'M'
 #define KV_TOOL_MAP_VERSION 1u
 #define KV_TOOL_MAP_HEADER 8u
+#define KV_ROUTE_HEAT_MAGIC0 'R'
+#define KV_ROUTE_HEAT_MAGIC1 'H'
+#define KV_ROUTE_HEAT_MAGIC2 'T'
+#define KV_ROUTE_HEAT_VERSION 1u
+#define KV_ROUTE_HEAT_HEADER 24u
 
 typedef enum {
     KV_REASON_UNKNOWN   = DS4_KVSTORE_REASON_UNKNOWN,
@@ -9551,6 +9560,10 @@ static int kv_tool_map_load_from_pos(server *s, FILE *fp, const stop_list *wante
     return loaded;
 }
 
+static int kv_cache_route_trailer_load(server *s, FILE *fp,
+                                       const stop_list *wanted,
+                                       bool restore_heat);
+
 #ifdef DS4_SERVER_TEST
 static void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
                            uint8_t reason, uint8_t ext_flags,
@@ -9602,7 +9615,7 @@ static void kv_cache_restore_tool_memory_for_messages(server *s, const chat_msgs
             skip <= (uint64_t)INT64_MAX &&
             fseeko(fp, (off_t)skip, SEEK_CUR) == 0)
         {
-            kv_tool_map_load_from_pos(s, fp, &wanted);
+            kv_cache_route_trailer_load(s, fp, &wanted, false);
         }
         fclose(fp);
     }
@@ -9709,23 +9722,171 @@ static bool kv_cache_file_size_fits(const kv_disk_cache *kc,
 
 static bool kv_cache_tool_map_size_cb(void *ud, const char *text,
                                       uint64_t *bytes_out) {
-    return kv_tool_map_serialized_size((server *)ud, text, bytes_out);
+    server *s = ud;
+    if (bytes_out) *bytes_out = 0;
+    if (!s || !s->engine) return true;
+    const uint32_t layers = ds4_engine_route_heat_layers(s->engine);
+    const uint32_t experts = ds4_engine_route_heat_experts(s->engine);
+    if (layers == 0 || experts == 0 ||
+        (uint64_t)layers > UINT64_MAX / experts ||
+        (uint64_t)layers * experts >
+            (UINT64_MAX - KV_ROUTE_HEAT_HEADER) / sizeof(float)) {
+        return false;
+    }
+    uint64_t tool_bytes = 0;
+    if (!kv_tool_map_serialized_size(s, text, &tool_bytes) ||
+        tool_bytes > UINT32_MAX) {
+        return false;
+    }
+    const uint64_t heat_bytes = (uint64_t)layers * experts * sizeof(float);
+    if (tool_bytes > UINT64_MAX - KV_ROUTE_HEAT_HEADER - heat_bytes) {
+        return false;
+    }
+    if (bytes_out) {
+        *bytes_out = KV_ROUTE_HEAT_HEADER + heat_bytes + tool_bytes;
+    }
+    return true;
 }
 
 static bool kv_cache_tool_map_write_cb(void *ud, FILE *fp, const char *text,
                                        uint64_t *written_bytes) {
-    return kv_tool_map_write((server *)ud, fp, text, written_bytes);
+    server *s = ud;
+    if (written_bytes) *written_bytes = 0;
+    if (!s || !s->engine || !fp) return false;
+    const uint32_t layers = ds4_engine_route_heat_layers(s->engine);
+    const uint32_t experts = ds4_engine_route_heat_experts(s->engine);
+    if (layers == 0 || experts == 0 ||
+        (uint64_t)layers > SIZE_MAX / experts ||
+        (uint64_t)layers * experts > SIZE_MAX / sizeof(float)) {
+        return false;
+    }
+    uint64_t tool_est = 0;
+    if (!kv_tool_map_serialized_size(s, text, &tool_est) ||
+        tool_est > UINT32_MAX) {
+        return false;
+    }
+    const size_t values = (size_t)layers * experts;
+    float *heat = xmalloc(values * sizeof(heat[0]));
+    uint64_t token_clock = 0;
+    bool ok = ds4_engine_export_route_heat(s->engine,
+                                            heat,
+                                            layers,
+                                            experts,
+                                            &token_clock);
+    uint8_t h[KV_ROUTE_HEAT_HEADER];
+    memset(h, 0, sizeof(h));
+    h[0] = KV_ROUTE_HEAT_MAGIC0;
+    h[1] = KV_ROUTE_HEAT_MAGIC1;
+    h[2] = KV_ROUTE_HEAT_MAGIC2;
+    h[3] = KV_ROUTE_HEAT_VERSION;
+    le_put32(h + 4, layers);
+    le_put32(h + 8, experts);
+    le_put32(h + 12, (uint32_t)token_clock);
+    le_put32(h + 16, (uint32_t)(token_clock >> 32));
+    le_put32(h + 20, (uint32_t)tool_est);
+    const uint64_t heat_bytes = (uint64_t)values * sizeof(heat[0]);
+    if (ok) {
+        ok = fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
+             fwrite(heat, 1, (size_t)heat_bytes, fp) == (size_t)heat_bytes;
+    }
+    uint64_t tool_written = 0;
+    if (ok) ok = kv_tool_map_write(s, fp, text, &tool_written);
+    free(heat);
+    if (!ok || tool_written != tool_est) return false;
+    if (written_bytes) {
+        *written_bytes = KV_ROUTE_HEAT_HEADER + heat_bytes + tool_written;
+    }
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-route-heat: stored layers=%u experts=%u values=%zu token_clock=%llu bytes=%llu",
+               layers, experts, values,
+               (unsigned long long)token_clock,
+               (unsigned long long)(KV_ROUTE_HEAT_HEADER + heat_bytes));
+    return true;
+}
+
+static void kv_cache_route_heat_reset(server *s) {
+    if (!s || !s->engine) return;
+    const uint32_t layers = ds4_engine_route_heat_layers(s->engine);
+    const uint32_t experts = ds4_engine_route_heat_experts(s->engine);
+    if (layers == 0 || experts == 0 ||
+        (uint64_t)layers > SIZE_MAX / experts ||
+        (uint64_t)layers * experts > SIZE_MAX / sizeof(float)) {
+        return;
+    }
+    const size_t values = (size_t)layers * experts;
+    float *zero = xmalloc(values * sizeof(zero[0]));
+    memset(zero, 0, values * sizeof(zero[0]));
+    (void)ds4_engine_import_route_heat(s->engine, zero,
+                                       layers, experts, 0);
+    free(zero);
+}
+
+static int kv_cache_route_trailer_load(server *s, FILE *fp,
+                                       const stop_list *wanted,
+                                       bool restore_heat) {
+    if (!s || !s->engine || !fp) return 0;
+    const off_t start = ftello(fp);
+    uint8_t h[KV_ROUTE_HEAT_HEADER];
+    const size_t got = fread(h, 1, sizeof(h), fp);
+    if (got == 0 && feof(fp)) {
+        if (restore_heat) kv_cache_route_heat_reset(s);
+        return 0;
+    }
+    if (got >= 4 && h[0] == KV_TOOL_MAP_MAGIC0 &&
+        h[1] == KV_TOOL_MAP_MAGIC1 && h[2] == KV_TOOL_MAP_MAGIC2) {
+        if (restore_heat) kv_cache_route_heat_reset(s);
+        if (start >= 0) (void)fseeko(fp, start, SEEK_SET);
+        return kv_tool_map_load_from_pos(s, fp, wanted);
+    }
+    if (got != sizeof(h) || h[0] != KV_ROUTE_HEAT_MAGIC0 ||
+        h[1] != KV_ROUTE_HEAT_MAGIC1 || h[2] != KV_ROUTE_HEAT_MAGIC2 ||
+        h[3] != KV_ROUTE_HEAT_VERSION) {
+        if (restore_heat) kv_cache_route_heat_reset(s);
+        return 0;
+    }
+    const uint32_t layers = le_get32(h + 4);
+    const uint32_t experts = le_get32(h + 8);
+    const uint64_t token_clock =
+        (uint64_t)le_get32(h + 12) | ((uint64_t)le_get32(h + 16) << 32);
+    const uint32_t tool_bytes = le_get32(h + 20);
+    if (layers != ds4_engine_route_heat_layers(s->engine) ||
+        experts != ds4_engine_route_heat_experts(s->engine) ||
+        layers == 0 || experts == 0 ||
+        (uint64_t)layers > SIZE_MAX / experts ||
+        (uint64_t)layers * experts > SIZE_MAX / sizeof(float)) {
+        if (restore_heat) kv_cache_route_heat_reset(s);
+        return 0;
+    }
+    const size_t values = (size_t)layers * experts;
+    float *heat = xmalloc(values * sizeof(heat[0]));
+    if (fread(heat, sizeof(heat[0]), values, fp) != values) {
+        free(heat);
+        if (restore_heat) kv_cache_route_heat_reset(s);
+        return 0;
+    }
+    if (restore_heat) {
+        if (ds4_engine_import_route_heat(s->engine, heat,
+                                          layers, experts, token_clock)) {
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-route-heat: restored layers=%u experts=%u values=%zu token_clock=%llu",
+                       layers, experts, values,
+                       (unsigned long long)token_clock);
+        }
+    }
+    free(heat);
+    return tool_bytes ? kv_tool_map_load_from_pos(s, fp, wanted) : 0;
 }
 
 static int kv_cache_tool_map_load_cb(void *ud, FILE *fp, const void *wanted) {
-    return kv_tool_map_load_from_pos((server *)ud, fp, (const stop_list *)wanted);
+    return kv_cache_route_trailer_load((server *)ud, fp,
+                                       (const stop_list *)wanted, true);
 }
 
 static ds4_kvstore_trailer_hooks kv_cache_tool_map_hooks(server *s,
                                                          const stop_list *wanted) {
     return (ds4_kvstore_trailer_hooks){
         .ud = s,
-        .ext_flag = KV_EXT_TOOL_MAP,
+        .ext_flag = KV_EXT_TOOL_MAP | KV_EXT_ROUTE_HEAT,
         .serialized_size = kv_cache_tool_map_size_cb,
         .write = kv_cache_tool_map_write_cb,
         .load = kv_cache_tool_map_load_cb,

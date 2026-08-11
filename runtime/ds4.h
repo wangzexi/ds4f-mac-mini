@@ -505,6 +505,21 @@ int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *
 int ds4_session_load_snapshot(ds4_session *s, const ds4_session_snapshot *snap, char *err, size_t errlen);
 void ds4_session_snapshot_free(ds4_session_snapshot *snap);
 
+/* Prompt-local routed-expert heat is durable state paired with a KV prefix.
+ * Values are accumulated real Router weights after per-token decay. */
+uint32_t ds4_engine_route_heat_layers(const ds4_engine *e);
+uint32_t ds4_engine_route_heat_experts(const ds4_engine *e);
+bool ds4_engine_export_route_heat(ds4_engine *e,
+                                  float *heat,
+                                  uint32_t n_layers,
+                                  uint32_t n_experts,
+                                  uint64_t *token_clock);
+bool ds4_engine_import_route_heat(ds4_engine *e,
+                                  const float *heat,
+                                  uint32_t n_layers,
+                                  uint32_t n_experts,
+                                  uint64_t token_clock);
+
 uint64_t ds4_session_layer_payload_bytes(ds4_session *s,
                                          uint32_t layer_start,
                                          uint32_t layer_end);

@@ -51966,6 +51966,48 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
 #endif
 }
 
+uint32_t ds4_engine_route_heat_layers(const ds4_engine *e) {
+    return e && e->backend == DS4_BACKEND_METAL && e->ssd_streaming ?
+        DS4_N_LAYER : 0u;
+}
+
+uint32_t ds4_engine_route_heat_experts(const ds4_engine *e) {
+    return e && e->backend == DS4_BACKEND_METAL && e->ssd_streaming ?
+        DS4_N_EXPERT : 0u;
+}
+
+bool ds4_engine_export_route_heat(ds4_engine *e,
+                                  float *heat,
+                                  uint32_t n_layers,
+                                  uint32_t n_experts,
+                                  uint64_t *token_clock) {
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+    return e && e->backend == DS4_BACKEND_METAL && e->ssd_streaming &&
+           n_layers == DS4_N_LAYER && n_experts == DS4_N_EXPERT &&
+           ds4_gpu_stream_expert_cache_export_route_heat(
+                   heat, n_layers, n_experts, token_clock) != 0;
+#else
+    (void)e; (void)heat; (void)n_layers; (void)n_experts; (void)token_clock;
+    return false;
+#endif
+}
+
+bool ds4_engine_import_route_heat(ds4_engine *e,
+                                  const float *heat,
+                                  uint32_t n_layers,
+                                  uint32_t n_experts,
+                                  uint64_t token_clock) {
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+    return e && e->backend == DS4_BACKEND_METAL && e->ssd_streaming &&
+           n_layers == DS4_N_LAYER && n_experts == DS4_N_EXPERT &&
+           ds4_gpu_stream_expert_cache_import_route_heat(
+                   heat, n_layers, n_experts, token_clock) != 0;
+#else
+    (void)e; (void)heat; (void)n_layers; (void)n_experts; (void)token_clock;
+    return false;
+#endif
+}
+
 int ds4_session_save_snapshot(ds4_session *s, ds4_session_snapshot *snap, char *err, size_t errlen) {
     if (!s || !snap) {
         payload_set_err(err, errlen, "invalid session snapshot save");

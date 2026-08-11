@@ -205,6 +205,16 @@ uint32_t ds4_gpu_stream_expert_cache_resident_mask(
 /* Reset only the prompt-local eviction heuristic.  The resident SSD expert
  * cache itself is intentionally kept warm across sessions. */
 void ds4_gpu_stream_expert_cache_reset_route_hotness(void);
+int ds4_gpu_stream_expert_cache_export_route_heat(
+        float    *heat,
+        uint32_t  n_layers,
+        uint32_t  n_experts,
+        uint64_t *token_clock);
+int ds4_gpu_stream_expert_cache_import_route_heat(
+        const float *heat,
+        uint32_t     n_layers,
+        uint32_t     n_experts,
+        uint64_t     token_clock);
 void ds4_gpu_stream_expert_cache_release_resident(void);
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,

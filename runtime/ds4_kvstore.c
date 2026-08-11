@@ -1309,7 +1309,10 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
                     engine, loaded_tokens, prompt_text + text_bytes,
                     effective_prompt);
             }
-            if (hooks && hooks->load && (hdr.ext_flags & hooks->ext_flag)) {
+            /* A trailer hook also owns the absence case: it must be able to
+             * reset prompt-local state when loading an older KV entry that has
+             * no corresponding trailer. */
+            if (hooks && hooks->load) {
                 hooks->load(hooks->ud, fp, hooks->load_wanted);
             }
         } else {

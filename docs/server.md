@@ -159,3 +159,12 @@ Model ID: deepseek-v4-flash
 Open WebUI 每轮发送完整消息历史；server 使用公共 token 前缀继续已有 KV
 session。当前 16GB 配置只保留一个常驻 session，因此并发请求会排队，切换到
 另一段不共享前缀的会话时需要重新 prefill。
+### KV-bound route heat
+
+Each persisted Flash KV prefix carries a small route-heat trailer. It stores
+the accumulated real Router weight for every layer/expert pair plus the decay
+token clock. Heat decays continuously with a 16-token half-life; batched
+Prefill weights older rows less than recent rows. A disk KV hit restores the
+matching heat atomically with the graph payload. Loading an older checkpoint
+without this trailer resets heat instead of reusing state from another prompt.
+The 43 x 256 float32 matrix costs 44,032 bytes per checkpoint.
