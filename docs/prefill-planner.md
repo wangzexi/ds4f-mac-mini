@@ -70,7 +70,9 @@ whole layer is demanded—there is no candidate cancellation to preserve. A
 300-token server request went from 47.72 s to 40.24 s: summed expert-activation
 wait fell from 12.27 s to 7.70 s (42 activations). The runner's serial versus
 parallel 300-token prefill logits were byte-identical, and its throughput rose
-from 7.99 to 8.46 t/s. This is enabled by the production launcher; set
+from 7.99 to 8.46 t/s. A same-fixture queue-depth sweep measured 8.24 t/s at
+4 workers, 8.46 at the default 9, and 7.80 at 18, so the pool deliberately
+stays at 9. This is enabled by the production launcher; set
 `DS4F_SERVER_PREFILL_FULL_LAYER_PARALLEL_PREAD=0` to reproduce the serial path.
 Shorter candidate reads deliberately remain slot-cancellable and serial.
 
