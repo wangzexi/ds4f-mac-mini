@@ -27492,7 +27492,14 @@ static bool metal_graph_upload_prompt_embeddings_hc(
 }
 
 static bool metal_graph_exact_prefill_rows_enabled(void) {
-    return getenv("DS4_METAL_EXACT_PREFILL_ROWS") != NULL;
+    /* The fixed-Mini server defaults this on in
+     * ds4_engine_configure_target_prefill_for_prompt().  Treat an explicit
+     * zero as an opt-out so the older true-batch path can be benchmarked
+     * without rebuilding a different binary.  It is intentionally an
+     * experiment: the canonical row path remains the byte-identical
+     * production baseline. */
+    const char *value = getenv("DS4_METAL_EXACT_PREFILL_ROWS");
+    return value && value[0] && strcmp(value, "0") != 0;
 }
 
 static bool metal_graph_hc_rms_scale_project(
