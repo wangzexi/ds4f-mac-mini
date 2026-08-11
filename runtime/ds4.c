@@ -15171,6 +15171,15 @@ typedef struct {
     uint32_t pipeline_capture_chunk_len;
     bool ssd_streaming; /* glm-branch SSD streaming; always false here */
     bool cache_aware_exact_prefill;
+    /* The experimental exact Prefill overlap path runs Attention/Router for
+     * a whole layer while its complete expert slab is still being read.  The
+     * normal CPU router would begin six individual cache loads per row; that
+     * would compete with the owned full-layer read.  While this scoped flag
+     * is set it records the exact IDs and defers those redundant loads until
+     * the full slab is activated. */
+    bool prefill_defer_router_expert_load;
+    int32_t *prefill_defer_router_selected;
+    uint32_t prefill_defer_router_row;
 
     /* Optional MTP model state.  It has its own raw cache because the drafter
      * runs on speculative future tokens; target KV state is updated only after
@@ -21552,9 +21561,20 @@ static bool metal_graph_decode_cpu_router(
     }
     const double t_cpu = profile ? now_sec() : 0.0;
 
+    if (g->prefill_defer_router_selected) {
+        memcpy(g->prefill_defer_router_selected +
+                   (uint64_t)g->prefill_defer_router_row *
+                       DS4_N_EXPERT_USED,
+               selected_i32,
+               (uint64_t)DS4_N_EXPERT_USED * sizeof(selected_i32[0]));
+    }
+
     /* CPU Router is the production path for Flash IQ2 experts.  It has the
      * real choice before any MoE kernel is encoded, which is the exact point
-     * where a live heat-prefetch must be reconciled and cancelled. */
+     * where a live heat-prefetch must be reconciled and cancelled.  The
+     * experimental full-layer Prefill overlap intentionally suppresses these
+     * six-ID loads: its owned 256-expert slab is already in flight and is
+     * activated after all rows have reached this point. */
     if (g->ssd_streaming) {
         uint64_t gate_expert_bytes = 0;
         uint64_t down_expert_bytes = 0;
@@ -21569,9 +21589,11 @@ static bool metal_graph_decode_cpu_router(
                                            il,
                                            gate_expert_bytes,
                                            down_expert_bytes);
-        if (ds4_gpu_stream_expert_cache_begin_selected_load(
-                    &table, selected_i32, DS4_N_EXPERT_USED) == 0) {
-            return false;
+        if (!g->prefill_defer_router_expert_load) {
+            if (ds4_gpu_stream_expert_cache_begin_selected_load(
+                        &table, selected_i32, DS4_N_EXPERT_USED) == 0) {
+                return false;
+            }
         }
         ds4_gpu_stream_expert_cache_note_route_weights(
                 il, selected_i32, weights, DS4_N_EXPERT_USED);
@@ -34161,6 +34183,189 @@ static bool metal_graph_prefill_pipeline_stage_major(
     return ok;
 }
 
+static bool metal_graph_prefill_deferred_full_expert_overlap_enabled(
+        const ds4_gpu_graph *g,
+        uint32_t             il,
+        uint32_t             n_tokens) {
+    const char *value = getenv("DS4_METAL_PREFILL_DEFER_FULL_EXPERT_ACTIVATION");
+    return g && value && value[0] && strcmp(value, "0") != 0 &&
+           g->ssd_streaming &&
+           il >= DS4_N_HASH_LAYER &&
+           metal_graph_prefill_expert_prefetch_count(n_tokens) ==
+               DS4_N_EXPERT;
+}
+
+/* Preserve decode arithmetic while hiding the tail of a complete layer's
+ * expert read.  Attention, HC-FFN prelude, and the CPU router are run in the
+ * original token order and copied verbatim into otherwise-idle batch scratch.
+ * Once the already-in-flight full expert slab is activated, each row's saved
+ * state is restored and the normal routed-MoE suffix is encoded in that same
+ * order.  Nothing is batched arithmetically: the workspace is a mailbox, not
+ * a vectorized kernel, so this remains suitable for byte-level comparison to
+ * the canonical decode-row Prefill path.
+ *
+ * The path is intentionally opt-in while it is being verified on the Mini.
+ * It only applies where all 256 experts are genuinely required; candidate
+ * reads retain their cancellation semantics in the normal path. */
+static bool metal_graph_prefill_deferred_full_expert_layer(
+        ds4_gpu_graph         *g,
+        const ds4_model       *model,
+        const ds4_weights     *weights,
+        const token_vec       *prompt,
+        uint32_t               il,
+        uint32_t               start,
+        uint32_t               n_tokens,
+        ds4_session_cancel_fn  cancel,
+        void                  *cancel_ud,
+        bool                  *cancelled) {
+    if (!g || !model || !weights || !prompt || il >= DS4_N_LAYER ||
+        n_tokens == 0 || n_tokens > g->prefill_cap ||
+        !metal_graph_batch_after_attn_hc(g) ||
+        !metal_graph_batch_ffn_norm(g) ||
+        !metal_graph_batch_router_selected(g) ||
+        !metal_graph_batch_router_weights(g)) {
+        return false;
+    }
+
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t hc_bytes = hc_dim * sizeof(float);
+    const uint64_t norm_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
+    const uint64_t selected_bytes =
+        (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t);
+    const uint64_t weight_bytes =
+        (uint64_t)DS4_N_EXPERT_USED * sizeof(float);
+    if ((uint64_t)n_tokens > SIZE_MAX / DS4_N_EXPERT_USED) return false;
+    int32_t *saved_selected = xcalloc(
+            (size_t)n_tokens * DS4_N_EXPERT_USED, sizeof(saved_selected[0]));
+    if (!saved_selected) return false;
+
+    bool ok = true;
+    bool interrupted = false;
+    const bool saved_exact_prefill = g->cache_aware_exact_prefill;
+    const double phase_a_started = now_sec();
+    g->cache_aware_exact_prefill = true;
+    g->prefill_defer_router_expert_load = true;
+    g->prefill_defer_router_selected = saved_selected;
+    g->prefill_defer_router_row = 0;
+
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t t = 0; ok && t < n_tokens; t++) {
+        if (cancel && cancel(cancel_ud)) {
+            interrupted = true;
+            break;
+        }
+        const uint32_t pos = start + t;
+        const uint32_t raw_row = pos % g->raw_cap;
+        const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
+        ds4_gpu_tensor *in_row = metal_graph_tensor_row_view(
+                metal_graph_batch_cur_hc(g), t, hc_dim);
+        ok = in_row &&
+             ds4_gpu_tensor_copy(metal_graph_cur_hc(g), 0, in_row, 0,
+                                 hc_bytes) != 0;
+        ds4_gpu_tensor_free(in_row);
+        if (ok) g->prefill_defer_router_row = t;
+        if (ok) {
+            ok = metal_graph_encode_decode_layer_phase(
+                    g, model, &weights->layer[il], il, pos,
+                    g->layer_raw_cache[il], g->raw_cap, raw_row, n_raw,
+                    prompt->v[pos], METAL_DECODE_LAYER_TO_ROUTER);
+        }
+        if (ok) ok = ds4_gpu_tensor_copy(
+                metal_graph_batch_after_attn_hc(g),
+                (uint64_t)t * hc_bytes,
+                metal_graph_after_attn_hc(g), 0, hc_bytes) != 0;
+        if (ok) ok = ds4_gpu_tensor_copy(
+                metal_graph_batch_ffn_norm(g),
+                (uint64_t)t * norm_bytes,
+                metal_graph_ffn_norm(g), 0, norm_bytes) != 0;
+        if (ok) ok = ds4_gpu_tensor_copy(
+                metal_graph_batch_router_selected(g),
+                (uint64_t)t * selected_bytes,
+                metal_graph_router_selected(g), 0, selected_bytes) != 0;
+        if (ok) ok = ds4_gpu_tensor_copy(
+                metal_graph_batch_router_weights(g),
+                (uint64_t)t * weight_bytes,
+                metal_graph_router_weights(g), 0, weight_bytes) != 0;
+    }
+    if (ok || interrupted) {
+        if (ds4_gpu_end_commands() == 0) ok = false;
+    } else {
+        (void)ds4_gpu_synchronize();
+    }
+    g->prefill_defer_router_expert_load = false;
+    g->prefill_defer_router_selected = NULL;
+    const double phase_a_finished = now_sec();
+
+    if (ok && !interrupted) {
+        /* This joins only the not-yet-read tail of the owned 256-expert
+         * prefetch.  The preceding Router loop has kept the GPU and CPU busy
+         * throughout the bulk of that transfer. */
+        ok = metal_graph_activate_prefill_expert_layer(model, weights, il);
+    }
+    const double experts_ready = now_sec();
+
+    if (ok && !interrupted) ok = ds4_gpu_begin_commands() != 0;
+    for (uint32_t t = 0; ok && !interrupted && t < n_tokens; t++) {
+        if (cancel && cancel(cancel_ud)) {
+            interrupted = true;
+            break;
+        }
+        const uint32_t pos = start + t;
+        const uint32_t raw_row = pos % g->raw_cap;
+        const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
+        ok = ds4_gpu_tensor_copy(metal_graph_after_attn_hc(g), 0,
+                                 metal_graph_batch_after_attn_hc(g),
+                                 (uint64_t)t * hc_bytes, hc_bytes) != 0;
+        if (ok) ok = ds4_gpu_tensor_copy(metal_graph_ffn_norm(g), 0,
+                                         metal_graph_batch_ffn_norm(g),
+                                         (uint64_t)t * norm_bytes,
+                                         norm_bytes) != 0;
+        if (ok) ok = ds4_gpu_tensor_copy(metal_graph_router_selected(g), 0,
+                                         metal_graph_batch_router_selected(g),
+                                         (uint64_t)t * selected_bytes,
+                                         selected_bytes) != 0;
+        if (ok) ok = ds4_gpu_tensor_copy(metal_graph_router_weights(g), 0,
+                                         metal_graph_batch_router_weights(g),
+                                         (uint64_t)t * weight_bytes,
+                                         weight_bytes) != 0;
+        if (ok) ok = ds4_gpu_routed_moe_set_selected_override(
+                saved_selected + (uint64_t)t * DS4_N_EXPERT_USED,
+                DS4_N_EXPERT_USED) != 0;
+        if (ok) {
+            ok = metal_graph_encode_decode_layer_phase(
+                    g, model, &weights->layer[il], il, pos,
+                    g->layer_raw_cache[il], g->raw_cap, raw_row, n_raw,
+                    prompt->v[pos], METAL_DECODE_LAYER_FROM_ROUTER);
+        }
+        ds4_gpu_tensor *out_row = NULL;
+        if (ok) out_row = metal_graph_tensor_row_view(
+                metal_graph_batch_next_hc(g), t, hc_dim);
+        if (ok) ok = out_row &&
+                     ds4_gpu_tensor_copy(out_row, 0,
+                                         metal_graph_after_ffn_hc(g), 0,
+                                         hc_bytes) != 0;
+        ds4_gpu_tensor_free(out_row);
+    }
+    if (ok || interrupted) {
+        if (ds4_gpu_end_commands() == 0) ok = false;
+    } else {
+        (void)ds4_gpu_synchronize();
+    }
+    const double finished = now_sec();
+    g->cache_aware_exact_prefill = saved_exact_prefill;
+    free(saved_selected);
+
+    fprintf(stderr,
+            "ds4-prefill-overlap: layer=%u tokens=%u router_ms=%.3f "
+            "expert_wait_ms=%.3f moe_ms=%.3f\n",
+            il, n_tokens,
+            (phase_a_finished - phase_a_started) * 1000.0,
+            (experts_ready - phase_a_finished) * 1000.0,
+            (finished - experts_ready) * 1000.0);
+    if (interrupted && cancelled) *cancelled = true;
+    return ok;
+}
+
 /* Canonical fixed-Mini prefill: retain one layer's non-routed weights, then
  * run every prompt row through the already accepted single-token decode
  * arithmetic before advancing to the next layer.  This changes only the I/O
@@ -34266,6 +34471,9 @@ static bool metal_graph_prefill_layer_major_decode_rows(
     }
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const double layer_started = layer_profile ? now_sec() : 0.0;
+        const bool deferred_full_expert_overlap =
+            metal_graph_prefill_deferred_full_expert_overlap_enabled(
+                    g, il, n_tokens);
         if (cancel && cancel(cancel_ud)) {
             interrupted = true;
             interrupted_layer = il;
@@ -34288,9 +34496,11 @@ static bool metal_graph_prefill_layer_major_decode_rows(
             if (il < DS4_N_HASH_LAYER ||
                 metal_graph_prefill_expert_prefetch_count(n_tokens) ==
                     DS4_N_EXPERT) {
+                if (!deferred_full_expert_overlap) {
                 (void)metal_graph_activate_prefill_expert_layer(model,
                                                                 weights,
                                                                 il);
+                }
             }
             const uint32_t lookahead =
                 metal_graph_prefill_expert_prefetch_count(n_tokens) ==
@@ -34336,52 +34546,65 @@ static bool metal_graph_prefill_layer_major_decode_rows(
             }
         }
         const double compute_started = layer_profile ? now_sec() : 0.0;
-        if (ok) ok = ds4_gpu_begin_commands() != 0;
-        for (uint32_t t = 0; ok && t < n_tokens; t++) {
-            if (cancel && cancel(cancel_ud)) {
+        if (deferred_full_expert_overlap) {
+            bool overlap_cancelled = false;
+            ok = metal_graph_prefill_deferred_full_expert_layer(
+                    g, model, weights, prompt, il, start, n_tokens,
+                    cancel, cancel_ud, &overlap_cancelled);
+            if (overlap_cancelled) {
                 interrupted = true;
                 interrupted_layer = il;
-                interrupted_row = t;
+                interrupted_row = 0;
                 ok = false;
-                break;
             }
-            const uint32_t pos = start + t;
-            const uint32_t raw_row = pos % g->raw_cap;
-            const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
-            ds4_gpu_tensor *in_row = metal_graph_tensor_row_view(
-                    metal_graph_batch_cur_hc(g), t, hc_dim);
-            ds4_gpu_tensor *out_row = metal_graph_tensor_row_view(
-                    metal_graph_batch_next_hc(g), t, hc_dim);
-            ok = in_row && out_row &&
-                 ds4_gpu_tensor_copy(metal_graph_cur_hc(g),
-                                     0,
-                                     in_row,
-                                     0,
-                                     hc_bytes) != 0;
-            if (ok) {
-                ok = metal_graph_encode_decode_layer(g,
-                                                     model,
-                                                     &weights->layer[il],
-                                                     il,
-                                                     pos,
-                                                     g->layer_raw_cache[il],
-                                                     g->raw_cap,
-                                                     raw_row,
-                                                     n_raw,
-                                                     prompt->v[pos]);
-            }
-            if (ok) {
-                ok = ds4_gpu_tensor_copy(out_row,
+        } else {
+            if (ok) ok = ds4_gpu_begin_commands() != 0;
+            for (uint32_t t = 0; ok && t < n_tokens; t++) {
+                if (cancel && cancel(cancel_ud)) {
+                    interrupted = true;
+                    interrupted_layer = il;
+                    interrupted_row = t;
+                    ok = false;
+                    break;
+                }
+                const uint32_t pos = start + t;
+                const uint32_t raw_row = pos % g->raw_cap;
+                const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
+                ds4_gpu_tensor *in_row = metal_graph_tensor_row_view(
+                        metal_graph_batch_cur_hc(g), t, hc_dim);
+                ds4_gpu_tensor *out_row = metal_graph_tensor_row_view(
+                        metal_graph_batch_next_hc(g), t, hc_dim);
+                ok = in_row && out_row &&
+                     ds4_gpu_tensor_copy(metal_graph_cur_hc(g),
                                          0,
-                                         metal_graph_after_ffn_hc(g),
+                                         in_row,
                                          0,
                                          hc_bytes) != 0;
+                if (ok) {
+                    ok = metal_graph_encode_decode_layer(g,
+                                                         model,
+                                                         &weights->layer[il],
+                                                         il,
+                                                         pos,
+                                                         g->layer_raw_cache[il],
+                                                         g->raw_cap,
+                                                         raw_row,
+                                                         n_raw,
+                                                         prompt->v[pos]);
+                }
+                if (ok) {
+                    ok = ds4_gpu_tensor_copy(out_row,
+                                             0,
+                                             metal_graph_after_ffn_hc(g),
+                                             0,
+                                             hc_bytes) != 0;
+                }
+                ds4_gpu_tensor_free(out_row);
+                ds4_gpu_tensor_free(in_row);
             }
-            ds4_gpu_tensor_free(out_row);
-            ds4_gpu_tensor_free(in_row);
+            if (ok) ok = ds4_gpu_end_commands() != 0;
+            else (void)ds4_gpu_synchronize();
         }
-        if (ok) ok = ds4_gpu_end_commands() != 0;
-        else (void)ds4_gpu_synchronize();
         const double compute_finished = layer_profile ? now_sec() : 0.0;
         if (layer_profile) {
             fprintf(stderr,
