@@ -15386,7 +15386,7 @@ void ds4_gpu_stream_expert_cache_release_layer_keep_recent(uint32_t layer,
      * no new I/O and gives the next decode token a small, exact warm start.
      * We intentionally use recency rather than route hotness: this is a
      * prompt-tail handoff, not a long-lived eviction policy. */
-    uint64_t cutoff = 0;
+    uint64_t cutoff = UINT64_MAX;
     uint32_t found = 0;
     for (uint32_t pass = 0; pass < keep; pass++) {
         uint64_t newest = 0;
@@ -15397,7 +15397,7 @@ void ds4_gpu_stream_expert_cache_release_layer_keep_recent(uint32_t layer,
                 &g_stream_expert_cache[layer][expert];
             if (!e->valid ||
                 ds4_gpu_stream_expert_cache_entry_inflight(e) ||
-                e->last_used <= cutoff) {
+                e->last_used >= cutoff) {
                 continue;
             }
             if (e->last_used > newest) newest = e->last_used;
