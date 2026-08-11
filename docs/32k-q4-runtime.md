@@ -36,6 +36,8 @@ cache-aware router 的初步速度档位：
 
 `DS4F_SPEED_CACHE_AWARE_MAX_ENTROPY_PCT` 是实验性的 router 熵保护。80/95% 阈值会让大量层回到 exact，实测只剩 2.17/2.86 t/s；25% mass + 99% 阈值虽有 5.18 t/s，但 10 题 NLL 相比无保护 30% 只改善约 2%，top-1 和 greedy 前缀反而更差。因此三个正式模式把该值设为 100（禁用保护）；代码保留用于后续研究，不把它宣传成现有优化。
 
+设置 `DS4F_SPEED_CACHE_AWARE_PROFILE=1` 会逐层记录 router 的总 mass、实际保留 mass、命中缓存数和保留专家数。它只用于寻找更可靠的自适应 decode 阈值，不改变默认 exact 路径。
+
 ## 预填充 workspace 复用
 
 预填充是 layer-major：同一批 token 完成某层 attention 后才进入该层 FFN。因此 attention-only 和 FFN-only 中间 tensor 生命周期不重叠。`DS4_METAL_PREFILL_STAGE_ALIAS=1` 会释放独立 FFN batch buffer，并让它们成为已结束 attention buffer 的不重叠 view；KV、跨阶段 HC、权重和计算公式均不改变。

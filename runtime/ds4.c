@@ -21406,6 +21406,8 @@ static bool metal_graph_decode_cpu_router(
     if (cache_mass_text && cache_mass_text[0] && g->ssd_streaming &&
         !g->cache_aware_exact_prefill &&
         DS4_N_EXPERT_USED <= 32u) {
+        const bool cache_aware_profile =
+            getenv("DS4F_SPEED_CACHE_AWARE_PROFILE") != NULL;
         char *mass_end = NULL;
         const long mass_pct = strtol(cache_mass_text, &mass_end, 10);
         uint64_t gate_expert_bytes = 0;
@@ -21485,6 +21487,21 @@ static bool metal_graph_decode_cpu_router(
                         weights[i] = 0.0f;
                     }
                 }
+            }
+            if (cache_aware_profile) {
+                uint32_t resident = 0;
+                uint32_t retained_resident = 0;
+                for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+                    if ((resident_mask & (1u << i)) != 0) resident++;
+                    if (keep[i] && (resident_mask & (1u << i)) != 0) {
+                        retained_resident++;
+                    }
+                }
+                fprintf(stderr,
+                        "ds4-cache-aware: layer=%u token=%u mass=%ld effective=%ld "
+                        "resident=%u kept=%u kept_resident=%u kept_mass=%.6f total_mass=%.6f\n",
+                        il, token, mass_pct, effective_mass_pct,
+                        resident, kept, retained_resident, kept_mass, total_mass);
             }
         }
     }
