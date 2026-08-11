@@ -19761,13 +19761,15 @@ static uint32_t metal_graph_prefill_hot_expert_prefetch_count(
             return parsed >= DS4_N_EXPERT ? DS4_N_EXPERT : (uint32_t)parsed;
         }
     }
-    /* Measured on the fixed Mini from the same 24-token disk-KV prefix:
-     * 10-token suffix demand-only=6.84 s, heat-12=7.36 s, heat-24=7.55 s.
-     * There is too little overlap window to earn back a speculative copy. */
-    if (n_tokens < 16u) return 0u;
-    if (n_tokens < 64u) return 24u;
-    if (n_tokens < 256u) return 64u;
-    return DS4_N_EXPERT;
+    /* Measured on the fixed Mini from one identical 24-token disk-KV prefix:
+     * suffix 10: demand=6.84 s, heat-12=7.36 s, heat-24=7.55 s;
+     * suffix 32: demand=13.18 s, heat-24=14.09 s;
+     * suffix 85: demand=23.97 s, heat-64=25.01 s.
+     * Candidate copying never repaid its own I/O below the established
+     * 256-token whole-layer crossover, so leave it opt-in for future trials.
+     * Long prompts retain the separately measured full-layer policy above. */
+    (void)n_tokens;
+    return 0u;
 }
 
 static void metal_graph_prefill_sort_hot_groups_by_address(

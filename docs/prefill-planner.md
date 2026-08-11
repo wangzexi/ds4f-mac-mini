@@ -22,19 +22,18 @@ layers at once.
 
 | Prompt rows | Cold learned-router staging | KV-prefix heat staging |
 | ---: | ---: | ---: |
-| 1-15 | wait for Router, then exact-read | disabled (measured faster) |
-| 16-63 | wait for Router, then exact-read | 24 candidates |
-| 64-255 | wait for Router, then exact-read | 64 candidates |
+| 1-255 | wait for Router, then exact-read | disabled by default (measured faster) |
 | 256+ | all 256 experts | all 256 experts |
 
 For layers 3 and later, a cold prompt keeps the conservative all-or-nothing
 policy: short and medium prompts wait for the actual Router result, while long
 prompts read all experts in packed-file order. A KV-prefix hit additionally
 restores decayed Router-weight heat. Below the 256-token full-layer crossover,
-that heat selects 24/64 candidates (then a full layer). They are sorted by heat, then each
+candidate prediction is disabled by default below the full-layer crossover.
+It remains available through
+`DS4_METAL_PREFILL_HOT_EXPERT_PREFETCH_COUNT=0..256` for reproducible Mini
+A/B measurements. When enabled, candidates are sorted by heat, then each
 eight-expert priority group is put in packed-file order for SSD locality.
-`DS4_METAL_PREFILL_HOT_EXPERT_PREFETCH_COUNT=0..256` overrides that number
-for reproducible Mini A/B measurements; normal service leaves it unset.
 
 The candidate reader publishes only fully-read expert slots. When the first
 real Router result for that layer arrives, it stops at the next slot boundary,
@@ -44,10 +43,12 @@ slab never becomes a long-lived 1.69 GiB allocation. Hash layer 0 is fully
 resident before the server listens; hash layers 1 and 2 use exact token-ID
 unions. A completed layer is released immediately.
 
-The current 1–15-token cutoff is measured rather than guessed. With the same
-24-token disk-KV prefix and a 10-token suffix, demand-only Prefill took
-6.84 s; 12 and 24 candidates took 7.36 s and 7.55 s respectively. That short
-window cannot hide enough I/O to repay speculative reads.
+The default 1–255-token cutoff is measured rather than guessed. With the same
+24-token disk-KV prefix, demand-only versus heat candidates were: 10-token
+suffix 6.84 s versus 7.36 s (12) / 7.55 s (24); 32-token suffix 13.18 s
+versus 14.09 s (24); 85-token suffix 23.97 s versus 25.01 s (64). Candidate
+copying does not repay speculative reads on this Mini below the already-tested
+256-token full-layer crossover.
 
 Complete learned-layer 256-expert staging is intentionally one layer ahead.
 Holding three complete 1.69 GiB Metal expert layers produced different
