@@ -15,6 +15,11 @@ layers never use a corpus-global fixed expert order.
 The exact layer-major path keeps decode arithmetic unchanged and varies only
 the I/O schedule:
 
+This applies equally to a cold prompt and to the uncached suffix after a
+disk-KV hit.  The older token-major suffix path is disabled for this fixed
+Flash runtime: it bypassed the SSD pipeline and could retain experts from many
+layers at once.
+
 | Prompt rows | Cold learned-router staging | KV-prefix heat staging |
 | ---: | ---: | ---: |
 | 1-15 | wait for Router, then exact-read | 12 candidates |

@@ -30477,6 +30477,15 @@ static bool metal_graph_use_streaming_decode_prefill_range(
         const ds4_weights   *weights,
         uint32_t             start,
         uint32_t             n_tokens) {
+    /* This runtime's value is the exact layer-major pipeline.  A disk-KV
+     * hit has a nonzero start, and historically that suffix silently fell
+     * back to token-major decode. Besides bypassing route-heat prefetch, that
+     * path can grow the global expert cache across all 43 layers. */
+    if (g && g->ssd_streaming &&
+        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4 &&
+        DS4_MODEL_VARIANT == DS4_VARIANT_FLASH) {
+        return false;
+    }
     /*
      * Short streamed prefill is latency-sensitive.  Use the decode-style path
      * by default for SSD streaming, while keeping a cold-only escape hatch for
