@@ -19640,6 +19640,52 @@ static bool metal_graph_stream_map_decode_static_all(
     return ok;
 }
 
+/* This tag cannot collide with a transformer layer number. */
+#define DS4_METAL_PREFETCH_STATIC_DECODE_TAG UINT32_MAX
+
+static bool metal_graph_prefill_static_decode_prefetch_enabled(void) {
+    const char *env = getenv("DS4_METAL_PREFILL_STATIC_DECODE_PREFETCH");
+    return env && env[0] && strcmp(env, "0") != 0;
+}
+
+/*
+ * The first decode step switches from layer-at-a-time Prefill trunk reads to
+ * the full static trunk map.  If the last Prefill layer has enough GPU work
+ * left, start the exact 90-span read there and later transfer those buffers
+ * directly into the decode map.  It is opt-in: its 4.60 GiB allocation must
+ * be admitted by the request memory plan before it can become a server mode.
+ */
+static bool metal_graph_prefetch_decode_static_all(
+        const ds4_model   *model,
+        const ds4_weights *weights) {
+    if (!metal_graph_prefill_static_decode_prefetch_enabled() ||
+        !metal_graph_stream_decode_static_map_enabled()) {
+        return false;
+    }
+    ds4_model_map_span_vec spans;
+    if (!weights_model_map_decode_static_spans(weights, true, true, &spans)) {
+        return false;
+    }
+    uint64_t *offsets = xmalloc((size_t)spans.len * sizeof(offsets[0]));
+    uint64_t *sizes = xmalloc((size_t)spans.len * sizeof(sizes[0]));
+    for (uint32_t i = 0; i < spans.len; i++) {
+        offsets[i] = spans.v[i].off;
+        sizes[i] = spans.v[i].end - spans.v[i].off;
+    }
+    const bool ok = ds4_gpu_model_prefetch_spans_begin(
+            model->map,
+            model->size,
+            offsets,
+            sizes,
+            spans.len,
+            spans.max_tensor_bytes,
+            DS4_METAL_PREFETCH_STATIC_DECODE_TAG) != 0;
+    free(sizes);
+    free(offsets);
+    free(spans.v);
+    return ok;
+}
+
 static bool metal_graph_stream_map_layer(
         const ds4_model   *model,
         const ds4_weights *weights,
@@ -34234,6 +34280,8 @@ static bool metal_graph_prefill_layer_major_decode_rows(
     }
     bool ok = true;
     bool interrupted = false;
+    bool static_decode_prefetch_started = false;
+    bool static_decode_prefetch_installed = false;
     const char *layer_profile_env =
         getenv("DS4_METAL_PREFILL_LAYER_PROFILE");
     const bool layer_profile = layer_profile_env && layer_profile_env[0] &&
@@ -34334,6 +34382,10 @@ static bool metal_graph_prefill_layer_major_decode_rows(
                     }
                 }
             }
+            if (il + 1u == DS4_N_LAYER) {
+                static_decode_prefetch_started =
+                    metal_graph_prefetch_decode_static_all(model, weights);
+            }
         }
         const double compute_started = layer_profile ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_begin_commands() != 0;
@@ -34431,6 +34483,13 @@ static bool metal_graph_prefill_layer_major_decode_rows(
         }
     }
     if (g->ssd_streaming) {
+        if (static_decode_prefetch_started &&
+            ds4_gpu_model_prefetch_spans_activate(
+                    DS4_METAL_PREFETCH_STATIC_DECODE_TAG)) {
+            static_decode_prefetch_installed = true;
+            g->streaming_static_decode_map_current =
+                metal_graph_stream_decode_static_map_state_cache_enabled();
+        }
         ds4_gpu_stream_expert_layer_prefetch_cancel_all();
         ds4_gpu_model_prefetch_cancel_all();
     }
@@ -34459,7 +34518,9 @@ static bool metal_graph_prefill_layer_major_decode_rows(
         ok = last_hc != NULL;
     }
     if (ok && logits && g->ssd_streaming) {
-        g->streaming_static_decode_map_current = false;
+        if (!static_decode_prefetch_installed) {
+            g->streaming_static_decode_map_current = false;
+        }
         ok = metal_graph_stream_map_output(model, weights);
     }
     if (ok && logits) {

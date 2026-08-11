@@ -561,7 +561,11 @@ static uint32_t g_model_view_count;
 
 enum {
     DS4_METAL_MODEL_PREFETCH_SLOTS = 6,
-    DS4_METAL_MODEL_PREFETCH_MAX_VIEWS = 16,
+    /* Static Flash decode maps contain 90 exact tensor spans.  The normal
+     * one-layer Prefill read needs only a few, but an opt-in final-layer
+     * handoff must retain the complete decoded trunk without merging gaps
+     * (which could accidentally read routed-expert payloads). */
+    DS4_METAL_MODEL_PREFETCH_MAX_VIEWS = 128,
 };
 
 typedef struct {
