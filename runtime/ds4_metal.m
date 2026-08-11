@@ -12958,6 +12958,26 @@ static int ds4_gpu_stream_expert_split_ready(void) {
            ds4_gpu_stream_expert_split_min_cached();
 }
 
+static uint32_t ds4_gpu_stream_expert_cache_hotness_decay_tokens(void) {
+    /* Flash on the fixed Mini has one active decode stream.  Keep this
+     * process-local test seam so we can measure the temporal locality window
+     * rather than guessing it.  Production retains the measured default. */
+    static int initialized = 0;
+    static uint32_t tokens = DS4_METAL_STREAM_EXPERT_HOTNESS_DECAY_TOKENS;
+    if (!initialized) {
+        const char *env = getenv("DS4_METAL_STREAMING_EXPERT_HOTNESS_DECAY_TOKENS");
+        if (env && env[0]) {
+            char *end = NULL;
+            const unsigned long value = strtoul(env, &end, 10);
+            if (end != env && *end == '\0' && value >= 1u && value <= 4096u) {
+                tokens = (uint32_t)value;
+            }
+        }
+        initialized = 1;
+    }
+    return tokens;
+}
+
 static void ds4_gpu_stream_expert_cache_maybe_decay_route_hotness(void);
 
 void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
@@ -13060,7 +13080,7 @@ static void ds4_gpu_stream_expert_cache_maybe_decay_route_hotness(void) {
                            g_stream_expert_cache_hotness_decay_token;
     if (delta != 0) {
         const float factor = exp2f(-(float)delta /
-                                   DS4_METAL_STREAM_EXPERT_HOTNESS_DECAY_TOKENS);
+                                   (float)ds4_gpu_stream_expert_cache_hotness_decay_tokens());
         for (uint32_t layer = 0;
              layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
              layer++) {
@@ -17014,7 +17034,7 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                 const uint64_t age = (uint64_t)n_tokens - 1u - row;
                 const float recency = exp2f(
                         -(float)age /
-                        DS4_METAL_STREAM_EXPERT_HOTNESS_DECAY_TOKENS);
+                        (float)ds4_gpu_stream_expert_cache_hotness_decay_tokens());
                 weight_sum[(uint32_t)selected_id] += weight * recency;
             }
             if (!seen[(uint32_t)selected_id]) {
