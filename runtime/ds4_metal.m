@@ -3722,12 +3722,13 @@ uint32_t ds4_gpu_resize_streaming_expert_cache_budget(
         g_stream_expert_cache_mlock_budget_cap = 0;
         g_stream_expert_cache_mlock_warned = 0;
     }
-    if (release_resident && experts < old_budget &&
-        g_stream_expert_cache_entry_count > experts) {
+    if (release_resident && shrinking_total) {
         /* Entries may share multi-GiB virtual slabs.  Pruning entries alone
-         * recycles their slots but intentionally keeps the slab objects; a
-         * request memory planner needs the stronger operation so munlock and
-         * slab release happen before large prefill scratch is touched. */
+         * recycles their slots but intentionally keeps the slab objects.  A
+         * short Prefill can have few logical entries while its prior phase
+         * still owns a large slab, so entry count is not a valid release
+         * condition.  The request planner needs the stronger operation so
+         * munlock and slab release happen before Decode begins. */
         ds4_gpu_stream_expert_cache_clear_all(0);
     }
     /* Lowering only the phase lock target must not throw away hot wired
