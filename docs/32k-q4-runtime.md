@@ -63,6 +63,13 @@ Decode 的 cache-hit/miss split 也以 950 槽 exact 路径重新测过。默认
 trace 中完全一致，但 generation 都是 2.05 t/s。现有 selected-expert early
 load 已处于同一同步边界，额外读请求没有形成可用重叠，因此该实验未保留。
 
+同一轮 profile 还显示，前三个 hash 层因为路由近似均匀，950 槽全局热度
+缓存中的命中率只有约 6–11%，而可学习路由层约为 62–85%。曾尝试把完整 hash
+层永久保留在缓存里；但 Mini 实际稳定可锁定的 expert slab 约 4GiB。仅固定第
+0 层就使后续批量加载在该上限处无法获得可复用槽并出现 Metal buffer allocation
+failure。因此它不是可行的缓存优化；保留更多专家必须以可回收的全局缓存方式进行，
+不能硬分区。
+
 ## 预填充 workspace 复用
 
 预填充是 layer-major：同一批 token 完成某层 attention 后才进入该层 FFN。因此 attention-only 和 FFN-only 中间 tensor 生命周期不重叠。`DS4_METAL_PREFILL_STAGE_ALIAS=1` 会释放独立 FFN batch buffer，并让它们成为已结束 attention buffer 的不重叠 view；KV、跨阶段 HC、权重和计算公式均不改变。
