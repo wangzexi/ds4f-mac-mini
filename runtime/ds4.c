@@ -1238,6 +1238,10 @@ typedef struct {
     uint32_t n_layer;
     uint32_t n_expert;
     uint32_t n_expert_used;
+    /* Optional profiler-only filter: retain locality statistics for the
+     * transition whose current absolute token position equals this value.
+     * UINT32_MAX retains the historical all-adjacent-pairs behavior. */
+    uint32_t adjacent_position;
     uint32_t n_caps;
     uint32_t caps[DS4_EXPERT_PROFILE_MAX_CAPS];
     uint64_t layer_records[DS4_MAX_LAYER];
@@ -1332,6 +1336,15 @@ static void ds4_expert_profile_init(const char *path, const char *hotlist_path) 
     g_expert_profile.n_layer = DS4_N_LAYER;
     g_expert_profile.n_expert = DS4_N_EXPERT;
     g_expert_profile.n_expert_used = DS4_N_EXPERT_USED;
+    g_expert_profile.adjacent_position = UINT32_MAX;
+    const char *adjacent_position = getenv("DS4_EXPERT_PROFILE_ADJACENT_POSITION");
+    if (adjacent_position && adjacent_position[0]) {
+        char *end = NULL;
+        const unsigned long value = strtoul(adjacent_position, &end, 10);
+        if (end != adjacent_position && *end == '\0' && value <= UINT32_MAX) {
+            g_expert_profile.adjacent_position = (uint32_t)value;
+        }
+    }
 
     for (uint32_t i = 0; i < DS4_EXPERT_PROFILE_MAX_CAPS; i++) {
         const uint32_t cap = ds4_expert_profile_cap_candidates[i];
@@ -1393,7 +1406,9 @@ static void ds4_expert_profile_record(
     p->total_records++;
     if (is_hash) p->layer_is_hash[il] = true;
 
-    if (p->prev_valid[il] && p->prev_pos[il] + 1u == pos) {
+    if (p->prev_valid[il] && p->prev_pos[il] + 1u == pos &&
+        (p->adjacent_position == UINT32_MAX ||
+         p->adjacent_position == pos)) {
         uint32_t intersection = 0;
         for (uint32_t a = 0; a < p->n_expert_used; a++) {
             for (uint32_t b = 0; b < p->n_expert_used; b++) {
