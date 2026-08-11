@@ -34346,7 +34346,8 @@ static bool metal_graph_prefill_layer_major_decode_rows(
             /* A completed prefill layer is never revisited by this request.
              * Releasing it immediately makes the same exact slot budget
              * available to the rolling future-layer prefetch window.  The
-             * opt-in tail handoff keeps the last row's six actual experts;
+             * opt-in tail handoff keeps the last row's most recently touched
+             * experts (normally its six routed experts);
              * it only changes residency, never router or MoE arithmetic. */
             const char *tail_handoff =
                 getenv("DS4_METAL_PREFILL_TAIL_EXPERT_HANDOFF");

@@ -43,6 +43,15 @@ slab never becomes a long-lived 1.69 GiB allocation. Hash layer 0 is fully
 resident before the server listens; hash layers 1 and 2 use exact token-ID
 unions. A completed layer is released immediately.
 
+An experimental bridge, `DS4_METAL_PREFILL_TAIL_EXPERT_HANDOFF=1`, changes
+only that final release: it retains the six most recently used expert entries
+from each completed layer. They are already-resident prompt-tail entries, so
+the handoff neither reads another byte nor changes Router/MoE arithmetic; it
+only gives the first decode token a chance to hit them. On `你好`, exact 32-token
+generation measured 1.96 versus 2.01 t/s and 56.4% versus 57.4% cache hit
+rate. That small difference is within run-to-run variance, so it stays opt-in
+rather than becoming a production default. The trace IDs were identical.
+
 The default 1–255-token cutoff is measured rather than guessed. With the same
 24-token disk-KV prefix, demand-only versus heat candidates were: 10-token
 suffix 6.84 s versus 7.36 s (12) / 7.55 s (24); 32-token suffix 13.18 s
