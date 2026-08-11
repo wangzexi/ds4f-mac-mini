@@ -1254,9 +1254,13 @@ typedef struct {
     bool prev_valid[DS4_MAX_LAYER];
     uint32_t prev_pos[DS4_MAX_LAYER];
     int prev_selected[DS4_MAX_LAYER][DS4_MAX_EXPERT_USED];
+    float prev_weights[DS4_MAX_LAYER][DS4_MAX_EXPERT_USED];
     uint64_t adjacent_pairs[DS4_MAX_LAYER];
     double adjacent_overlap_sum[DS4_MAX_LAYER];
     double adjacent_jaccard_sum[DS4_MAX_LAYER];
+    /* For each K=1..N, count how many of the next row's selected experts
+     * were among the previous row's K highest-weight experts. */
+    double adjacent_tail_topk_hits[DS4_MAX_EXPERT_USED][DS4_MAX_LAYER];
     bool layer_is_hash[DS4_MAX_LAYER];
     uint64_t total_records;
     uint64_t total_selections;
@@ -1426,6 +1430,38 @@ static void ds4_expert_profile_record(
             p->adjacent_jaccard_sum[il] +=
                 (double)intersection / (double)union_size;
         }
+
+        uint32_t ranked[DS4_MAX_EXPERT_USED];
+        for (uint32_t a = 0; a < p->n_expert_used; a++) ranked[a] = a;
+        for (uint32_t a = 1; a < p->n_expert_used; a++) {
+            const uint32_t item = ranked[a];
+            uint32_t at = a;
+            while (at != 0) {
+                const uint32_t previous = ranked[at - 1u];
+                const float item_weight = p->prev_weights[il][item];
+                const float previous_weight = p->prev_weights[il][previous];
+                if (previous_weight > item_weight ||
+                    (previous_weight == item_weight &&
+                     p->prev_selected[il][previous] <
+                         p->prev_selected[il][item])) {
+                    break;
+                }
+                ranked[at] = previous;
+                at--;
+            }
+            ranked[at] = item;
+        }
+        double hits = 0.0;
+        for (uint32_t a = 0; a < p->n_expert_used; a++) {
+            const int expert = p->prev_selected[il][ranked[a]];
+            for (uint32_t b = 0; b < p->n_expert_used; b++) {
+                if (expert == selected[b]) {
+                    hits += 1.0;
+                    break;
+                }
+            }
+            p->adjacent_tail_topk_hits[a][il] += hits;
+        }
     }
 
     p->prev_valid[il] = true;
@@ -1435,6 +1471,7 @@ static void ds4_expert_profile_record(
         const int expert = selected[slot];
         const float weight = weights[slot];
         p->prev_selected[il][slot] = expert;
+        p->prev_weights[il][slot] = weight;
         if (expert < 0 || (uint32_t)expert >= p->n_expert) continue;
         p->hist[il][expert]++;
         p->weight_hist[il][expert] += weight;
@@ -1545,6 +1582,14 @@ static void ds4_expert_profile_write_layer(FILE *fp, uint32_t il) {
                 hits,
                 hit_rate,
                 weight_hit_rate);
+    }
+    fputs("],\n      \"tail_topk_hits\": [", fp);
+    for (uint32_t k = 0; k < p->n_expert_used; k++) {
+        const double avg_hits = p->adjacent_pairs[il] ?
+            p->adjacent_tail_topk_hits[k][il] /
+                (double)p->adjacent_pairs[il] : 0.0;
+        if (k) fputc(',', fp);
+        fprintf(fp, "%.6f", avg_hits);
     }
     fputs("]}", fp);
 }
