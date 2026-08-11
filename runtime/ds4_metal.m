@@ -15468,13 +15468,20 @@ void ds4_gpu_stream_expert_cache_release_layer_keep_recent(uint32_t layer,
             NSUInteger dst_down_inner = 0;
             if (gate_bytes > UINT64_MAX - gate_bytes ||
                 gate_bytes * 2ull > UINT64_MAX - down_bytes) {
+                ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
                 continue;
             }
             const uint64_t compact_bytes = gate_bytes * 2ull + down_bytes;
             __strong id<MTLBuffer> compact_buffer =
                 ds4_gpu_stream_expert_alloc_buffer(
                         compact_bytes, @"ds4_compact_tail_expert");
-            if (!src_gate || !src_up || !src_down || !compact_buffer) continue;
+            if (!src_gate || !src_up || !src_down || !compact_buffer) {
+                /* Compact mode must never retain a full staging slab as a
+                 * fallback.  Missing tail entries are safe: Decode will
+                 * simply reload them through its ordinary exact path. */
+                ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
+                continue;
+            }
             dst_gate = compact_buffer;
             dst_up = compact_buffer;
             dst_down = compact_buffer;
