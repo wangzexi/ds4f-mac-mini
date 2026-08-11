@@ -146,6 +146,11 @@ prompt、32-token greedy 输出的受控 A/B 明确显示 GPU router 为 3.54 s 
 GPU 路由的 selected-id readback/异步交接没有在该模型上抵消调度开销；CPU router 能在
 MoE 编码前直接给出 six experts，故仍为 Mini 的默认精确路径。
 
+专家 route heat 的时间衰减也按真实连续会话测过。夹具先对 `你好` 解码 32 tokens，
+再带着该精确 assistant 历史追加新追问并解码 8 tokens；半衰期 8/16/64 的第二轮 Decode
+分别为 1.90/1.87/1.89 t/s（增量 Prefill 8.74/8.74/8.34 s）。未出现超过 SSD/Metal
+运行波动的稳定收益，故固定保留 16-token 半衰期，不把实验参数暴露到生产运行时。
+
 ### 单会话 KV 与 L0 的独立性
 
 服务空闲时仍保留三个彼此独立的状态：完整 L0（256 experts）、静态 Decode 主干映射，
