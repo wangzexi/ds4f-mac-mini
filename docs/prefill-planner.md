@@ -83,6 +83,25 @@ whereas the established two-2,048-row path completed the same request at about
 19.2 token/s.  The current exact per-row layer kernel therefore scales
 unfavorably past 2K; increasing the outer quantum is not a prefill speedup.
 
+## Rejected scheduler experiments
+
+The project retains a true-batch Prefill implementation for diagnostic work;
+set `DS4_METAL_EXACT_PREFILL_ROWS=0` only when explicitly measuring it.  On a
+304-token Mini fixture it reached 14.78 t/s versus 8.16 t/s for the canonical
+row path, but all 129,280 output logits differed (RMSE 0.426, maximum absolute
+difference 2.27).  The argmax happened to agree on that one prompt, which is
+not a correctness criterion.  It is not a user-facing turbo mode.
+
+An additional exact-row experiment deferred a full expert-layer activation
+while every row ran Attention and Router, preserving the row intermediates for
+a later MoE suffix.  Although its first deferred-layer output could be made
+byte-identical, later layers diverged and the 256-token fixture improved only
+from 6.86 to 6.93 t/s.  The experiment was reverted rather than leave an
+unverified alternate schedule in the runtime.  The remaining safe Prefill
+opportunity is therefore a future kernel-level split that preserves every
+dependency while avoiding the extra per-row mailbox copies; it must clear the
+same byte-identical logits gate before becoming selectable.
+
 ## Explicit I/O and paging
 
 - Model and packed-expert descriptors use `F_NOCACHE`.
