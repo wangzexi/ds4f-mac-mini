@@ -628,6 +628,7 @@ typedef struct {
     uint64_t logical_bytes;
     uint64_t last_used;
     uint64_t use_count;
+    float last_route_weight;
     NSUInteger gate_inner;
     NSUInteger up_inner;
     NSUInteger down_inner;
@@ -13110,6 +13111,13 @@ static void ds4_gpu_stream_expert_cache_note_selected_hotness(
                 (uint32_t)selected_ids[i],
                 selected_weights && isfinite(selected_weights[i]) &&
                     selected_weights[i] > 0.0f ? selected_weights[i] : 1.0f);
+        ds4_gpu_stream_expert_cache_entry *entry =
+            &g_stream_expert_cache[layer][(uint32_t)selected_ids[i]];
+        if (entry->valid) {
+            entry->last_route_weight =
+                selected_weights && isfinite(selected_weights[i]) &&
+                    selected_weights[i] > 0.0f ? selected_weights[i] : 0.0f;
+        }
     }
 }
 
@@ -15489,13 +15497,16 @@ void ds4_gpu_stream_expert_cache_release_layer_keep_recent(uint32_t layer,
     }
 
     /* The layer-major prefill has already loaded every exact expert used by
-     * its final prompt row.  Keeping the six newest entries therefore costs
-     * no new I/O and gives the next decode token a small, exact warm start.
-     * We intentionally use recency rather than route hotness: this is a
-     * prompt-tail handoff, not a long-lived eviction policy. */
+     * its final prompt row.  Find that row from its six newest cache touches,
+     * then retain its highest actual Router-weight experts.  This costs no
+     * model I/O and is a prompt-tail bridge only, not a long-lived eviction
+     * policy.  It is especially important for keep=1: Router's selected-ID
+     * order follows biased top-k selection, not necessarily the largest
+     * un-biased aggregation weight. */
+    const uint32_t recent_window = keep < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED ?
+        DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED : keep;
     uint64_t cutoff = UINT64_MAX;
-    uint32_t found = 0;
-    for (uint32_t pass = 0; pass < keep; pass++) {
+    for (uint32_t pass = 0; pass < recent_window; pass++) {
         uint64_t newest = 0;
         for (uint32_t expert = 0;
              expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
@@ -15511,23 +15522,46 @@ void ds4_gpu_stream_expert_cache_release_layer_keep_recent(uint32_t layer,
         }
         if (newest == 0) break;
         cutoff = newest;
-        found++;
     }
 
-    /* Fewer live entries than the target means all of them are prompt-tail
-     * candidates.  Do not return here: compact handoff still has to detach
-     * them from a full-layer staging buffer. */
-    const bool keep_all = found < keep;
+    bool retained[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT] = { false };
+    uint32_t retained_count = 0;
+    for (uint32_t pass = 0; pass < keep; pass++) {
+        uint32_t best = UINT32_MAX;
+        float best_weight = -FLT_MAX;
+        uint64_t best_last_used = 0;
+        for (uint32_t expert = 0;
+             expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+             expert++) {
+            const ds4_gpu_stream_expert_cache_entry *e =
+                &g_stream_expert_cache[layer][expert];
+            if (!e->valid || retained[expert] ||
+                ds4_gpu_stream_expert_cache_entry_inflight(e) ||
+                e->last_used < cutoff) {
+                continue;
+            }
+            if (e->last_route_weight > best_weight ||
+                (e->last_route_weight == best_weight &&
+                 e->last_used > best_last_used)) {
+                best = expert;
+                best_weight = e->last_route_weight;
+                best_last_used = e->last_used;
+            }
+        }
+        if (best == UINT32_MAX) break;
+        retained[best] = true;
+        retained_count++;
+    }
 
-    /* `cutoff` is the kth most-recent timestamp.  Timestamps are monotonic
-     * and unique for cache touches, so this keeps at most `keep` entries. */
+    /* Do not return when there are fewer than keep candidates: compact
+     * handoff still has to detach the selected entries from a full layer slab. */
     for (uint32_t expert = 0;
          expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
          expert++) {
         ds4_gpu_stream_expert_cache_entry *e =
             &g_stream_expert_cache[layer][expert];
         if (!e->valid || ds4_gpu_stream_expert_cache_entry_inflight(e) ||
-            keep_all || e->last_used >= cutoff) {
+            retained[expert]) {
             continue;
         }
         ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
@@ -15631,7 +15665,7 @@ void ds4_gpu_stream_expert_cache_release_layer_keep_recent(uint32_t layer,
         }
         fprintf(stderr,
                 "ds4: compact tail handoff layer=%u retained=%u migrated=%u\n",
-                layer, keep, migrated);
+                layer, retained_count, migrated);
     }
 }
 
