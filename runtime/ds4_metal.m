@@ -14903,6 +14903,11 @@ static void *ds4_gpu_stream_expert_layer_prefetch_thread_main(void *opaque) {
     @autoreleasepool {
         const int serialize_full_layer =
             p->n_experts == p->table.n_total_expert;
+        const char *parallel_full_layer_env =
+            getenv("DS4_METAL_PREFILL_FULL_LAYER_PARALLEL_PREAD");
+        const int parallel_full_layer = serialize_full_layer &&
+            parallel_full_layer_env && parallel_full_layer_env[0] &&
+            strcmp(parallel_full_layer_env, "0") != 0;
         if (serialize_full_layer) {
             pthread_mutex_lock(&g_stream_expert_layer_prefetch_io_mutex);
         }
@@ -14910,35 +14915,61 @@ static void *ds4_gpu_stream_expert_layer_prefetch_thread_main(void *opaque) {
         const size_t max_chunk = ds4_gpu_model_prefetch_chunk_bytes();
         int ok = dst != NULL;
         uint64_t total = 0;
-        for (uint32_t i = 0; ok && i < p->n_experts; i++) {
-            uint64_t done = 0;
-            while (done < p->slot_bytes) {
-                if (p->cancel) {
-                    ok = 0;
-                    break;
-                }
-                const uint64_t remaining = p->slot_bytes - done;
-                const size_t chunk = remaining > (uint64_t)max_chunk ?
-                    max_chunk : (size_t)remaining;
-                ssize_t got;
-                do {
-                    got = pread(p->source_fd,
-                                dst + (uint64_t)i * p->slot_bytes + done,
-                                chunk,
-                                (off_t)(p->source_offsets[i] + done));
-                } while (got < 0 && errno == EINTR);
-                if (got <= 0) {
-                    ok = 0;
-                    break;
-                }
-                done += (uint64_t)got;
-                total += (uint64_t)got;
+        if (ok && parallel_full_layer) {
+            /* Long Prefill deliberately consumes every expert in a layer, so
+             * it needs neither candidate cancellation nor slot-at-a-time
+             * publication.  Giving the packed, contiguous layer to the
+             * bounded pread pool lets the SSD choose a useful queue depth.
+             * Keep this opt-in until it has been measured on this Mini. */
+            ds4_gpu_stream_expert_pread_task tasks[
+                DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+            memset(tasks, 0, sizeof(tasks));
+            for (uint32_t i = 0; i < p->n_experts; i++) {
+                tasks[i] = (ds4_gpu_stream_expert_pread_task){
+                    .fd = p->source_fd,
+                    .offset = p->source_offsets[i],
+                    .len = p->slot_bytes,
+                    .dst = dst + (uint64_t)i * p->slot_bytes,
+                };
             }
+            double ignored_ms = 0.0;
+            ok = !p->cancel && ds4_gpu_stream_expert_pread_tasks(
+                    tasks, p->n_experts, &total, &ignored_ms);
             if (ok) {
-                /* Publish only complete packed slots.  The scheduler may
-                 * cancel after any slot and safely salvage these bytes. */
-                __atomic_store_n(&p->completed_experts, i + 1u,
+                __atomic_store_n(&p->completed_experts, p->n_experts,
                                  __ATOMIC_RELEASE);
+            }
+        } else {
+            for (uint32_t i = 0; ok && i < p->n_experts; i++) {
+                uint64_t done = 0;
+                while (done < p->slot_bytes) {
+                    if (p->cancel) {
+                        ok = 0;
+                        break;
+                    }
+                    const uint64_t remaining = p->slot_bytes - done;
+                    const size_t chunk = remaining > (uint64_t)max_chunk ?
+                        max_chunk : (size_t)remaining;
+                    ssize_t got;
+                    do {
+                        got = pread(p->source_fd,
+                                    dst + (uint64_t)i * p->slot_bytes + done,
+                                    chunk,
+                                    (off_t)(p->source_offsets[i] + done));
+                    } while (got < 0 && errno == EINTR);
+                    if (got <= 0) {
+                        ok = 0;
+                        break;
+                    }
+                    done += (uint64_t)got;
+                    total += (uint64_t)got;
+                }
+                if (ok) {
+                    /* Publish only complete packed slots.  The scheduler may
+                     * cancel after any slot and safely salvage these bytes. */
+                    __atomic_store_n(&p->completed_experts, i + 1u,
+                                     __ATOMIC_RELEASE);
+                }
             }
         }
         if (ok) {
