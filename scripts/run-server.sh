@@ -12,6 +12,7 @@ port=${DS4F_SERVER_PORT:-8000}
 context=${DS4F_SERVER_CONTEXT:-32768}
 tokens=${DS4F_SERVER_TOKENS:-4096}
 cache_experts=${DS4F_SERVER_CACHE_EXPERTS:-1800}
+prefill_full_layer_parallel_pread=${DS4F_SERVER_PREFILL_FULL_LAYER_PARALLEL_PREAD:-1}
 working_set_mib=${DS4F_SERVER_WORKING_SET_MIB:-11776}
 pinned_mib=${DS4F_SERVER_PINNED_MIB:-4096}
 decode_pinned_mib=${DS4F_SERVER_DECODE_PINNED_MIB:-6144}
@@ -35,6 +36,7 @@ exec env \
     DS4_METAL_STREAMING_EXPERT_PACK_PATH="$pack" \
     DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER=1 \
     DS4_METAL_PREFILL_STAGE_ALIAS=1 \
+    DS4_METAL_PREFILL_FULL_LAYER_PARALLEL_PREAD="$prefill_full_layer_parallel_pread" \
     DS4_METAL_PREFILL_MEASUREMENTS_PATH="$prefill_measurements" \
     DS4_SERVER_WORKING_SET_MIB="$working_set_mib" \
     DS4_SERVER_PINNED_MIB="$pinned_mib" \

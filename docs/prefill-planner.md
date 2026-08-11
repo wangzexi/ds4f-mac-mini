@@ -64,6 +64,16 @@ Holding three complete 1.69 GiB Metal expert layers produced different
 long-prompt logits on this machine; one layer ahead is byte-identical to demand
 loading and still reduced the measured 300-row run from 60.15 s to 40.11 s.
 
+For the 256-expert long-prompt case only, the packed layer is now read through
+the bounded (nine-worker) `pread` pool. It is safe to parallelize because the
+whole layer is demanded—there is no candidate cancellation to preserve. A
+300-token server request went from 47.72 s to 40.24 s: summed expert-activation
+wait fell from 12.27 s to 7.70 s (42 activations). The runner's serial versus
+parallel 300-token prefill logits were byte-identical, and its throughput rose
+from 7.99 to 8.46 t/s. This is enabled by the production launcher; set
+`DS4F_SERVER_PREFILL_FULL_LAYER_PARALLEL_PREAD=0` to reproduce the serial path.
+Shorter candidate reads deliberately remain slot-cancellable and serial.
+
 The server deliberately retains a 2,048-row idle scheduling quantum even
 though the shared workspace can hold 4,096 rows.  A 3,971-row one-shot trial
 kept SSD activation waits near zero but took roughly 12 seconds per layer,
