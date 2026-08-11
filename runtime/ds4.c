@@ -19665,6 +19665,24 @@ static bool metal_graph_prefill_static_decode_prefetch_enabled(
         n_tokens <= metal_graph_prefill_static_decode_prefetch_max_tokens();
 }
 
+/* Each exact Prefill layer has already touched the selected experts from the
+ * prompt tail.  Six entries retain the final row; larger experimental values
+ * retain a short tail union without another SSD read.  Keep this opt-in: its
+ * residency competes directly with Decode's global expert cache. */
+static uint32_t metal_graph_prefill_tail_expert_handoff_keep(void) {
+    uint32_t keep = DS4_N_EXPERT_USED;
+    const char *env = getenv("DS4_METAL_PREFILL_TAIL_EXPERT_HANDOFF_KEEP");
+    if (env && env[0]) {
+        char *end = NULL;
+        const unsigned long value = strtoul(env, &end, 10);
+        if (end != env && *end == '\0' && value != 0 &&
+            value <= DS4_N_EXPERT) {
+            keep = (uint32_t)value;
+        }
+    }
+    return keep;
+}
+
 /*
  * The first decode step switches from layer-at-a-time Prefill trunk reads to
  * the full static trunk map.  If the last Prefill layer has enough GPU work
@@ -34478,7 +34496,7 @@ static bool metal_graph_prefill_layer_major_decode_rows(
             if (tail_handoff && tail_handoff[0] &&
                 strcmp(tail_handoff, "0") != 0) {
                 ds4_gpu_stream_expert_cache_release_layer_keep_recent(
-                        il, DS4_N_EXPERT_USED);
+                        il, metal_graph_prefill_tail_expert_handoff_keep());
             } else {
                 ds4_gpu_stream_expert_cache_release_layer(il);
             }
