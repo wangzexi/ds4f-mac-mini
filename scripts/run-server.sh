@@ -19,6 +19,7 @@ reserve_mib=${DS4F_SERVER_MEMORY_RESERVE_MIB:-512}
 kv_cache_dir=${DS4F_SERVER_KV_CACHE_DIR:-$project_dir/cache/kv}
 kv_cache_mib=${DS4F_SERVER_KV_CACHE_MIB:-10240}
 kv_cache_min_tokens=${DS4F_SERVER_KV_CACHE_MIN_TOKENS:-1}
+prefill_measurements=${DS4F_SERVER_PREFILL_MEASUREMENTS:-$project_dir/cache/prefill-measurements.tsv}
 
 if [ ! -x "$project_dir/ds4f-server" ]; then
     echo "missing ds4f-server; run: make server" >&2
@@ -34,6 +35,7 @@ exec env \
     DS4_METAL_STREAMING_EXPERT_PACK_PATH="$pack" \
     DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER=1 \
     DS4_METAL_PREFILL_STAGE_ALIAS=1 \
+    DS4_METAL_PREFILL_MEASUREMENTS_PATH="$prefill_measurements" \
     DS4_SERVER_WORKING_SET_MIB="$working_set_mib" \
     DS4_SERVER_PINNED_MIB="$pinned_mib" \
     DS4_SERVER_DECODE_PINNED_MIB="$decode_pinned_mib" \

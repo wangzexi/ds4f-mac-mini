@@ -19688,6 +19688,194 @@ static bool metal_graph_stream_map_prefill_trunk(
     return ok;
 }
 
+static bool metal_graph_prefetch_prefill_trunk(
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           il) {
+    if (!model || !weights || il >= DS4_N_LAYER) return false;
+    ds4_model_map_span_vec spans;
+    if (!weights_model_map_decode_layer_spans(weights, il, &spans)) {
+        return false;
+    }
+    uint64_t *offsets = xmalloc((size_t)spans.len * sizeof(offsets[0]));
+    uint64_t *sizes = xmalloc((size_t)spans.len * sizeof(sizes[0]));
+    for (uint32_t i = 0; i < spans.len; i++) {
+        offsets[i] = spans.v[i].off;
+        sizes[i] = spans.v[i].end - spans.v[i].off;
+    }
+    const bool ok = ds4_gpu_model_prefetch_spans_begin(model->map,
+                                                        model->size,
+                                                        offsets,
+                                                        sizes,
+                                                        spans.len,
+                                                        spans.max_tensor_bytes,
+                                                        il) != 0;
+    free(sizes);
+    free(offsets);
+    free(spans.v);
+    return ok;
+}
+
+static uint32_t metal_graph_prefill_full_expert_prefetch_min_tokens(void) {
+    const char *env = getenv("DS4_METAL_PREFILL_FULL_EXPERT_MIN_TOKENS");
+    if (env && env[0]) {
+        char *end = NULL;
+        const unsigned long parsed = strtoul(env, &end, 10);
+        if (end != env && *end == '\0') {
+            return parsed > UINT32_MAX ? UINT32_MAX : (uint32_t)parsed;
+        }
+    }
+    return 64u;
+}
+
+static uint32_t metal_graph_prefill_expert_prefetch_count(
+        uint32_t n_tokens) {
+    const char *env = getenv("DS4_METAL_PREFILL_EXPERT_PREFETCH_COUNT");
+    if (env && env[0]) {
+        char *end = NULL;
+        const unsigned long parsed = strtoul(env, &end, 10);
+        if (end != env && *end == '\0') {
+            return parsed > DS4_N_EXPERT ? DS4_N_EXPERT : (uint32_t)parsed;
+        }
+    }
+    if (n_tokens < metal_graph_prefill_full_expert_prefetch_min_tokens()) {
+        return 0;
+    }
+    if (n_tokens < 128u) return DS4_N_EXPERT / 2u;
+    if (n_tokens < 256u) return (DS4_N_EXPERT * 3u) / 4u;
+    return DS4_N_EXPERT;
+}
+
+static uint32_t metal_graph_prefill_prefetch_lookahead(void) {
+    const char *env = getenv("DS4_METAL_PREFILL_PREFETCH_LOOKAHEAD");
+    if (env && env[0]) {
+        char *end = NULL;
+        const unsigned long parsed = strtoul(env, &end, 10);
+        if (end != env && *end == '\0') {
+            return parsed > 6u ? 6u : (uint32_t)parsed;
+        }
+    }
+    return 3u;
+}
+
+static uint32_t metal_graph_prefill_io_chunk_mib(void) {
+    const char *env = getenv("DS4_METAL_EXPLICIT_PREFETCH_CHUNK_MIB");
+    if (env && env[0]) {
+        char *end = NULL;
+        const unsigned long parsed = strtoul(env, &end, 10);
+        if (end != env && *end == '\0' && parsed >= 1u && parsed <= 64u) {
+            return (uint32_t)parsed;
+        }
+    }
+    return 32u;
+}
+
+static uint32_t metal_graph_prefill_expert_order(
+        uint32_t il,
+        int32_t  expert_ids[DS4_N_EXPERT]) {
+    bool seen[DS4_N_EXPERT];
+    memset(seen, 0, sizeof(seen));
+    uint32_t n = 0;
+    const uint16_t (*hotlist)[2] =
+        g_ds4_shape.variant == DS4_VARIANT_FLASH ?
+            ds4_default_streaming_hotlist_flash : NULL;
+    const uint32_t hotlist_count = hotlist ?
+        ds4_default_streaming_hotlist_flash_count : 0;
+    for (uint32_t i = 0; i < hotlist_count && n < DS4_N_EXPERT; i++) {
+        if (hotlist[i][0] != il || hotlist[i][1] >= DS4_N_EXPERT ||
+            seen[hotlist[i][1]]) {
+            continue;
+        }
+        expert_ids[n++] = (int32_t)hotlist[i][1];
+        seen[hotlist[i][1]] = true;
+    }
+    for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+        if (!seen[expert]) expert_ids[n++] = (int32_t)expert;
+    }
+    return n;
+}
+
+static bool metal_graph_prefetch_prefill_expert_layer(
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           il,
+        uint32_t           n_tokens,
+        uint32_t           protect_layer) {
+    if (!model || !weights || il >= DS4_N_LAYER) {
+        return false;
+    }
+    const char *pack_path = getenv("DS4_METAL_STREAMING_EXPERT_PACK_PATH");
+    if (!pack_path || !pack_path[0]) return false;
+    const uint32_t n_prefetch =
+        metal_graph_prefill_expert_prefetch_count(n_tokens);
+    if (n_prefetch == 0) return false;
+    const char *only_layer =
+        getenv("DS4_METAL_PREFILL_FULL_EXPERT_ONLY_LAYER");
+    if (only_layer && only_layer[0]) {
+        char *end = NULL;
+        const unsigned long selected = strtoul(only_layer, &end, 10);
+        if (end == only_layer || *end != '\0' || selected != il) {
+            return false;
+        }
+    }
+    const ds4_layer_weights *layer = &weights->layer[il];
+    uint64_t gate_expert_bytes = 0;
+    uint64_t down_expert_bytes = 0;
+    if (!streaming_layer_gate_down_expert_bytes(layer,
+                                                &gate_expert_bytes,
+                                                &down_expert_bytes)) {
+        return false;
+    }
+    const ds4_gpu_stream_expert_table table =
+        graph_stream_expert_table_make(model,
+                                       layer,
+                                       il,
+                                       gate_expert_bytes,
+                                       down_expert_bytes);
+    int32_t expert_ids[DS4_N_EXPERT];
+    if (metal_graph_prefill_expert_order(il, expert_ids) != DS4_N_EXPERT) {
+        return false;
+    }
+    /* Preserve the hotlist-selected set but restore ascending packed-file
+     * order. This turns adjacent selected experts into forward sequential I/O
+     * instead of seeking in hotness order. */
+    for (uint32_t i = 1; i < n_prefetch; i++) {
+        const int32_t value = expert_ids[i];
+        uint32_t j = i;
+        while (j > 0 && expert_ids[j - 1u] > value) {
+            expert_ids[j] = expert_ids[j - 1u];
+            j--;
+        }
+        expert_ids[j] = value;
+    }
+    return ds4_gpu_stream_expert_layer_prefetch_begin(&table,
+                                                       expert_ids,
+                                                       n_prefetch,
+                                                       protect_layer) != 0;
+}
+
+static bool metal_graph_activate_prefill_expert_layer(
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           il) {
+    if (!model || !weights || il >= DS4_N_LAYER) return false;
+    const ds4_layer_weights *layer = &weights->layer[il];
+    uint64_t gate_expert_bytes = 0;
+    uint64_t down_expert_bytes = 0;
+    if (!streaming_layer_gate_down_expert_bytes(layer,
+                                                &gate_expert_bytes,
+                                                &down_expert_bytes)) {
+        return false;
+    }
+    const ds4_gpu_stream_expert_table table =
+        graph_stream_expert_table_make(model,
+                                       layer,
+                                       il,
+                                       gate_expert_bytes,
+                                       down_expert_bytes);
+    return ds4_gpu_stream_expert_layer_prefetch_activate(&table) != 0;
+}
+
 static bool metal_graph_stream_map_output(
         const ds4_model   *model,
         const ds4_weights *weights) {
@@ -33781,7 +33969,10 @@ static bool metal_graph_prefill_layer_major_decode_rows(
         float                 *logits,
         bool                   show_progress,
         ds4_session_progress_fn display_progress,
-        void                  *display_progress_ud) {
+        void                  *display_progress_ud,
+        ds4_session_cancel_fn  cancel,
+        void                  *cancel_ud,
+        bool                  *cancelled) {
     if (!g || !model || !weights || !prompt || n_tokens == 0 ||
         n_tokens > g->prefill_cap || start > (uint32_t)prompt->len ||
         n_tokens > (uint32_t)prompt->len - start || g->raw_cap == 0 ||
@@ -33805,15 +33996,82 @@ static bool metal_graph_prefill_layer_major_decode_rows(
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t hc_bytes = hc_dim * sizeof(float);
+    if (g->ssd_streaming) {
+        const char *pack_path =
+            getenv("DS4_METAL_STREAMING_EXPERT_PACK_PATH");
+        const uint32_t planned_experts = pack_path && pack_path[0] ?
+            metal_graph_prefill_expert_prefetch_count(n_tokens) : 0u;
+        const uint32_t planned_lookahead = planned_experts == DS4_N_EXPERT ?
+            1u : metal_graph_prefill_prefetch_lookahead();
+        uint64_t gate_bytes = 0;
+        uint64_t down_bytes = 0;
+        uint64_t expert_bytes = 0;
+        if (streaming_layer_gate_down_expert_bytes(&weights->layer[0],
+                                                   &gate_bytes,
+                                                   &down_bytes) &&
+            gate_bytes <= (UINT64_MAX - down_bytes) / 2ull) {
+            expert_bytes = gate_bytes * 2ull + down_bytes;
+        }
+        fprintf(stderr,
+                "ds4: exact prefill plan tokens=%u expert_prefetch=%u/layer "
+                "lookahead=%u expert_slot=%.2f MiB staged_experts=%u "
+                "staged_payload=%.2f GiB chunk=%zu MiB F_NOCACHE=1\n",
+                n_tokens,
+                planned_experts,
+                planned_lookahead,
+                (double)expert_bytes / 1048576.0,
+                planned_experts * planned_lookahead,
+                (double)expert_bytes * planned_experts * planned_lookahead /
+                    1073741824.0,
+                (size_t)metal_graph_prefill_io_chunk_mib());
+    }
     bool ok = true;
+    bool interrupted = false;
+    uint32_t interrupted_layer = UINT32_MAX;
+    uint32_t interrupted_row = UINT32_MAX;
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
-        if (g->ssd_streaming &&
-            !metal_graph_stream_map_prefill_trunk(model, weights, il)) {
-            ok = false;
+        if (cancel && cancel(cancel_ud)) {
+            interrupted = true;
+            interrupted_layer = il;
             break;
+        }
+        if (g->ssd_streaming) {
+            /* Layer zero is loaded synchronously.  Every later layer first
+             * adopts the owned buffer filled while the preceding layer was
+             * executing; a failed/disabled prefetch falls back to the exact
+             * synchronous path. */
+            if (!ds4_gpu_model_prefetch_spans_activate(il) &&
+                !metal_graph_stream_map_prefill_trunk(model, weights, il)) {
+                ok = false;
+                break;
+            }
+            (void)metal_graph_activate_prefill_expert_layer(model,
+                                                            weights,
+                                                            il);
+            const uint32_t lookahead =
+                metal_graph_prefill_expert_prefetch_count(n_tokens) ==
+                    DS4_N_EXPERT ? 1u :
+                    metal_graph_prefill_prefetch_lookahead();
+            for (uint32_t d = 1; d <= lookahead && il + d < DS4_N_LAYER; d++) {
+                (void)metal_graph_prefetch_prefill_trunk(model,
+                                                         weights,
+                                                         il + d);
+                (void)metal_graph_prefetch_prefill_expert_layer(model,
+                                                                weights,
+                                                                il + d,
+                                                                n_tokens,
+                                                                il);
+            }
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         for (uint32_t t = 0; ok && t < n_tokens; t++) {
+            if (cancel && cancel(cancel_ud)) {
+                interrupted = true;
+                interrupted_layer = il;
+                interrupted_row = t;
+                ok = false;
+                break;
+            }
             const uint32_t pos = start + t;
             const uint32_t raw_row = pos % g->raw_cap;
             const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
@@ -33852,6 +34110,12 @@ static bool metal_graph_prefill_layer_major_decode_rows(
         if (ok) ok = ds4_gpu_end_commands() != 0;
         else (void)ds4_gpu_synchronize();
         if (!ok) break;
+        if (g->ssd_streaming) {
+            /* A completed prefill layer is never revisited by this request.
+             * Releasing it immediately makes the same exact slot budget
+             * available to the rolling future-layer prefetch window. */
+            ds4_gpu_stream_expert_cache_release_layer(il);
+        }
 
         ds4_gpu_tensor *tmp = metal_graph_batch_cur_hc(g);
         g->batch_cur_hc_by_tier[g->active_tier] =
@@ -33871,7 +34135,25 @@ static bool metal_graph_prefill_layer_major_decode_rows(
                              prompt->len);
         }
     }
+    if (g->ssd_streaming) {
+        ds4_gpu_stream_expert_layer_prefetch_cancel_all();
+        ds4_gpu_model_prefetch_cancel_all();
+    }
     if (show_progress) fputc('\n', stderr);
+    if (interrupted) {
+        if (interrupted_row == UINT32_MAX) {
+            fprintf(stderr,
+                    "ds4: exact prefill cancelled before layer=%u; staged I/O released\n",
+                    interrupted_layer);
+        } else {
+            fprintf(stderr,
+                    "ds4: exact prefill cancelled layer=%u row=%u; staged I/O released\n",
+                    interrupted_layer,
+                    interrupted_row);
+        }
+        if (cancelled) *cancelled = true;
+        return true;
+    }
     if (!ok) return false;
 
     ds4_gpu_tensor *saved_cur = metal_graph_cur_hc(g);
@@ -33917,7 +34199,10 @@ static bool metal_graph_prefill_layer_major(
         bool                   show_progress,
         ds4_imatrix_collector *imatrix,
         ds4_session_progress_fn display_progress,
-        void                  *display_progress_ud) {
+        void                  *display_progress_ud,
+        ds4_session_cancel_fn  cancel,
+        void                  *cancel_ud,
+        bool                  *cancelled) {
     if (n_tokens == 0 || n_tokens > g->prefill_cap) return false;
     if (start > (uint32_t)prompt->len) return false;
     if (n_tokens > (uint32_t)prompt->len - start) return false;
@@ -33940,8 +34225,15 @@ static bool metal_graph_prefill_layer_major(
                                                            logits,
                                                            show_progress,
                                                            display_progress,
-                                                           display_progress_ud);
+                                                           display_progress_ud,
+                                                           cancel,
+                                                           cancel_ud,
+                                                           cancelled);
     }
+
+    (void)cancel;
+    (void)cancel_ud;
+    (void)cancelled;
 
 #ifdef DS4_ROCM_BUILD
     if (g->ssd_streaming &&
@@ -34669,7 +34961,10 @@ static bool metal_graph_prefill_raw_swa(
                                            show_progress,
                                            NULL,
                                            display_progress,
-                                           display_progress_ud);
+                                           display_progress_ud,
+                                           cancel,
+                                           cancel_ud,
+                                           cancelled);
 }
 
 /* Prefill a contiguous token range in fixed-size chunks.
@@ -34767,7 +35062,10 @@ static bool metal_graph_prefill_chunked_range(
                                                   show_progress,
                                                   imatrix,
                                                   display_progress,
-                                                  display_progress_ud);
+                                                  display_progress_ud,
+                                                  cancel,
+                                                  cancel_ud,
+                                                  cancelled);
         if (!ok) {
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after chunked prefill failure also failed\n");
@@ -51803,7 +52101,8 @@ int ds4_engine_collect_imatrix(ds4_engine *e,
                                                          (uint32_t)prompt.len,
                                                          NULL, false,
                                                          &collector,
-                                                         NULL, NULL);
+                                                         NULL, NULL,
+                                                         NULL, NULL, NULL);
                 }
                 if (!ok) {
                     fprintf(stderr, "ds4: imatrix prefill failed at prompt %d\n", prompts_done + 1);
@@ -59059,6 +59358,9 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                                  false,
                                                  NULL,
                                                  NULL,
+                                                 NULL,
+                                                 NULL,
+                                                 NULL,
                                                  NULL);
         } else if (n_tokens == 1) {
             ok = metal_graph_eval_token_raw_swa(g,
@@ -59086,6 +59388,9 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                                                      n_tokens,
                                                      logits,
                                                      false,
+                                                     NULL,
+                                                     NULL,
+                                                     NULL,
                                                      NULL,
                                                      NULL,
                                                      NULL);

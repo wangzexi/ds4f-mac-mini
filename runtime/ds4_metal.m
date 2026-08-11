@@ -560,6 +560,31 @@ static ds4_gpu_model_view g_model_views[DS4_METAL_MAX_MODEL_VIEWS];
 static uint32_t g_model_view_count;
 
 enum {
+    DS4_METAL_MODEL_PREFETCH_SLOTS = 6,
+    DS4_METAL_MODEL_PREFETCH_MAX_VIEWS = 16,
+};
+
+typedef struct {
+    pthread_t thread;
+    ds4_gpu_model_view views[DS4_METAL_MODEL_PREFETCH_MAX_VIEWS];
+    const void *model_map;
+    uint64_t model_size;
+    uint64_t max_tensor_bytes;
+    uint64_t useful_bytes;
+    uint64_t io_bytes;
+    double start_ms;
+    double read_ms;
+    uint32_t tag;
+    uint32_t view_count;
+    volatile int cancel;
+    int started;
+    int ok;
+} ds4_gpu_model_prefetch_slot;
+
+static ds4_gpu_model_prefetch_slot
+    g_model_prefetch_slots[DS4_METAL_MODEL_PREFETCH_SLOTS];
+
+enum {
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER = 80,
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT = 384,
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED = DS4_METAL_MAX_ROUTED_EXPERT_USED,
@@ -604,6 +629,7 @@ typedef struct {
     uint32_t slab_slot;
     uint8_t valid;
     uint8_t slab_backed;
+    uint8_t shared_prefetch;
 } ds4_gpu_stream_expert_cache_entry;
 
 typedef struct {
@@ -617,6 +643,31 @@ typedef struct {
 
 static ds4_gpu_stream_expert_cache_entry
     g_stream_expert_cache[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+
+enum { DS4_METAL_EXPERT_LAYER_PREFETCH_SLOTS = 6 };
+typedef struct {
+    pthread_t thread;
+    ds4_gpu_stream_expert_table table;
+    __strong id<MTLBuffer> buffer;
+    int32_t expert_ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    uint64_t source_offsets[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    uint64_t slot_bytes;
+    uint64_t read_bytes;
+    double start_ms;
+    double read_ms;
+    uint32_t n_experts;
+    uint32_t reserved_experts;
+    int source_fd;
+    volatile int cancel;
+    int started;
+    int ok;
+} ds4_gpu_stream_expert_layer_prefetch;
+
+static ds4_gpu_stream_expert_layer_prefetch
+    g_stream_expert_layer_prefetch[DS4_METAL_EXPERT_LAYER_PREFETCH_SLOTS];
+static uint32_t g_stream_expert_layer_prefetch_reserved_experts;
+static pthread_mutex_t g_stream_expert_layer_prefetch_io_mutex =
+    PTHREAD_MUTEX_INITIALIZER;
 static ds4_gpu_stream_expert_cache_entry
     g_stream_full_expert_addr_entry[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint32_t g_stream_expert_cache_layer_count[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
@@ -10459,6 +10510,288 @@ static int ds4_gpu_model_views_cover_spans(
         const uint64_t *sizes,
         uint32_t        count);
 
+static void ds4_gpu_append_prefill_measurement(
+        const char *kind,
+        uint32_t    layer,
+        uint32_t    units,
+        uint64_t    bytes,
+        double      read_ms,
+        double      wait_ms) {
+    const char *path = getenv("DS4_METAL_PREFILL_MEASUREMENTS_PATH");
+    if (!path || !path[0] || !kind) return;
+    const int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd < 0) return;
+    (void)dprintf(fd,
+                  "%lld\t%d\t%s\t%u\t%u\t%llu\t%.3f\t%.3f\n",
+                  (long long)time(NULL),
+                  (int)getpid(),
+                  kind,
+                  layer,
+                  units,
+                  (unsigned long long)bytes,
+                  read_ms,
+                  wait_ms);
+    (void)close(fd);
+}
+
+static void ds4_gpu_model_prefetch_slot_clear(
+        ds4_gpu_model_prefetch_slot *slot) {
+    if (!slot) return;
+    for (uint32_t i = 0; i < DS4_METAL_MODEL_PREFETCH_MAX_VIEWS; i++) {
+        slot->views[i].buffer = nil;
+        slot->views[i].model_map = NULL;
+        slot->views[i].model_size = 0;
+        slot->views[i].model_offset = 0;
+        slot->views[i].bytes = 0;
+    }
+    slot->model_map = NULL;
+    slot->model_size = 0;
+    slot->max_tensor_bytes = 0;
+    slot->useful_bytes = 0;
+    slot->io_bytes = 0;
+    slot->start_ms = 0.0;
+    slot->read_ms = 0.0;
+    slot->tag = 0;
+    slot->view_count = 0;
+    slot->cancel = 0;
+    slot->started = 0;
+    slot->ok = 0;
+}
+
+static ds4_gpu_model_prefetch_slot *ds4_gpu_model_prefetch_find(
+        uint32_t tag) {
+    for (uint32_t i = 0; i < DS4_METAL_MODEL_PREFETCH_SLOTS; i++) {
+        ds4_gpu_model_prefetch_slot *slot = &g_model_prefetch_slots[i];
+        if (slot->started && slot->tag == tag) return slot;
+    }
+    return NULL;
+}
+
+static ds4_gpu_model_prefetch_slot *ds4_gpu_model_prefetch_find_free(void) {
+    for (uint32_t i = 0; i < DS4_METAL_MODEL_PREFETCH_SLOTS; i++) {
+        if (!g_model_prefetch_slots[i].started) {
+            return &g_model_prefetch_slots[i];
+        }
+    }
+    return NULL;
+}
+
+static size_t ds4_gpu_model_prefetch_chunk_bytes(void) {
+    uint64_t mib = 32;
+    const char *env = getenv("DS4_METAL_EXPLICIT_PREFETCH_CHUNK_MIB");
+    if (env && env[0]) {
+        char *end = NULL;
+        const unsigned long long parsed = strtoull(env, &end, 10);
+        if (end != env && *end == '\0' && parsed >= 1 && parsed <= 64) {
+            mib = parsed;
+        }
+    }
+    return (size_t)(mib * 1024ull * 1024ull);
+}
+
+static void *ds4_gpu_model_prefetch_thread_main(void *opaque) {
+    ds4_gpu_model_prefetch_slot *slot =
+        (ds4_gpu_model_prefetch_slot *)opaque;
+    if (!slot) return NULL;
+
+    @autoreleasepool {
+        const size_t max_chunk = ds4_gpu_model_prefetch_chunk_bytes();
+        int ok = 1;
+        for (uint32_t i = 0; ok && i < slot->view_count; i++) {
+            ds4_gpu_model_view *view = &slot->views[i];
+            uint8_t *dst = view->buffer ? (uint8_t *)[view->buffer contents] : NULL;
+            uint64_t done = 0;
+            if (!dst) {
+                ok = 0;
+                break;
+            }
+            while (done < view->bytes) {
+                if (slot->cancel) {
+                    ok = 0;
+                    break;
+                }
+                const uint64_t remaining = view->bytes - done;
+                const size_t chunk = remaining > (uint64_t)max_chunk ?
+                    max_chunk : (size_t)remaining;
+                ssize_t got;
+                do {
+                    got = pread(g_model_fd,
+                                dst + done,
+                                chunk,
+                                (off_t)(view->model_offset + done));
+                } while (got < 0 && errno == EINTR);
+                if (got <= 0) {
+                    ok = 0;
+                    break;
+                }
+                done += (uint64_t)got;
+            }
+            if (ok) {
+                [view->buffer didModifyRange:NSMakeRange(0,
+                                                         (NSUInteger)view->bytes)];
+            }
+        }
+        slot->read_ms = ds4_gpu_now_ms() - slot->start_ms;
+        slot->ok = ok && !slot->cancel;
+    }
+    return NULL;
+}
+
+int ds4_gpu_model_prefetch_spans_begin(
+        const void     *model_map,
+        uint64_t        model_size,
+        const uint64_t *offsets,
+        const uint64_t *sizes,
+        uint32_t        count,
+        uint64_t        max_tensor_bytes,
+        uint32_t        tag) {
+    if (!g_ssd_streaming_mode || g_model_fd < 0 || !model_map ||
+        model_size == 0 || !offsets || !sizes || count == 0 ||
+        count > DS4_METAL_MODEL_PREFETCH_MAX_VIEWS) {
+        return 0;
+    }
+    if (ds4_gpu_model_prefetch_find(tag)) return 1;
+
+    ds4_gpu_model_prefetch_slot *slot = ds4_gpu_model_prefetch_find_free();
+    if (!slot) return 0;
+    ds4_gpu_model_prefetch_slot_clear(slot);
+    slot->model_map = model_map;
+    slot->model_size = model_size;
+    slot->max_tensor_bytes = max_tensor_bytes;
+    slot->tag = tag;
+    slot->view_count = count;
+
+    @autoreleasepool {
+        const uint64_t page = (uint64_t)getpagesize();
+        for (uint32_t i = 0; i < count; i++) {
+            if (offsets[i] > model_size || sizes[i] == 0 ||
+                sizes[i] > model_size - offsets[i]) {
+                ds4_gpu_model_prefetch_slot_clear(slot);
+                return 0;
+            }
+            const uint64_t file_offset = offsets[i] & ~(page - 1u);
+            const uint64_t leading = offsets[i] - file_offset;
+            if (sizes[i] > UINT64_MAX - leading) {
+                ds4_gpu_model_prefetch_slot_clear(slot);
+                return 0;
+            }
+            uint64_t bytes = round_up_u64(leading + sizes[i], page);
+            if (bytes > model_size - file_offset) bytes = model_size - file_offset;
+            if (bytes == 0 || bytes > (uint64_t)NSUIntegerMax ||
+                bytes > (uint64_t)[g_device maxBufferLength]) {
+                ds4_gpu_model_prefetch_slot_clear(slot);
+                return 0;
+            }
+            id<MTLBuffer> buffer =
+                [g_device newBufferWithLength:(NSUInteger)bytes
+                                       options:MTLResourceStorageModeShared];
+            if (!buffer) {
+                ds4_gpu_model_prefetch_slot_clear(slot);
+                return 0;
+            }
+            buffer.label = [NSString stringWithFormat:@"ds4_prefetch_trunk_%u_%u",
+                            tag,
+                            i];
+            slot->views[i].buffer = buffer;
+            slot->views[i].model_map = model_map;
+            slot->views[i].model_size = model_size;
+            slot->views[i].model_offset = file_offset;
+            slot->views[i].bytes = bytes;
+            slot->useful_bytes += sizes[i];
+            slot->io_bytes += bytes;
+        }
+    }
+
+    slot->start_ms = ds4_gpu_now_ms();
+    slot->started = 1;
+    const int rc = pthread_create(&slot->thread,
+                                  NULL,
+                                  ds4_gpu_model_prefetch_thread_main,
+                                  slot);
+    if (rc != 0) {
+        fprintf(stderr,
+                "ds4: explicit model prefetch thread failed tag=%u: %s\n",
+                tag,
+                strerror(rc));
+        ds4_gpu_model_prefetch_slot_clear(slot);
+        return 0;
+    }
+    fprintf(stderr,
+            "ds4-io: kind=prefetch_trunk_begin tag=%u spans=%u io=%llu\n",
+            tag,
+            count,
+            (unsigned long long)slot->io_bytes);
+    return 1;
+}
+
+int ds4_gpu_model_prefetch_spans_activate(uint32_t tag) {
+    ds4_gpu_model_prefetch_slot *slot = ds4_gpu_model_prefetch_find(tag);
+    if (!slot) return 0;
+    const double wait_started = ds4_gpu_now_ms();
+    const int rc = pthread_join(slot->thread, NULL);
+    const double wait_ms = ds4_gpu_now_ms() - wait_started;
+    if (rc != 0 || !slot->ok) {
+        fprintf(stderr,
+                "ds4: explicit model prefetch activation failed tag=%u\n",
+                tag);
+        ds4_gpu_model_prefetch_slot_clear(slot);
+        return 0;
+    }
+
+    ds4_gpu_model_residency_clear();
+    ds4_gpu_model_views_clear();
+    for (uint32_t i = 0; i < slot->view_count; i++) {
+        g_model_views[i].buffer = slot->views[i].buffer;
+        g_model_views[i].model_map = slot->views[i].model_map;
+        g_model_views[i].model_size = slot->views[i].model_size;
+        g_model_views[i].model_offset = slot->views[i].model_offset;
+        g_model_views[i].bytes = slot->views[i].bytes;
+        slot->views[i].buffer = nil;
+    }
+    g_model_view_count = slot->view_count;
+    g_model_map_ptr = slot->model_map;
+    g_model_map_size = slot->model_size;
+    g_model_mapped_offset = g_model_views[0].model_offset;
+    g_model_mapped_size = slot->io_bytes;
+    g_model_mapped_max_tensor_bytes = slot->max_tensor_bytes;
+
+    const double mib_s = slot->read_ms > 0.0 ?
+        ((double)slot->io_bytes / 1048576.0) / (slot->read_ms / 1000.0) : 0.0;
+    fprintf(stderr,
+            "ds4-io: seq=%llu kind=prefetch_trunk_activate tag=%u spans=%u "
+            "useful=%llu io=%llu read_ms=%.3f wait_ms=%.3f rate=%.2f_MiB_s\n",
+            (unsigned long long)++g_model_io_sequence,
+            tag,
+            slot->view_count,
+            (unsigned long long)slot->useful_bytes,
+            (unsigned long long)slot->io_bytes,
+            slot->read_ms,
+            wait_ms,
+            mib_s);
+    ds4_gpu_append_prefill_measurement("trunk",
+                                       tag,
+                                       slot->view_count,
+                                       slot->io_bytes,
+                                       slot->read_ms,
+                                       wait_ms);
+    ds4_gpu_model_prefetch_slot_clear(slot);
+    return 1;
+}
+
+void ds4_gpu_model_prefetch_cancel_all(void) {
+    for (uint32_t i = 0; i < DS4_METAL_MODEL_PREFETCH_SLOTS; i++) {
+        if (g_model_prefetch_slots[i].started) {
+            g_model_prefetch_slots[i].cancel = 1;
+        }
+    }
+    for (uint32_t i = 0; i < DS4_METAL_MODEL_PREFETCH_SLOTS; i++) {
+        ds4_gpu_model_prefetch_slot *slot = &g_model_prefetch_slots[i];
+        if (!slot->started) continue;
+        (void)pthread_join(slot->thread, NULL);
+        ds4_gpu_model_prefetch_slot_clear(slot);
+    }
+}
+
 int ds4_gpu_set_model_map_spans(
         const void *model_map,
         uint64_t model_size,
@@ -11122,7 +11455,9 @@ static uint32_t ds4_gpu_stream_expert_cache_requested_budget(void) {
 }
 
 static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void) {
-    return ds4_gpu_stream_expert_cache_requested_budget();
+    const uint32_t requested = ds4_gpu_stream_expert_cache_requested_budget();
+    return g_stream_expert_layer_prefetch_reserved_experts < requested ?
+        requested - g_stream_expert_layer_prefetch_reserved_experts : 0;
 }
 
 static uint32_t ds4_gpu_stream_expert_cache_configured_mlock_budget(void) {
@@ -13378,7 +13713,7 @@ static void ds4_gpu_stream_expert_cache_clear_entry_internal(
         reuse->down_inner = e->down_inner;
     } else if (e->slab_backed && recycle_slab_slot) {
         ds4_gpu_stream_expert_slab_push_free_slot(e->slab_slot);
-    } else if (!e->slab_backed) {
+    } else if (!e->slab_backed && !e->shared_prefetch) {
         ds4_gpu_stream_expert_unlock_explicit_buffer(e->gate_buffer);
         if (e->up_buffer != e->gate_buffer) {
             ds4_gpu_stream_expert_unlock_explicit_buffer(e->up_buffer);
@@ -13408,6 +13743,7 @@ static void ds4_gpu_stream_expert_cache_clear_entry_internal(
     e->slab_slot = 0;
     e->valid = 0;
     e->slab_backed = 0;
+    e->shared_prefetch = 0;
 
     if (g_stream_expert_cache_layer_count[layer] > 0) {
         g_stream_expert_cache_layer_count[layer]--;
@@ -14428,6 +14764,7 @@ ds4_gpu_stream_expert_cache_install_loaded(
         e->slab_backed = 0;
         e->slab_slot = 0;
     }
+    e->shared_prefetch = 0;
     e->valid = 1;
     g_stream_expert_cache_layer_count[layer]++;
     if (g_stream_expert_cache_entry_count < UINT32_MAX) {
@@ -14442,6 +14779,354 @@ ds4_gpu_stream_expert_cache_install_loaded(
     g_stream_expert_cache_layer_misses[layer]++;
     g_stream_expert_cache_wraps += 3;
     return e;
+}
+
+static void ds4_gpu_stream_expert_layer_prefetch_clear(
+        ds4_gpu_stream_expert_layer_prefetch *p) {
+    if (!p) return;
+    if (p->reserved_experts != 0) {
+        if (g_stream_expert_layer_prefetch_reserved_experts >=
+            p->reserved_experts) {
+            g_stream_expert_layer_prefetch_reserved_experts -=
+                p->reserved_experts;
+        } else {
+            g_stream_expert_layer_prefetch_reserved_experts = 0;
+        }
+    }
+    p->buffer = nil;
+    memset(&p->table, 0, sizeof(p->table));
+    memset(p->expert_ids, 0xff, sizeof(p->expert_ids));
+    memset(p->source_offsets, 0, sizeof(p->source_offsets));
+    p->slot_bytes = 0;
+    p->read_bytes = 0;
+    p->start_ms = 0.0;
+    p->read_ms = 0.0;
+    p->n_experts = 0;
+    p->reserved_experts = 0;
+    p->source_fd = -1;
+    p->cancel = 0;
+    p->started = 0;
+    p->ok = 0;
+}
+
+static ds4_gpu_stream_expert_layer_prefetch *
+ds4_gpu_stream_expert_layer_prefetch_find(uint32_t layer) {
+    for (uint32_t i = 0; i < DS4_METAL_EXPERT_LAYER_PREFETCH_SLOTS; i++) {
+        ds4_gpu_stream_expert_layer_prefetch *p =
+            &g_stream_expert_layer_prefetch[i];
+        if (p->started && p->table.layer == layer) return p;
+    }
+    return NULL;
+}
+
+static void *ds4_gpu_stream_expert_layer_prefetch_thread_main(void *opaque) {
+    ds4_gpu_stream_expert_layer_prefetch *p =
+        (ds4_gpu_stream_expert_layer_prefetch *)opaque;
+    if (!p) return NULL;
+    @autoreleasepool {
+        const int serialize_full_layer =
+            p->n_experts == p->table.n_total_expert;
+        if (serialize_full_layer) {
+            pthread_mutex_lock(&g_stream_expert_layer_prefetch_io_mutex);
+        }
+        uint8_t *dst = p->buffer ? (uint8_t *)[p->buffer contents] : NULL;
+        const size_t max_chunk = ds4_gpu_model_prefetch_chunk_bytes();
+        int ok = dst != NULL;
+        uint64_t total = 0;
+        for (uint32_t i = 0; ok && i < p->n_experts; i++) {
+            uint64_t done = 0;
+            while (done < p->slot_bytes) {
+                if (p->cancel) {
+                    ok = 0;
+                    break;
+                }
+                const uint64_t remaining = p->slot_bytes - done;
+                const size_t chunk = remaining > (uint64_t)max_chunk ?
+                    max_chunk : (size_t)remaining;
+                ssize_t got;
+                do {
+                    got = pread(p->source_fd,
+                                dst + (uint64_t)i * p->slot_bytes + done,
+                                chunk,
+                                (off_t)(p->source_offsets[i] + done));
+                } while (got < 0 && errno == EINTR);
+                if (got <= 0) {
+                    ok = 0;
+                    break;
+                }
+                done += (uint64_t)got;
+                total += (uint64_t)got;
+            }
+        }
+        if (ok) {
+            [p->buffer didModifyRange:NSMakeRange(
+                    0, (NSUInteger)(p->slot_bytes * p->n_experts))];
+        }
+        p->read_bytes = total;
+        p->read_ms = ds4_gpu_now_ms() - p->start_ms;
+        p->ok = ok && !p->cancel;
+        if (serialize_full_layer) {
+            pthread_mutex_unlock(&g_stream_expert_layer_prefetch_io_mutex);
+        }
+    }
+    return NULL;
+}
+
+int ds4_gpu_stream_expert_layer_prefetch_begin(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *expert_ids,
+        uint32_t                           n_experts,
+        uint32_t                           protect_layer) {
+    if (!g_ssd_streaming_mode || !table || !expert_ids || n_experts == 0 ||
+        n_experts > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT ||
+        table->layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        table->n_total_expert == 0 || n_experts > table->n_total_expert ||
+        table->gate_expert_bytes >
+            (UINT64_MAX - table->down_expert_bytes) / 2ull) {
+        return 0;
+    }
+    if (ds4_gpu_stream_expert_layer_prefetch_find(table->layer)) return 1;
+
+    const uint32_t requested =
+        ds4_gpu_stream_expert_cache_requested_budget();
+    if (requested == 0 ||
+        g_stream_expert_layer_prefetch_reserved_experts > requested ||
+        n_experts > requested -
+            g_stream_expert_layer_prefetch_reserved_experts) {
+        fprintf(stderr,
+                "ds4: expert layer prefetch budget reject layer=%u requested=%u reserved=%u experts=%u\n",
+                table->layer,
+                requested,
+                g_stream_expert_layer_prefetch_reserved_experts,
+                n_experts);
+        return 0;
+    }
+
+    ds4_gpu_stream_expert_layer_prefetch *p = NULL;
+    for (uint32_t i = 0; i < DS4_METAL_EXPERT_LAYER_PREFETCH_SLOTS; i++) {
+        if (!g_stream_expert_layer_prefetch[i].started) {
+            p = &g_stream_expert_layer_prefetch[i];
+            break;
+        }
+    }
+    if (!p) return 0;
+    ds4_gpu_stream_expert_layer_prefetch_clear(p);
+    p->table = *table;
+    p->n_experts = n_experts;
+    p->reserved_experts = n_experts;
+    g_stream_expert_layer_prefetch_reserved_experts += n_experts;
+
+    /* Staging bytes are part of the exact expert-slot budget. Evict cold
+     * entries before allocating them, while preserving the layer currently
+     * being consumed by the GPU. */
+    int32_t protect_ids[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+    for (uint32_t i = 0; i < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; i++) {
+        protect_ids[i] = (int32_t)i;
+    }
+    ds4_gpu_stream_expert_cache_prune_global(
+            protect_layer,
+            protect_layer == UINT32_MAX ? NULL : protect_ids,
+            protect_layer == UINT32_MAX ? 0 : table->n_total_expert);
+    if (g_stream_expert_cache_entry_count >
+        ds4_gpu_stream_expert_cache_configured_budget()) {
+        fprintf(stderr,
+                "ds4: expert layer prefetch could not reserve layer=%u active=%u effective_budget=%u\n",
+                table->layer,
+                g_stream_expert_cache_entry_count,
+                ds4_gpu_stream_expert_cache_configured_budget());
+        ds4_gpu_stream_expert_layer_prefetch_clear(p);
+        return 0;
+    }
+    p->slot_bytes = table->gate_expert_bytes * 2ull +
+                    table->down_expert_bytes;
+    if (p->slot_bytes == 0 ||
+        p->slot_bytes > UINT64_MAX / n_experts ||
+        p->slot_bytes * n_experts > (uint64_t)NSUIntegerMax ||
+        p->slot_bytes * n_experts > (uint64_t)[g_device maxBufferLength]) {
+        fprintf(stderr,
+                "ds4: expert layer prefetch buffer size reject layer=%u bytes=%llu max=%llu\n",
+                table->layer,
+                (unsigned long long)(p->slot_bytes * n_experts),
+                (unsigned long long)[g_device maxBufferLength]);
+        ds4_gpu_stream_expert_layer_prefetch_clear(p);
+        return 0;
+    }
+
+    for (uint32_t i = 0; i < n_experts; i++) {
+        if (expert_ids[i] < 0 ||
+            (uint32_t)expert_ids[i] >= table->n_total_expert) {
+            ds4_gpu_stream_expert_layer_prefetch_clear(p);
+            return 0;
+        }
+        for (uint32_t j = 0; j < i; j++) {
+            if (expert_ids[j] == expert_ids[i]) {
+                ds4_gpu_stream_expert_layer_prefetch_clear(p);
+                return 0;
+            }
+        }
+        int fd = -1;
+        uint64_t offset = 0;
+        if (!ds4_gpu_stream_expert_pack_source(table->model_size,
+                                               table->layer,
+                                               (uint32_t)expert_ids[i],
+                                               table->gate_expert_bytes,
+                                               table->down_expert_bytes,
+                                               &fd,
+                                               &offset)) {
+            fprintf(stderr,
+                    "ds4: expert layer prefetch packed source reject layer=%u expert=%d\n",
+                    table->layer,
+                    expert_ids[i]);
+            ds4_gpu_stream_expert_layer_prefetch_clear(p);
+            return 0;
+        }
+        if (i == 0) p->source_fd = fd;
+        if (fd != p->source_fd) {
+            ds4_gpu_stream_expert_layer_prefetch_clear(p);
+            return 0;
+        }
+        p->expert_ids[i] = expert_ids[i];
+        p->source_offsets[i] = offset;
+    }
+
+    @autoreleasepool {
+        p->buffer = [g_device
+            newBufferWithLength:(NSUInteger)(p->slot_bytes * n_experts)
+                         options:MTLResourceStorageModeShared];
+        if (!p->buffer) {
+            fprintf(stderr,
+                    "ds4: expert layer prefetch Metal allocation failed layer=%u bytes=%llu\n",
+                    table->layer,
+                    (unsigned long long)(p->slot_bytes * n_experts));
+            ds4_gpu_stream_expert_layer_prefetch_clear(p);
+            return 0;
+        }
+        p->buffer.label = [NSString stringWithFormat:
+            @"ds4_prefetch_expert_layer_%u", table->layer];
+    }
+
+    p->start_ms = ds4_gpu_now_ms();
+    p->started = 1;
+    const int rc = pthread_create(&p->thread,
+                                  NULL,
+                                  ds4_gpu_stream_expert_layer_prefetch_thread_main,
+                                  p);
+    if (rc != 0) {
+        ds4_gpu_stream_expert_layer_prefetch_clear(p);
+        return 0;
+    }
+    fprintf(stderr,
+            "ds4-io: kind=expert_layer_prefetch_begin layer=%u experts=%u io=%llu\n",
+            table->layer,
+            n_experts,
+            (unsigned long long)(p->slot_bytes * n_experts));
+    return 1;
+}
+
+int ds4_gpu_stream_expert_layer_prefetch_activate(
+        const ds4_gpu_stream_expert_table *table) {
+    if (!table) return 0;
+    ds4_gpu_stream_expert_layer_prefetch *p =
+        ds4_gpu_stream_expert_layer_prefetch_find(table->layer);
+    if (!p) return 0;
+    const double wait_started = ds4_gpu_now_ms();
+    const int rc = pthread_join(p->thread, NULL);
+    const double wait_ms = ds4_gpu_now_ms() - wait_started;
+    if (rc != 0 || !p->ok || p->table.model_map != table->model_map ||
+        p->table.model_size != table->model_size) {
+        ds4_gpu_stream_expert_layer_prefetch_clear(p);
+        return 0;
+    }
+
+    if (g_stream_expert_layer_prefetch_reserved_experts >=
+        p->reserved_experts) {
+        g_stream_expert_layer_prefetch_reserved_experts -=
+            p->reserved_experts;
+    } else {
+        g_stream_expert_layer_prefetch_reserved_experts = 0;
+    }
+    p->reserved_experts = 0;
+
+    int ok = 1;
+    for (uint32_t i = 0; ok && i < p->n_experts; i++) {
+        const uint32_t expert = (uint32_t)p->expert_ids[i];
+        const uint64_t gate_rel = (uint64_t)expert * table->gate_expert_bytes;
+        const uint64_t down_rel = (uint64_t)expert * table->down_expert_bytes;
+        ds4_gpu_stream_expert_cache_entry *entry =
+            ds4_gpu_stream_expert_cache_install_loaded(
+                    table->model_map,
+                    table->model_size,
+                    table->layer,
+                    expert,
+                    table->gate_offset + gate_rel,
+                    table->up_offset + gate_rel,
+                    table->down_offset + down_rel,
+                    table->gate_expert_bytes,
+                    table->down_expert_bytes,
+                    p->buffer,
+                    p->buffer,
+                    p->buffer,
+                    (NSUInteger)((uint64_t)i * p->slot_bytes),
+                    (NSUInteger)((uint64_t)i * p->slot_bytes +
+                                 table->gate_expert_bytes),
+                    (NSUInteger)((uint64_t)i * p->slot_bytes +
+                                 table->gate_expert_bytes * 2ull));
+        if (!entry) {
+            ok = 0;
+            break;
+        }
+        entry->shared_prefetch = 1;
+    }
+    if (!ok) {
+        ds4_gpu_stream_expert_cache_release_layer(table->layer);
+        ds4_gpu_stream_expert_layer_prefetch_clear(p);
+        return 0;
+    }
+    ds4_gpu_stream_expert_cache_prune_global(table->layer, NULL, 0);
+    const double mib_s = p->read_ms > 0.0 ?
+        ((double)p->read_bytes / 1048576.0) / (p->read_ms / 1000.0) : 0.0;
+    fprintf(stderr,
+            "ds4-io: seq=%llu kind=expert_layer_prefetch_activate layer=%u "
+            "experts=%u io=%llu read_ms=%.3f wait_ms=%.3f rate=%.2f_MiB_s\n",
+            (unsigned long long)++g_model_io_sequence,
+            table->layer,
+            p->n_experts,
+            (unsigned long long)p->read_bytes,
+            p->read_ms,
+            wait_ms,
+            mib_s);
+    ds4_gpu_append_prefill_measurement("experts",
+                                       table->layer,
+                                       p->n_experts,
+                                       p->read_bytes,
+                                       p->read_ms,
+                                       wait_ms);
+    ds4_gpu_stream_expert_layer_prefetch_clear(p);
+    return 1;
+}
+
+void ds4_gpu_stream_expert_layer_prefetch_cancel_all(void) {
+    for (uint32_t i = 0; i < DS4_METAL_EXPERT_LAYER_PREFETCH_SLOTS; i++) {
+        if (g_stream_expert_layer_prefetch[i].started) {
+            g_stream_expert_layer_prefetch[i].cancel = 1;
+        }
+    }
+    for (uint32_t i = 0; i < DS4_METAL_EXPERT_LAYER_PREFETCH_SLOTS; i++) {
+        ds4_gpu_stream_expert_layer_prefetch *p =
+            &g_stream_expert_layer_prefetch[i];
+        if (!p->started) continue;
+        (void)pthread_join(p->thread, NULL);
+        ds4_gpu_stream_expert_layer_prefetch_clear(p);
+    }
+}
+
+void ds4_gpu_stream_expert_cache_release_layer(uint32_t layer) {
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return;
+    for (uint32_t expert = 0;
+         expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+         expert++) {
+        ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
+    }
 }
 
 static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protected(

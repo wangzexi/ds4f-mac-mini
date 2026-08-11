@@ -19,6 +19,9 @@ When `--metal --ssd-streaming` is active:
 - the canonical fixed-target prefill path changes only the I/O nesting: each
   transformer layer is read once, while prompt rows execute sequentially with
   the accepted single-token decode arithmetic inside that layer;
+- future trunk spans and planned packed experts are read into owned staging
+  buffers; activation transfers those buffers into the live view without a
+  second payload read, and cancellation is checked at each 32 MiB boundary;
 - prefill maps only the output head for its final logits, then the server
   releases prefill workspace and shrinks the expert cache;
 - the first decode token explicitly reads the complete Q4 trunk, token
@@ -31,6 +34,9 @@ The canonical prefill path was checked against the frozen mmap/token-major
 baseline over all 129,280 output logits. The dumps are byte-identical
 (`max_abs = 0`, identical greedy token), so the phase-specific residency does
 not introduce a numerical approximation.
+
+The prompt-length policy, paging experiments, and persistent per-layer
+measurement format are documented in `docs/prefill-planner.md`.
 
 Each logical read emits one `ds4-io` record:
 

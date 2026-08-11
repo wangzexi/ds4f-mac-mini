@@ -115,6 +115,17 @@ int ds4_gpu_model_range_replaced(const void *model_map, uint64_t offset,
                                  uint64_t bytes);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes);
 int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size, const uint64_t *offsets, const uint64_t *sizes, uint32_t count, uint64_t max_tensor_bytes);
+/* Explicit-I/O prefetch retains owned Metal buffers. activate() transfers
+ * them into the live model view without issuing a second payload read. */
+int ds4_gpu_model_prefetch_spans_begin(const void *model_map,
+                                       uint64_t model_size,
+                                       const uint64_t *offsets,
+                                       const uint64_t *sizes,
+                                       uint32_t count,
+                                       uint64_t max_tensor_bytes,
+                                       uint32_t tag);
+int ds4_gpu_model_prefetch_spans_activate(uint32_t tag);
+void ds4_gpu_model_prefetch_cancel_all(void);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_q8_cache_suppressed(void);
@@ -241,6 +252,17 @@ int ds4_gpu_stream_expert_cache_seed_experts(
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts);
 #ifdef __APPLE__
+/* Prefill-only full/partial layer staging. The payload remains in one packed
+ * shared Metal buffer and is published only when its layer is reached. */
+int ds4_gpu_stream_expert_layer_prefetch_begin(
+        const ds4_gpu_stream_expert_table *table,
+        const int32_t                     *expert_ids,
+        uint32_t                           n_experts,
+        uint32_t                           protect_layer);
+int ds4_gpu_stream_expert_layer_prefetch_activate(
+        const ds4_gpu_stream_expert_table *table);
+void ds4_gpu_stream_expert_layer_prefetch_cancel_all(void);
+void ds4_gpu_stream_expert_cache_release_layer(uint32_t layer);
 /* Seed from mapped weights with blits appended to the active command buffer. */
 int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
         const ds4_gpu_stream_expert_table *table,
