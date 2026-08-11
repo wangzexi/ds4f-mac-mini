@@ -41,7 +41,11 @@ copies completed selected slots into ordinary cache ownership, releases the
 speculative slab, and reads only the selected misses. Thus an unneeded partial
 slab never becomes a long-lived 1.69 GiB allocation. Hash layer 0 is fully
 resident before the server listens; hash layers 1 and 2 use exact token-ID
-unions. A completed layer is released immediately.
+unions. On the fixed single-active-session launcher, L0 is the sole exception
+to immediate release: all 256 of its experts remain protected between requests.
+They cost 1.69 GiB and are useful for every cold or disk-KV-restored Prefix,
+because L0 routing is determined directly by token IDs. It is released only if
+the next phase's measured physical expert buffers exceed its budget.
 
 An experimental bridge, `DS4_METAL_PREFILL_TAIL_EXPERT_HANDOFF=1`, changes
 only that final release: it retains the six most recently used expert entries

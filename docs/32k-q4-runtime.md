@@ -22,6 +22,24 @@ e62ac715fd77449a655d2319b8c74b0cc0d11dd81067cccb640f4d89a689aa3d
 
 同一短中文提示、32 token 输出的 exact 路径在 8/16/24/32K 上分别为 2.26/2.24/2.25/2.26 token/s，因此把上限从 32K 降到 8K 对短 decode 没有实际收益。
 
+## 单活跃会话待命
+
+部署只允许一个活跃会话，但不放弃磁盘 KV：当前会话的 KV、路由热度和 Decode
+专家池留在统一内存；每次响应结束后，同一 KV 和热度也写入 10 GiB 磁盘 LRU。
+切换到另一段旧会话或服务重启时，先尝试恢复该磁盘快照；未命中才重新 Prefill。
+因此磁盘 KV 是“会话切换/重启恢复层”，不是与当前会话竞争的第二个内存会话。
+
+固定启动器还常驻预热 hash layer 0 的全部 256 个专家（1.69 GiB）。它们在
+启动时只从 SSD 读取一次；因 L0 的路由仅依赖 token ID，任何 KV 未命中都可直接
+复用。2026-08-12 的 Mini 烟雾测试中，5-token 新提示加 2-token exact 输出的
+请求在 server ready 后 L0 SSD expert-read 为 0；Prefill→Decode 相位转换保留
+了 5.68 GiB 实际专家缓冲，低于 6.37 GiB Decode 预算。完整数值回归仍输出
+`6111 2004 28` 与 `23385 33951 6573 303`。
+
+这不是盲目锁死所有权重：相位规划按真实 Metal 缓冲字节数（包括 shared Prefill
+staging 与 slab 预留）而不是逻辑条目数判断。若下一阶段装不下，缓存仍会整体释放，
+以保证 16GB 机器不因保留热缓存进入内存压力。
+
 cache-aware router 的初步速度档位：
 
 | retained router mass | generation | 观察 |
