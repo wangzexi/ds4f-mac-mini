@@ -19725,7 +19725,11 @@ static uint32_t metal_graph_prefill_full_expert_prefetch_min_tokens(void) {
             return parsed > UINT32_MAX ? UINT32_MAX : (uint32_t)parsed;
         }
     }
-    return 64u;
+    /* A complete Flash expert layer takes about 0.97 s to stream on the fixed
+     * M4 Mini. Measured layer compute hides that read at roughly 512+ prompt
+     * tokens. Below that point there is no trustworthy cold-start ranking, so
+     * exact Router-selected reads are cheaper than speculative partial I/O. */
+    return 512u;
 }
 
 static uint32_t metal_graph_prefill_expert_prefetch_count(
@@ -19735,15 +19739,11 @@ static uint32_t metal_graph_prefill_expert_prefetch_count(
         char *end = NULL;
         const unsigned long parsed = strtoul(env, &end, 10);
         if (end != env && *end == '\0') {
-            return parsed > DS4_N_EXPERT ? DS4_N_EXPERT : (uint32_t)parsed;
+            return parsed >= DS4_N_EXPERT ? DS4_N_EXPERT : 0u;
         }
     }
-    if (n_tokens < metal_graph_prefill_full_expert_prefetch_min_tokens()) {
-        return 0;
-    }
-    if (n_tokens < 128u) return DS4_N_EXPERT / 2u;
-    if (n_tokens < 256u) return (DS4_N_EXPERT * 3u) / 4u;
-    return DS4_N_EXPERT;
+    return n_tokens < metal_graph_prefill_full_expert_prefetch_min_tokens() ?
+        0u : DS4_N_EXPERT;
 }
 
 static uint32_t metal_graph_prefill_prefetch_lookahead(void) {
@@ -19768,31 +19768,6 @@ static uint32_t metal_graph_prefill_io_chunk_mib(void) {
         }
     }
     return 32u;
-}
-
-static uint32_t metal_graph_prefill_expert_order(
-        uint32_t il,
-        int32_t  expert_ids[DS4_N_EXPERT]) {
-    bool seen[DS4_N_EXPERT];
-    memset(seen, 0, sizeof(seen));
-    uint32_t n = 0;
-    const uint16_t (*hotlist)[2] =
-        g_ds4_shape.variant == DS4_VARIANT_FLASH ?
-            ds4_default_streaming_hotlist_flash : NULL;
-    const uint32_t hotlist_count = hotlist ?
-        ds4_default_streaming_hotlist_flash_count : 0;
-    for (uint32_t i = 0; i < hotlist_count && n < DS4_N_EXPERT; i++) {
-        if (hotlist[i][0] != il || hotlist[i][1] >= DS4_N_EXPERT ||
-            seen[hotlist[i][1]]) {
-            continue;
-        }
-        expert_ids[n++] = (int32_t)hotlist[i][1];
-        seen[hotlist[i][1]] = true;
-    }
-    for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
-        if (!seen[expert]) expert_ids[n++] = (int32_t)expert;
-    }
-    return n;
 }
 
 static uint32_t metal_graph_prefill_hash_expert_union(
@@ -19922,21 +19897,13 @@ static bool metal_graph_prefetch_prefill_expert_layer(
     const uint32_t n_prefetch =
         metal_graph_prefill_expert_prefetch_count(n_tokens);
     if (n_prefetch == 0) return false;
+    /* Cold learned-layer Prefill is deliberately all-or-nothing. Partial
+     * prefetch without prompt-local route heat is only a disguised fixed
+     * expert bias and can delay the exact Router-selected reads. */
+    if (n_prefetch != DS4_N_EXPERT) return false;
     int32_t expert_ids[DS4_N_EXPERT];
-    if (metal_graph_prefill_expert_order(il, expert_ids) != DS4_N_EXPERT) {
-        return false;
-    }
-    /* Preserve the hotlist-selected set but restore ascending packed-file
-     * order. This turns adjacent selected experts into forward sequential I/O
-     * instead of seeking in hotness order. */
-    for (uint32_t i = 1; i < n_prefetch; i++) {
-        const int32_t value = expert_ids[i];
-        uint32_t j = i;
-        while (j > 0 && expert_ids[j - 1u] > value) {
-            expert_ids[j] = expert_ids[j - 1u];
-            j--;
-        }
-        expert_ids[j] = value;
+    for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+        expert_ids[expert] = (int32_t)expert;
     }
     return metal_graph_prefetch_prefill_expert_layer_selected(model,
                                                                weights,
@@ -21007,6 +20974,9 @@ static bool metal_graph_streaming_prefill_cache_seed_enabled(const ds4_gpu_graph
 }
 
 static bool metal_graph_streaming_expert_hotlist_enabled(const ds4_gpu_graph *g) {
+    /* Flash cache residency must come from this prompt/session's actual Router
+     * selections, never from the upstream corpus-global fixed ordering. */
+    if (g_ds4_shape.variant == DS4_VARIANT_FLASH) return false;
     return g &&
            g->ssd_streaming &&
            !g->ssd_streaming_cold &&
@@ -34993,9 +34963,6 @@ static bool metal_graph_prefill_layer_major(
     (void)ds4_gpu_stream_expert_cache_release_layer_cache();
     if (g->ssd_streaming) ds4_gpu_release_q8_f16_cache();
 #endif
-    if (!metal_graph_seed_streaming_expert_cache_from_hotlist(g, model, weights)) {
-        return false;
-    }
     if (!metal_graph_seed_streaming_expert_cache_from_prefill(g, model, weights)) {
         return false;
     }

@@ -7,28 +7,27 @@ The first three MoE layers use the frozen `ffn_gate_tid2eid` lookup. The
 server preloads all 256 layer-0 experts before it listens. Once a request has
 been tokenized, Prefill computes the exact expert unions for hash layers 1 and
 2. Layer 0 starts from the startup-resident set; layer 1 is read while layer 0
-computes, and layer 2 is read while layer 1 computes. Only later learned-router
-layers use speculative hotlist Prefill.
+computes, and layer 2 is read while layer 1 computes. Later learned-router
+layers never use a corpus-global fixed expert order.
 
 ## Request plan
 
 The exact layer-major path keeps decode arithmetic unchanged and varies only
 the I/O schedule:
 
-| Prompt rows | Learned-router staging per future layer | Lookahead |
+| Prompt rows | Cold learned-router staging | Lookahead |
 | ---: | ---: | ---: |
-| 1-63 | demand-loaded only | 3 trunk layers |
-| 64-127 | 128 hot experts | 3 layers |
-| 128-255 | 192 hot experts | 3 layers |
-| 256+ | all 256 experts | 1 layer |
+| 1-511 | wait for Router, then exact-read | trunk only |
+| 512+ | all 256 experts | 1 layer |
 
-For layers 3 and later, partial expert sets come from the fixed Flash hotlist,
-then are sorted by expert ID before `pread` so the packed sidecar is consumed
-in forward file order. Hash layer 0 is instead fully resident before the
-server listens; hash layers 1 and 2 use their exact token-id unions. A
-completed layer is released immediately. Staged entries reserve the
-same exact slot budget as active cache entries, so prefetch cannot silently
-exceed the request planner's expert allocation.
+For layers 3 and later, cold speculative Prefill is all-or-nothing. Short and
+medium prompts wait for the actual Router result, avoiding low-precision
+partial guesses. Long prompts read all experts in packed-file order when the
+measured previous-layer compute window can hide the full-layer transfer. The
+fixed-Mini default crossover is 512 uncached tokens and can be overridden with
+`DS4_METAL_PREFILL_FULL_EXPERT_MIN_TOKENS` for profiling. Hash layer 0 is
+fully resident before the server listens; hash layers 1 and 2 use exact
+token-ID unions. A completed layer is released immediately.
 
 Complete learned-layer 256-expert staging is intentionally one layer ahead.
 Holding three complete 1.69 GiB Metal expert layers produced different
@@ -47,8 +46,8 @@ loading and still reduced the measured 300-row run from 60.15 s to 40.11 s.
   staging buffers, and leaves the server ready for the next request.
 - `F_RDADVISE` is not used by the staged path. Combining it with explicit
   multi-layer reads regressed the same fixture from 25.55 s to 39.92 s.
-- More lookahead is not automatically better: one/two/three/four-layer partial
-  windows measured 26.93/26.27/25.55/26.95 s before chunk tuning.
+- Full-layer lookahead stays at one layer so reads do not compete for the
+  Mini's single SSD queue.
 
 ## Measurement table
 
@@ -74,10 +73,9 @@ and completion while future-layer reads may run in the background.
 
 - 11-row canonical fixture: all 129,280 logits byte-identical to the frozen
   mmap/token-major baseline.
-- 100-row fixture, 128 experts x three layers: byte-identical to demand loading;
-  33.35 s to 25.95 s after tuning (about 22%).
-- 200-row fixture, 192 experts x three layers: byte-identical to demand loading;
-  50.20 s to 33.29 s (about 34%).
+- The retired fixed Flash hotlist covered only 28 of 74 experts on the
+  101-token L3 fixture while reading 100 unused experts; it is no longer part
+  of Prefill or Decode cache decisions.
 - 300-row fixture, 256 experts x one layer: byte-identical to demand loading;
   60.15 s to 40.11 s (about 33%).
 
