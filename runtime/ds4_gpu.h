@@ -221,6 +221,11 @@ uint32_t ds4_gpu_stream_expert_cache_rank_route_heat(
         uint32_t layer,
         int32_t *expert_ids,
         uint32_t capacity);
+void ds4_gpu_stream_expert_cache_note_route_weights(
+        uint32_t       layer,
+        const int32_t *selected_ids,
+        const float   *selected_weights,
+        uint32_t       n_selected);
 void ds4_gpu_stream_expert_cache_release_resident(void);
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,

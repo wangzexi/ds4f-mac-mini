@@ -21494,6 +21494,31 @@ static bool metal_graph_decode_cpu_router(
     }
     const double t_cpu = profile ? now_sec() : 0.0;
 
+    /* CPU Router is the production path for Flash IQ2 experts.  It has the
+     * real choice before any MoE kernel is encoded, which is the exact point
+     * where a live heat-prefetch must be reconciled and cancelled. */
+    if (g->ssd_streaming) {
+        uint64_t gate_expert_bytes = 0;
+        uint64_t down_expert_bytes = 0;
+        if (!streaming_layer_gate_down_expert_bytes(layer,
+                                                    &gate_expert_bytes,
+                                                    &down_expert_bytes)) {
+            return false;
+        }
+        const ds4_gpu_stream_expert_table table =
+            graph_stream_expert_table_make(model,
+                                           layer,
+                                           il,
+                                           gate_expert_bytes,
+                                           down_expert_bytes);
+        if (ds4_gpu_stream_expert_cache_begin_selected_load(
+                    &table, selected_i32, DS4_N_EXPERT_USED) == 0) {
+            return false;
+        }
+        ds4_gpu_stream_expert_cache_note_route_weights(
+                il, selected_i32, weights, DS4_N_EXPERT_USED);
+    }
+
     if (ds4_gpu_tensor_write(metal_graph_router_logits(g),
                              0,
                              logits,

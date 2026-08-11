@@ -13018,6 +13018,15 @@ static void ds4_gpu_stream_expert_cache_note_selected_hotness(
     }
 }
 
+void ds4_gpu_stream_expert_cache_note_route_weights(
+        uint32_t       layer,
+        const int32_t *selected_ids,
+        const float   *selected_weights,
+        uint32_t       n_selected) {
+    ds4_gpu_stream_expert_cache_note_selected_hotness(
+            layer, selected_ids, selected_weights, n_selected);
+}
+
 static void ds4_gpu_stream_expert_cache_note_tokens(uint32_t layer_index,
                                                     uint32_t n_tokens) {
     if (!g_ssd_streaming_mode || layer_index != 0 ||
