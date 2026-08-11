@@ -88,14 +88,15 @@ def tensor_nbytes(dims, tensor_type: int) -> int | None:
         8: (32, 34),     # Q8_0
         9: (32, 36),     # Q8_1
         10: (256, 84),   # Q2_K
+        11: (256, 110),  # Q3_K
     }
     # Keep the table explicit; IQ and MXFP types vary by GGML revision.
     blocks.update({
-        12: (256, 112),  # Q3_K
-        13: (256, 144),  # Q4_K
-        14: (256, 176),  # Q5_K
-        15: (256, 210),  # Q6_K
-        16: (256, 66),   # Q8_K
+        12: (256, 144),  # Q4_K
+        13: (256, 176),  # Q5_K
+        14: (256, 210),  # Q6_K
+        15: (256, 292),  # Q8_K
+        16: (256, 66),   # IQ2_XXS
     })
     if tensor_type not in blocks:
         return None
