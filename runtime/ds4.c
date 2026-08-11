@@ -19764,7 +19764,10 @@ static uint32_t metal_graph_prefill_hot_expert_prefetch_count(
             return parsed >= DS4_N_EXPERT ? DS4_N_EXPERT : (uint32_t)parsed;
         }
     }
-    if (n_tokens < 16u) return 12u;
+    /* Measured on the fixed Mini from the same 24-token disk-KV prefix:
+     * 10-token suffix demand-only=6.84 s, heat-12=7.36 s, heat-24=7.55 s.
+     * There is too little overlap window to earn back a speculative copy. */
+    if (n_tokens < 16u) return 0u;
     if (n_tokens < 64u) return 24u;
     if (n_tokens < 256u) return 64u;
     return DS4_N_EXPERT;

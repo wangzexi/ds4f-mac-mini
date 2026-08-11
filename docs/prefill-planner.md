@@ -22,7 +22,7 @@ layers at once.
 
 | Prompt rows | Cold learned-router staging | KV-prefix heat staging |
 | ---: | ---: | ---: |
-| 1-15 | wait for Router, then exact-read | 12 candidates |
+| 1-15 | wait for Router, then exact-read | disabled (measured faster) |
 | 16-63 | wait for Router, then exact-read | 24 candidates |
 | 64-255 | wait for Router, then exact-read | 64 candidates |
 | 256+ | all 256 experts | all 256 experts |
@@ -31,7 +31,7 @@ For layers 3 and later, a cold prompt keeps the conservative all-or-nothing
 policy: short and medium prompts wait for the actual Router result, while long
 prompts read all experts in packed-file order. A KV-prefix hit additionally
 restores decayed Router-weight heat. Below the 256-token full-layer crossover,
-that heat selects 12/24/64 candidates. They are sorted by heat, then each
+that heat selects 24/64 candidates (then a full layer). They are sorted by heat, then each
 eight-expert priority group is put in packed-file order for SSD locality.
 `DS4_METAL_PREFILL_HOT_EXPERT_PREFETCH_COUNT=0..256` overrides that number
 for reproducible Mini A/B measurements; normal service leaves it unset.
@@ -43,6 +43,11 @@ speculative slab, and reads only the selected misses. Thus an unneeded partial
 slab never becomes a long-lived 1.69 GiB allocation. Hash layer 0 is fully
 resident before the server listens; hash layers 1 and 2 use exact token-ID
 unions. A completed layer is released immediately.
+
+The current 1–15-token cutoff is measured rather than guessed. With the same
+24-token disk-KV prefix and a 10-token suffix, demand-only Prefill took
+6.84 s; 12 and 24 candidates took 7.36 s and 7.55 s respectively. That short
+window cannot hide enough I/O to repay speculative reads.
 
 Complete learned-layer 256-expert staging is intentionally one layer ahead.
 Holding three complete 1.69 GiB Metal expert layers produced different
