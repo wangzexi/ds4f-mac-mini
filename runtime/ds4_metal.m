@@ -15407,7 +15407,10 @@ void ds4_gpu_stream_expert_cache_release_layer_keep_recent(uint32_t layer,
         found++;
     }
 
-    if (found < keep) return;
+    /* Fewer live entries than the target means all of them are prompt-tail
+     * candidates.  Do not return here: compact handoff still has to detach
+     * them from a full-layer staging buffer. */
+    const bool keep_all = found < keep;
 
     /* `cutoff` is the kth most-recent timestamp.  Timestamps are monotonic
      * and unique for cache touches, so this keeps at most `keep` entries. */
@@ -15417,7 +15420,7 @@ void ds4_gpu_stream_expert_cache_release_layer_keep_recent(uint32_t layer,
         ds4_gpu_stream_expert_cache_entry *e =
             &g_stream_expert_cache[layer][expert];
         if (!e->valid || ds4_gpu_stream_expert_cache_entry_inflight(e) ||
-            e->last_used >= cutoff) {
+            keep_all || e->last_used >= cutoff) {
             continue;
         }
         ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
