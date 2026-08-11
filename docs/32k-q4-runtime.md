@@ -38,6 +38,8 @@ cache-aware router 的初步速度档位：
 
 设置 `DS4F_SPEED_CACHE_AWARE_PROFILE=1` 会逐层记录 router 的总 mass、实际保留 mass、命中缓存数和保留专家数。它只用于寻找更可靠的自适应 decode 阈值，不改变默认 exact 路径。
 
+2026-08-11 在当前 600-slot Mini 部署上，以 `你好` 生成 32 token 的新对照为：exact 为 1.95 token/s，30% mass turbo 为 4.49 token/s，20% mass 为 4.55 token/s。20% 的收益不足 2%，却在第一个生成 token 即与 exact 分叉，不能作为可用档位。当前瓶颈不是再少保留一个专家，而是让保留集合更常命中真正需要的专家。
+
 ## 预填充 workspace 复用
 
 预填充是 layer-major：同一批 token 完成某层 attention 后才进入该层 FFN。因此 attention-only 和 FFN-only 中间 tensor 生命周期不重叠。`DS4_METAL_PREFILL_STAGE_ALIAS=1` 会释放独立 FFN batch buffer，并让它们成为已结束 attention buffer 的不重叠 view；KV、跨阶段 HC、权重和计算公式均不改变。
