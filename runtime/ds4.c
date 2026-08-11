@@ -58597,6 +58597,27 @@ bool ds4_session_streaming_static_decode_map_current(ds4_session *s) {
 #endif
 }
 
+bool ds4_session_preload_static_decode_trunk(ds4_session *s) {
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+    if (!s || !s->engine || !s->engine->ssd_streaming ||
+        s->engine->backend != DS4_BACKEND_METAL ||
+        !metal_graph_stream_decode_static_map_enabled() ||
+        !metal_graph_stream_decode_static_map_state_cache_enabled()) {
+        return false;
+    }
+    if (s->graph.streaming_static_decode_map_current) return true;
+    if (!metal_graph_stream_map_decode_static_all(&s->engine->model,
+                                                   &s->engine->weights)) {
+        return false;
+    }
+    s->graph.streaming_static_decode_map_current = true;
+    return true;
+#else
+    (void)s;
+    return false;
+#endif
+}
+
 uint64_t ds4_engine_task_phys_footprint(ds4_engine *e) {
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
     if (!e || e->backend != DS4_BACKEND_METAL) return 0;

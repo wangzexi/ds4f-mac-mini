@@ -13677,6 +13677,24 @@ int main(int argc, char **argv) {
                    "ds4-server: hash layer 0 startup preload unavailable; continuing with exact synchronous fallback");
     }
 
+    /* This launcher has one active session and a fixed 16 GiB machine.  When
+     * enabled, make server-ready mean both L0 and the Decode static trunk are
+     * resident.  The request planner sees this map and reduces its Prefill
+     * expert-cache budget before the first prompt, so this is not an
+     * unaccounted second copy of the model. */
+    const char *preload_static_decode =
+        getenv("DS4_SERVER_PRELOAD_STATIC_DECODE_TRUNK");
+    if (slot_count == 1 && preload_static_decode && preload_static_decode[0] &&
+        strcmp(preload_static_decode, "0") != 0) {
+        if (ds4_session_preload_static_decode_trunk(s.slots[0].session)) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: startup Decode static trunk preloaded for single active session");
+        } else {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: startup Decode static trunk preload unavailable; continuing with lazy exact fallback");
+        }
+    }
+
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
