@@ -14897,6 +14897,9 @@ ds4_gpu_stream_expert_cache_install_loaded(
     ds4_gpu_stream_expert_cache_entry *e =
         &g_stream_expert_cache[layer][expert];
     if (e->valid) {
+        if (layer == 0 && getenv("DS4_METAL_HASH_LAYER0_CACHE_TRACE") != NULL) {
+            fprintf(stderr, "ds4: hash-l0 install-replace expert=%u\n", expert);
+        }
         if (ds4_gpu_stream_expert_cache_entry_inflight(e) &&
             ds4_gpu_stream_expert_cache_on_service_thread()) {
             return NULL;
