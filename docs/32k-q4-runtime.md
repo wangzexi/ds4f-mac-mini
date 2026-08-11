@@ -58,6 +58,11 @@ Decode 的 cache-hit/miss split 也以 950 槽 exact 路径重新测过。默认
 仅作诊断开关，不形成新的 balanced 档位。瓶颈仍是提高所保留专家的真实命中，
 不是在 miss 时再少算一个专家。
 
+又尝试只在低熵 router 层执行这种舍弃：20% 阈值分别限制在归一化熵不高于
+80% 与 85%，仍都在第 6 个 token 分叉，15%/80% 也同样在第 6 个 token
+分叉且只有 2.04 t/s。低熵不能区分出“可安全补零”的 miss 专家；该保护实验
+已撤回，避免把一个看似合理但无质量收益的近似开关留在运行时。
+
 解码时第 1、2 个 hash 路由层的专家可由 token ID 精确提前算出；也试过在
 前一层 MoE 执行期间预读这些 six-expert 集合。开/关在同一 950 槽 32-token
 trace 中完全一致，但 generation 都是 2.05 t/s。现有 selected-expert early
