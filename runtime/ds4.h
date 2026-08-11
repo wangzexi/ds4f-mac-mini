@@ -266,6 +266,9 @@ uint32_t ds4_engine_resize_streaming_expert_cache(
         uint32_t    experts,
         uint32_t    pinned_experts,
         bool        release_resident);
+/* Fixed-Mini startup optimization: load every routed expert in hash layer 0
+ * before the first request so its cold SSD read is outside TTFT. */
+bool ds4_engine_preload_prefill_hash_layer_zero(ds4_engine *e);
 uint32_t ds4_engine_streaming_expert_cache_locked_count(ds4_engine *e);
 uint64_t ds4_engine_task_phys_footprint(ds4_engine *e);
 int ds4_engine_tp_vocab_split(ds4_engine *e);

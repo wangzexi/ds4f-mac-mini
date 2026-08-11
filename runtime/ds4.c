@@ -19795,20 +19795,95 @@ static uint32_t metal_graph_prefill_expert_order(
     return n;
 }
 
-static bool metal_graph_prefetch_prefill_expert_layer(
+static uint32_t metal_graph_prefill_hash_expert_union(
+        const ds4_model         *model,
+        const ds4_layer_weights *layer,
+        const token_vec         *prompt,
+        uint32_t                 start,
+        uint32_t                 n_tokens,
+        int32_t                  expert_ids[DS4_N_EXPERT]) {
+    if (!model || !layer || !layer->ffn_gate_tid2eid || !prompt ||
+        start > (uint32_t)prompt->len ||
+        n_tokens > (uint32_t)prompt->len - start) {
+        return 0;
+    }
+    const ds4_tensor *route = layer->ffn_gate_tid2eid;
+    if (route->type != DS4_TENSOR_I32 || route->ndim != 2 ||
+        route->dim[0] != DS4_N_EXPERT_USED ||
+        route->dim[1] != DS4_N_VOCAB ||
+        route->bytes != (uint64_t)DS4_N_EXPERT_USED *
+                        DS4_N_VOCAB * sizeof(int32_t) ||
+        route->bytes > (uint64_t)SIZE_MAX ||
+        route->abs_offset > model->size ||
+        route->bytes > model->size - route->abs_offset ||
+        route->abs_offset > (uint64_t)LLONG_MAX ||
+        model->fd < 0) {
+        return 0;
+    }
+    /* SSD streaming deliberately unmaps model payload. Read this small
+     * frozen lookup into an owned CPU buffer instead of bypassing explicit
+     * I/O through tensor_data(). The L1/L2 Flash tables total 5.92 MiB. */
+    int32_t *table = xmalloc((size_t)route->bytes);
+    uint64_t done = 0;
+    while (done < route->bytes) {
+        const uint64_t remaining = route->bytes - done;
+        const size_t want = remaining > (uint64_t)SSIZE_MAX ?
+            (size_t)SSIZE_MAX : (size_t)remaining;
+        ssize_t got;
+        do {
+            got = pread(model->fd,
+                        (uint8_t *)table + done,
+                        want,
+                        (off_t)(route->abs_offset + done));
+        } while (got < 0 && errno == EINTR);
+        if (got <= 0) {
+            free(table);
+            return 0;
+        }
+        done += (uint64_t)got;
+    }
+    bool seen[DS4_N_EXPERT];
+    memset(seen, 0, sizeof(seen));
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const int token = prompt->v[start + t];
+        if (token < 0 || (uint32_t)token >= DS4_N_VOCAB) {
+            free(table);
+            return 0;
+        }
+        const int32_t *selected =
+            table + (uint64_t)token * DS4_N_EXPERT_USED;
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            if (selected[i] < 0 || (uint32_t)selected[i] >= DS4_N_EXPERT) {
+                free(table);
+                return 0;
+            }
+            seen[selected[i]] = true;
+        }
+    }
+    free(table);
+    uint32_t n = 0;
+    /* Packed experts are ordered by physical expert id. Building the exact
+     * union in ascending order therefore also gives the pread path its most
+     * sequential possible request order. */
+    for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+        if (seen[expert]) expert_ids[n++] = (int32_t)expert;
+    }
+    return n;
+}
+
+static bool metal_graph_prefetch_prefill_expert_layer_selected(
         const ds4_model   *model,
         const ds4_weights *weights,
         uint32_t           il,
-        uint32_t           n_tokens,
+        const int32_t      *expert_ids,
+        uint32_t           n_prefetch,
         uint32_t           protect_layer) {
-    if (!model || !weights || il >= DS4_N_LAYER) {
+    if (!model || !weights || !expert_ids || il >= DS4_N_LAYER ||
+        n_prefetch == 0 || n_prefetch > DS4_N_EXPERT) {
         return false;
     }
     const char *pack_path = getenv("DS4_METAL_STREAMING_EXPERT_PACK_PATH");
     if (!pack_path || !pack_path[0]) return false;
-    const uint32_t n_prefetch =
-        metal_graph_prefill_expert_prefetch_count(n_tokens);
-    if (n_prefetch == 0) return false;
     const char *only_layer =
         getenv("DS4_METAL_PREFILL_FULL_EXPERT_ONLY_LAYER");
     if (only_layer && only_layer[0]) {
@@ -19832,6 +19907,21 @@ static bool metal_graph_prefetch_prefill_expert_layer(
                                        il,
                                        gate_expert_bytes,
                                        down_expert_bytes);
+    return ds4_gpu_stream_expert_layer_prefetch_begin(&table,
+                                                       expert_ids,
+                                                       n_prefetch,
+                                                       protect_layer) != 0;
+}
+
+static bool metal_graph_prefetch_prefill_expert_layer(
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           il,
+        uint32_t           n_tokens,
+        uint32_t           protect_layer) {
+    const uint32_t n_prefetch =
+        metal_graph_prefill_expert_prefetch_count(n_tokens);
+    if (n_prefetch == 0) return false;
     int32_t expert_ids[DS4_N_EXPERT];
     if (metal_graph_prefill_expert_order(il, expert_ids) != DS4_N_EXPERT) {
         return false;
@@ -19848,10 +19938,12 @@ static bool metal_graph_prefetch_prefill_expert_layer(
         }
         expert_ids[j] = value;
     }
-    return ds4_gpu_stream_expert_layer_prefetch_begin(&table,
-                                                       expert_ids,
-                                                       n_prefetch,
-                                                       protect_layer) != 0;
+    return metal_graph_prefetch_prefill_expert_layer_selected(model,
+                                                               weights,
+                                                               il,
+                                                               expert_ids,
+                                                               n_prefetch,
+                                                               protect_layer);
 }
 
 static bool metal_graph_activate_prefill_expert_layer(
@@ -34029,6 +34121,30 @@ static bool metal_graph_prefill_layer_major_decode_rows(
     bool interrupted = false;
     uint32_t interrupted_layer = UINT32_MAX;
     uint32_t interrupted_row = UINT32_MAX;
+    int32_t hash_expert_ids[DS4_N_HASH_LAYER][DS4_N_EXPERT];
+    uint32_t hash_expert_counts[DS4_N_HASH_LAYER];
+    memset(hash_expert_counts, 0, sizeof(hash_expert_counts));
+    if (DS4_N_HASH_LAYER != 0 && DS4_N_LAYER != 0) {
+        hash_expert_counts[0] = DS4_N_EXPERT;
+        fprintf(stderr,
+                "ds4: exact hash prefill layer=0 tokens=%u experts=%u source=startup-full\n",
+                n_tokens,
+                (uint32_t)DS4_N_EXPERT);
+    }
+    for (uint32_t il = 1; il < DS4_N_HASH_LAYER && il < DS4_N_LAYER; il++) {
+        hash_expert_counts[il] = metal_graph_prefill_hash_expert_union(
+                model,
+                &weights->layer[il],
+                prompt,
+                start,
+                n_tokens,
+                hash_expert_ids[il]);
+        fprintf(stderr,
+                "ds4: exact hash prefill layer=%u tokens=%u experts=%u\n",
+                il,
+                n_tokens,
+                hash_expert_counts[il]);
+    }
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         if (cancel && cancel(cancel_ud)) {
             interrupted = true;
@@ -34056,11 +34172,35 @@ static bool metal_graph_prefill_layer_major_decode_rows(
                 (void)metal_graph_prefetch_prefill_trunk(model,
                                                          weights,
                                                          il + d);
-                (void)metal_graph_prefetch_prefill_expert_layer(model,
-                                                                weights,
-                                                                il + d,
-                                                                n_tokens,
-                                                                il);
+            }
+            const uint32_t next = il + 1u;
+            if (next < DS4_N_LAYER) {
+                if (next < DS4_N_HASH_LAYER &&
+                    hash_expert_counts[next] != 0) {
+                    /* Hash-layer identities are fully known from token ids.
+                     * Roll one exact layer ahead: L0 computes while L1 reads,
+                     * then L1 computes while L2 reads. This prioritizes the
+                     * next critical-path read on the Mini's single SSD. */
+                    (void)metal_graph_prefetch_prefill_expert_layer_selected(
+                            model,
+                            weights,
+                            next,
+                            hash_expert_ids[next],
+                            hash_expert_counts[next],
+                            il);
+                } else {
+                    for (uint32_t d = 1;
+                         d <= lookahead && il + d < DS4_N_LAYER;
+                         d++) {
+                        if (il + d < DS4_N_HASH_LAYER) continue;
+                        (void)metal_graph_prefetch_prefill_expert_layer(
+                                model,
+                                weights,
+                                il + d,
+                                n_tokens,
+                                il);
+                    }
+                }
             }
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
@@ -58082,6 +58222,45 @@ uint32_t ds4_engine_resize_streaming_expert_cache(
     (void)pinned_experts;
     (void)release_resident;
     return 0;
+#endif
+}
+
+bool ds4_engine_preload_prefill_hash_layer_zero(ds4_engine *e) {
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+    if (!e || !e->ssd_streaming || e->backend != DS4_BACKEND_METAL ||
+        DS4_N_LAYER == 0 || !e->weights.layer[0].ffn_gate_tid2eid) {
+        return true;
+    }
+    const char *disabled = getenv("DS4_METAL_DISABLE_HASH_LAYER0_PRELOAD");
+    if (disabled && disabled[0] && strcmp(disabled, "0") != 0) return true;
+
+    int32_t expert_ids[DS4_N_EXPERT];
+    for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
+        expert_ids[expert] = (int32_t)expert;
+    }
+    const double t0 = now_sec();
+    if (!metal_graph_prefetch_prefill_expert_layer_selected(
+                &e->model,
+                &e->weights,
+                0,
+                expert_ids,
+                DS4_N_EXPERT,
+                UINT32_MAX) ||
+        !metal_graph_activate_prefill_expert_layer(&e->model,
+                                                   &e->weights,
+                                                   0)) {
+        fprintf(stderr,
+                "ds4: startup hash layer 0 preload failed; first prefill will fall back to synchronous reads\n");
+        return false;
+    }
+    fprintf(stderr,
+            "ds4: startup hash layer 0 preloaded experts=%u time=%.3f ms\n",
+            (uint32_t)DS4_N_EXPERT,
+            (now_sec() - t0) * 1000.0);
+    return true;
+#else
+    (void)e;
+    return true;
 #endif
 }
 

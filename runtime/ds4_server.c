@@ -13488,6 +13488,15 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* This server is dedicated to one fixed Flash model. Spend idle startup
+     * memory on all 256 experts of hash layer 0 so the first request can begin
+     * L0 computation immediately after tokenization. L1/L2 are selected
+     * exactly from tid2eid and streamed by the Prefill pipeline. */
+    if (!ds4_engine_preload_prefill_hash_layer_zero(engine)) {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: hash layer 0 startup preload unavailable; continuing with exact synchronous fallback");
+    }
+
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
