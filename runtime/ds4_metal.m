@@ -15422,6 +15422,96 @@ void ds4_gpu_stream_expert_cache_release_layer_keep_recent(uint32_t layer,
         }
         ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
     }
+
+    /* A full-layer Prefill read installs all entries as views into one large
+     * staging buffer.  Leaving just six entries alive would otherwise retain
+     * the entire 1.69 GiB buffer.  When requested, migrate those retained
+     * bytes into ordinary fixed-size cache slab slots, then let ARC release
+     * the staging buffer.  This copies memory already resident on the Mini;
+     * it does not issue model I/O or change any expert payload. */
+    const char *compact_env =
+        getenv("DS4_METAL_PREFILL_TAIL_EXPERT_HANDOFF_COMPACT");
+    const int compact = compact_env && compact_env[0] &&
+        strcmp(compact_env, "0") != 0;
+    uint32_t migrated = 0;
+    if (compact) {
+        for (uint32_t expert = 0;
+             expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+             expert++) {
+            ds4_gpu_stream_expert_cache_entry *e =
+                &g_stream_expert_cache[layer][expert];
+            if (!e->valid || !e->shared_prefetch ||
+                ds4_gpu_stream_expert_cache_entry_inflight(e)) {
+                continue;
+            }
+            __strong id<MTLBuffer> src_gate = e->gate_buffer;
+            __strong id<MTLBuffer> src_up = e->up_buffer;
+            __strong id<MTLBuffer> src_down = e->down_buffer;
+            const NSUInteger src_gate_inner = e->gate_inner;
+            const NSUInteger src_up_inner = e->up_inner;
+            const NSUInteger src_down_inner = e->down_inner;
+            const uint64_t gate_bytes = e->gate_expert_bytes;
+            const uint64_t down_bytes = e->down_expert_bytes;
+            const void *model_map = e->model_map;
+            const uint64_t model_size = e->model_size;
+            const uint64_t gate_off = e->gate_abs_offset;
+            const uint64_t up_off = e->up_abs_offset;
+            const uint64_t down_off = e->down_abs_offset;
+            __strong id<MTLBuffer> dst_gate = nil;
+            __strong id<MTLBuffer> dst_up = nil;
+            __strong id<MTLBuffer> dst_down = nil;
+            NSUInteger dst_gate_inner = 0;
+            NSUInteger dst_up_inner = 0;
+            NSUInteger dst_down_inner = 0;
+            if (!src_gate || !src_up || !src_down ||
+                !ds4_gpu_stream_expert_alloc_slab_slot(gate_bytes,
+                                                        down_bytes,
+                                                        &dst_gate,
+                                                        &dst_up,
+                                                        &dst_down,
+                                                        &dst_gate_inner,
+                                                        &dst_up_inner,
+                                                        &dst_down_inner)) {
+                continue;
+            }
+            memcpy((uint8_t *)[dst_gate contents] + dst_gate_inner,
+                   (const uint8_t *)[src_gate contents] + src_gate_inner,
+                   (size_t)gate_bytes);
+            memcpy((uint8_t *)[dst_up contents] + dst_up_inner,
+                   (const uint8_t *)[src_up contents] + src_up_inner,
+                   (size_t)gate_bytes);
+            memcpy((uint8_t *)[dst_down contents] + dst_down_inner,
+                   (const uint8_t *)[src_down contents] + src_down_inner,
+                   (size_t)down_bytes);
+            [dst_gate didModifyRange:NSMakeRange(dst_gate_inner,
+                                                  (NSUInteger)gate_bytes)];
+            [dst_up didModifyRange:NSMakeRange(dst_up_inner,
+                                                (NSUInteger)gate_bytes)];
+            [dst_down didModifyRange:NSMakeRange(dst_down_inner,
+                                                  (NSUInteger)down_bytes)];
+            ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
+            if (ds4_gpu_stream_expert_cache_install_loaded(model_map,
+                                                            model_size,
+                                                            layer,
+                                                            expert,
+                                                            gate_off,
+                                                            up_off,
+                                                            down_off,
+                                                            gate_bytes,
+                                                            down_bytes,
+                                                            dst_gate,
+                                                            dst_up,
+                                                            dst_down,
+                                                            dst_gate_inner,
+                                                            dst_up_inner,
+                                                            dst_down_inner)) {
+                migrated++;
+            }
+        }
+        fprintf(stderr,
+                "ds4: compact tail handoff layer=%u retained=%u migrated=%u\n",
+                layer, keep, migrated);
+    }
 }
 
 static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protected(
