@@ -3701,6 +3701,71 @@ void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     ds4_gpu_stream_expert_cache_clear_all(1);
 }
 
+/* Return the actual Metal allocation retained by the expert cache.  Logical
+ * entry count is deliberately not enough here: a layer-prefetch entry can be
+ * a view into a 1.69 GiB shared staging buffer, while a slab can reserve many
+ * expert slots before all of them are populated.  The phase planner uses this
+ * before replacing a larger cache budget with a smaller one. */
+static uint64_t ds4_gpu_stream_expert_cache_resident_bytes(void) {
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < g_stream_expert_cache_slab_count; i++) {
+        id<MTLBuffer> slab = g_stream_expert_cache_slabs[i];
+        const uint64_t bytes = slab ? (uint64_t)[slab length] : 0;
+        if (bytes > UINT64_MAX - total) return UINT64_MAX;
+        total += bytes;
+    }
+
+    /* Non-slab cache entries normally own one combined buffer each.  Shared
+     * Prefill reads are the exception: all experts in a streamed layer point
+     * into the same staging buffer, so de-duplicate those buffer objects. */
+    id<MTLBuffer> shared_seen[
+        DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER * 3u];
+    uint32_t shared_seen_count = 0;
+    for (uint32_t layer = 0;
+         layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
+         layer++) {
+        for (uint32_t expert = 0;
+             expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+             expert++) {
+            const ds4_gpu_stream_expert_cache_entry *e =
+                &g_stream_expert_cache[layer][expert];
+            if (!e->valid || e->slab_backed) continue;
+            id<MTLBuffer> buffers[3] = {
+                e->gate_buffer, e->up_buffer, e->down_buffer,
+            };
+            for (uint32_t i = 0; i < 3; i++) {
+                id<MTLBuffer> buffer = buffers[i];
+                if (!buffer) continue;
+                bool duplicate = false;
+                for (uint32_t j = 0; j < i; j++) {
+                    if (buffers[j] == buffer) {
+                        duplicate = true;
+                        break;
+                    }
+                }
+                if (duplicate) continue;
+                if (e->shared_prefetch) {
+                    for (uint32_t j = 0; j < shared_seen_count; j++) {
+                        if (shared_seen[j] == buffer) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (duplicate) continue;
+                    if (shared_seen_count <
+                        DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER * 3u) {
+                        shared_seen[shared_seen_count++] = buffer;
+                    }
+                }
+                const uint64_t bytes = (uint64_t)[buffer length];
+                if (bytes > UINT64_MAX - total) return UINT64_MAX;
+                total += bytes;
+            }
+        }
+    }
+    return total;
+}
+
 uint32_t ds4_gpu_resize_streaming_expert_cache_budget(
         uint32_t experts,
         uint32_t pinned_experts,
@@ -3713,6 +3778,12 @@ uint32_t ds4_gpu_resize_streaming_expert_cache_budget(
     const uint32_t old_mlock_budget =
         g_stream_expert_cache_mlock_budget_override;
     const int shrinking_total = experts < old_budget;
+    const uint64_t resident_bytes =
+        ds4_gpu_stream_expert_cache_resident_bytes();
+    const uint64_t target_bytes =
+        g_stream_expert_cache_expert_bytes != 0 &&
+        experts <= UINT64_MAX / g_stream_expert_cache_expert_bytes ?
+            (uint64_t)experts * g_stream_expert_cache_expert_bytes : 0;
     g_stream_expert_cache_budget_override = experts;
     g_stream_expert_cache_mlock_budget_override = pinned_experts;
     if (pinned_experts > old_mlock_budget) {
@@ -3722,14 +3793,20 @@ uint32_t ds4_gpu_resize_streaming_expert_cache_budget(
         g_stream_expert_cache_mlock_budget_cap = 0;
         g_stream_expert_cache_mlock_warned = 0;
     }
-    if (release_resident && shrinking_total) {
+    if (release_resident && shrinking_total &&
+        (target_bytes == 0 || resident_bytes > target_bytes)) {
         /* Entries may share multi-GiB virtual slabs.  Pruning entries alone
-         * recycles their slots but intentionally keeps the slab objects.  A
-         * short Prefill can have few logical entries while its prior phase
-         * still owns a large slab, so entry count is not a valid release
-         * condition.  The request planner needs the stronger operation so
-         * munlock and slab release happen before Decode begins. */
+         * recycles their slots but intentionally keeps the slab objects, so
+         * compare actual backing buffers to the new phase budget rather than
+         * comparing logical entries.  This releases a genuine oversized
+         * Prefill pool, while preserving a fitting L0 startup preload and a
+         * Decode hot set for the next turn of the sole active conversation. */
         ds4_gpu_stream_expert_cache_clear_all(0);
+    } else if (release_resident && shrinking_total && resident_bytes != 0) {
+        fprintf(stderr,
+                "ds4: preserve streaming expert cache across phase shrink "
+                "resident=%.2f GiB target=%.2f GiB\\n",
+                ds4_gpu_gib(resident_bytes), ds4_gpu_gib(target_bytes));
     }
     /* Lowering only the phase lock target must not throw away hot wired
      * experts when the total cache still fits (the common short-prefill
