@@ -131,6 +131,25 @@ Decode 分别为 2.50 s（1.60 t/s）和 2.53 s（1.58 t/s）。额外 0.50 GiB 
 从 6.35 s 增至 6.70 s，Decode 从 2.50 s 增至 2.71 s；此前对“完整 staged layer”
 的否决不适用于这条按 selected experts 读取的路径。
 
+Prefill 结束时把最后一行实际选择的 six experts 复制/保留给 Decode 的精确开关
+`DS4_METAL_ENABLE_STREAMING_PREFILL_CACHE_SEED=1` 也完成了主干启动预热后的受控
+A/B。隔离 KV 目录、相同 13-token prompt 与 4-token greedy 输出 `您好！您提到的` 下，
+启用 `K=1` 的 Prefill/Decode/总时间为 6.42/2.49/8.91 s；默认路径为
+6.35/2.50/8.85 s。输出完全一致但没有净收益，故保持关闭。它可在后续改变缓存实现后
+重新评估，但当前不应为了“首 token 命中”干扰全局 Decode cache。
+
+### 单会话 KV 与 L0 的独立性
+
+服务空闲时仍保留三个彼此独立的状态：完整 L0（256 experts）、静态 Decode 主干映射，
+以及最近会话的内存 KV。响应结束后，KV 还会以 LRU 形式写入 10 GiB 磁盘缓存，并携带
+对应的 router heat。
+
+- 内存 KV 命中：不读磁盘 KV，也不读 L0。
+- 内存未命中、磁盘中有精确 token-prefix：只读回该 KV/heat（实测约数毫秒），L0 和
+  静态主干继续复用。
+- 磁盘也未命中：从新消息重新 Prefill 并建立新的 KV；依然不会重读 L0。后续层的可换
+  专家按正常调度补入，但 L0 预热与 KV 是否命中无关。
+
 真实 server 的内存检查进一步否决了把它设为默认：5-token 输入、2-token输出时，
 开启 6-entry handoff 的进程 RSS 约为 7.1 GiB，而空闲默认服务约 2.0 GiB。
 原因不是逻辑条目数，而是这些条目仍引用各层完整的 Prefill staging buffer。除非先将
