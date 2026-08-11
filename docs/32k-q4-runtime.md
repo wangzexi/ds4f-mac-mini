@@ -68,6 +68,15 @@ Decode 的 cache-hit/miss split 也以 950 槽 exact 路径重新测过。默认
 trace 中完全一致，但 generation 都是 2.05 t/s。现有 selected-expert early
 load 已处于同一同步边界，额外读请求没有形成可用重叠，因此该实验未保留。
 
+Prefill 的尾部专家交接仍是独立的精确实验：
+`DS4_METAL_PREFILL_TAIL_EXPERT_HANDOFF=1` 默认留下每层最后一行的 6 个
+已在内存中的专家；`DS4_METAL_PREFILL_TAIL_EXPERT_HANDOFF_KEEP=1..256`
+只用于测试更长尾部并集。`你好`、两个输出 token、600 槽的对照中，关闭/保留
+6 个的累计 cache hit/miss 为 332/1017 与 519/840，generation 为 0.60 与
+0.70 t/s。它减少了首个实际 decode 的 SSD miss，但会占用全局 decode cache；
+32-token 连续生成尚未显示稳定净收益，故服务默认仍关闭。短提示只有一行可留，
+设为 18 与 6 得到相同集合，不能据此推断长尾效果。
+
 同一轮 profile 还显示，前三个 hash 层因为路由近似均匀，950 槽全局热度
 缓存中的命中率只有约 6–11%，而可学习路由层约为 62–85%。曾尝试把完整 hash
 层永久保留在缓存里；但 Mini 实际稳定可锁定的 expert slab 约 4GiB。仅固定第
