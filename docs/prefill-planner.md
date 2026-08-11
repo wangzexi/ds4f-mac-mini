@@ -126,6 +126,14 @@ opportunity is therefore a future kernel-level split that preserves every
 dependency while avoiding the extra per-row mailbox copies; it must clear the
 same byte-identical logits gate before becoming selectable.
 
+Reversing the launch order of the next full expert layer and the small
+1--3-layer trunk lookahead was also measured on the same roughly 300-token
+fixture.  The normal/expert-first pairs were 8.75/9.02 and 8.95/8.93 t/s;
+the summed preparation times showed the same inconclusive spread.  Both reads
+share one SSD queue, but this ordering is not a repeatable way to remove a GPU
+wait, so the calibration switch was removed rather than become another server
+tuning knob.
+
 ## Explicit I/O and paging
 
 - Model and packed-expert descriptors use `F_NOCACHE`.
