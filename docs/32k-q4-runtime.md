@@ -121,6 +121,11 @@ prompt + 4-token exact 输出中，不交接为 2.73 s Decode；保留每层 6 �
 tail expert 均约 4.70--4.76 s，输出文本相同。它会扰乱全局专家缓存的生命周期，
 故不应默认开启，即使其不改变数值。
 
+同一受控 fixture 还比较了静态主干常驻下的 Decode 缓存上限：11.50 GiB 工作集为
+967 槽 / 6.37 GiB，12.00 GiB 为 1,043 槽 / 6.88 GiB；两者输出相同，4-token
+Decode 分别为 2.50 s（1.60 t/s）和 2.53 s（1.58 t/s）。额外 0.50 GiB 没有可测
+收益，因此正式配置仍保持 11.50 GiB，把余量留给 Metal 和系统而非盲目扩张缓存。
+
 真实 server 的内存检查进一步否决了把它设为默认：5-token 输入、2-token输出时，
 开启 6-entry handoff 的进程 RSS 约为 7.1 GiB，而空闲默认服务约 2.0 GiB。
 原因不是逻辑条目数，而是这些条目仍引用各层完整的 Prefill staging buffer。除非先将
