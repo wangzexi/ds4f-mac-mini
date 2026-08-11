@@ -34345,8 +34345,18 @@ static bool metal_graph_prefill_layer_major_decode_rows(
         if (g->ssd_streaming) {
             /* A completed prefill layer is never revisited by this request.
              * Releasing it immediately makes the same exact slot budget
-             * available to the rolling future-layer prefetch window. */
-            ds4_gpu_stream_expert_cache_release_layer(il);
+             * available to the rolling future-layer prefetch window.  The
+             * opt-in tail handoff keeps the last row's six actual experts;
+             * it only changes residency, never router or MoE arithmetic. */
+            const char *tail_handoff =
+                getenv("DS4_METAL_PREFILL_TAIL_EXPERT_HANDOFF");
+            if (tail_handoff && tail_handoff[0] &&
+                strcmp(tail_handoff, "0") != 0) {
+                ds4_gpu_stream_expert_cache_release_layer_keep_recent(
+                        il, DS4_N_EXPERT_USED);
+            } else {
+                ds4_gpu_stream_expert_cache_release_layer(il);
+            }
         }
 
         ds4_gpu_tensor *tmp = metal_graph_batch_cur_hc(g);

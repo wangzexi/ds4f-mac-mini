@@ -284,6 +284,11 @@ int ds4_gpu_stream_expert_layer_prefetch_activate(
         const ds4_gpu_stream_expert_table *table);
 void ds4_gpu_stream_expert_layer_prefetch_cancel_all(void);
 void ds4_gpu_stream_expert_cache_release_layer(uint32_t layer);
+/* Drop a finished prefill layer but preserve its most-recently-used expert
+ * entries.  The exact layer-major prefill uses this to hand the tail-token
+ * route to the first decode token without issuing another SSD read. */
+void ds4_gpu_stream_expert_cache_release_layer_keep_recent(uint32_t layer,
+                                                            uint32_t keep);
 /* Seed from mapped weights with blits appended to the active command buffer. */
 int ds4_gpu_stream_expert_cache_seed_experts_gpu_copy(
         const ds4_gpu_stream_expert_table *table,

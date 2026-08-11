@@ -15328,6 +15328,56 @@ void ds4_gpu_stream_expert_cache_release_layer(uint32_t layer) {
     }
 }
 
+void ds4_gpu_stream_expert_cache_release_layer_keep_recent(uint32_t layer,
+                                                            uint32_t keep) {
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER || keep == 0) {
+        ds4_gpu_stream_expert_cache_release_layer(layer);
+        return;
+    }
+
+    /* The layer-major prefill has already loaded every exact expert used by
+     * its final prompt row.  Keeping the six newest entries therefore costs
+     * no new I/O and gives the next decode token a small, exact warm start.
+     * We intentionally use recency rather than route hotness: this is a
+     * prompt-tail handoff, not a long-lived eviction policy. */
+    uint64_t cutoff = 0;
+    uint32_t found = 0;
+    for (uint32_t pass = 0; pass < keep; pass++) {
+        uint64_t newest = 0;
+        for (uint32_t expert = 0;
+             expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+             expert++) {
+            const ds4_gpu_stream_expert_cache_entry *e =
+                &g_stream_expert_cache[layer][expert];
+            if (!e->valid ||
+                ds4_gpu_stream_expert_cache_entry_inflight(e) ||
+                e->last_used <= cutoff) {
+                continue;
+            }
+            if (e->last_used > newest) newest = e->last_used;
+        }
+        if (newest == 0) break;
+        cutoff = newest;
+        found++;
+    }
+
+    if (found < keep) return;
+
+    /* `cutoff` is the kth most-recent timestamp.  Timestamps are monotonic
+     * and unique for cache touches, so this keeps at most `keep` entries. */
+    for (uint32_t expert = 0;
+         expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+         expert++) {
+        ds4_gpu_stream_expert_cache_entry *e =
+            &g_stream_expert_cache[layer][expert];
+        if (!e->valid || ds4_gpu_stream_expert_cache_entry_inflight(e) ||
+            e->last_used >= cutoff) {
+            continue;
+        }
+        ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
+    }
+}
+
 static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protected(
         const void *model_map,
         uint64_t    model_size,
