@@ -50,6 +50,14 @@ Decode 的 cache-hit/miss split 也以 950 槽 exact 路径重新测过。默认
 缓存变大带来小幅收益，但仍未稳定达到 5 t/s，且第一生成 token 即与 exact
 分叉。它继续只作为显式极速实验，不进入服务默认配置。
 
+“只放弃未命中且很小的路由权重”也在 950 槽、`你好` 32-token exact
+基线上单独扫过：0/5/10/15/20/30% 相对层内最大权重的 generation 分别为
+2.04/2.06/2.08/2.08/2.17/2.34 t/s。5% 与 10% 保持完整 greedy trace，
+但收益处于测量噪声范围；15% 与 20% 都在第 6 个 token 分叉，30% 在第 3
+个 token 分叉。因此 `DS4F_SPEED_CACHE_AWARE_DROP_MISS_BELOW_TOP_PCT` 继续
+仅作诊断开关，不形成新的 balanced 档位。瓶颈仍是提高所保留专家的真实命中，
+不是在 miss 时再少算一个专家。
+
 ## 预填充 workspace 复用
 
 预填充是 layer-major：同一批 token 完成某层 attention 后才进入该层 FFN。因此 attention-only 和 FFN-only 中间 tensor 生命周期不重叠。`DS4_METAL_PREFILL_STAGE_ALIAS=1` 会释放独立 FFN batch buffer，并让它们成为已结束 attention buffer 的不重叠 view；KV、跨阶段 HC、权重和计算公式均不改变。
