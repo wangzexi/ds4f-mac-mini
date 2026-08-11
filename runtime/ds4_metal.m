@@ -19353,7 +19353,9 @@ int ds4_gpu_matmul_q8_0_decode_mpp_model_view_tensor(
 
 static const char *ds4_gpu_q4_mv_ext_name(uint32_t weight_type, int16_t r1ptg) {
     const char *prefix = NULL;
-    if (weight_type == DS4_METAL_TENSOR_Q4_K) {
+    if (weight_type == DS4_METAL_TENSOR_Q2_K) {
+        prefix = "kernel_mul_mv_ext_q2_K_f32_r1_";
+    } else if (weight_type == DS4_METAL_TENSOR_Q4_K) {
         prefix = "kernel_mul_mv_ext_q4_K_f32_r1_";
     } else if (weight_type == DS4_METAL_TENSOR_Q4_0) {
         prefix = "kernel_mul_mv_ext_q4_0_f32_r1_";
@@ -19361,15 +19363,20 @@ static const char *ds4_gpu_q4_mv_ext_name(uint32_t weight_type, int16_t r1ptg) {
         return NULL;
     }
     switch (r1ptg) {
-    case 1: return weight_type == DS4_METAL_TENSOR_Q4_K ?
+    case 1: return weight_type == DS4_METAL_TENSOR_Q2_K ?
+        "kernel_mul_mv_ext_q2_K_f32_r1_1" : weight_type == DS4_METAL_TENSOR_Q4_K ?
         "kernel_mul_mv_ext_q4_K_f32_r1_1" : "kernel_mul_mv_ext_q4_0_f32_r1_1";
-    case 2: return weight_type == DS4_METAL_TENSOR_Q4_K ?
+    case 2: return weight_type == DS4_METAL_TENSOR_Q2_K ?
+        "kernel_mul_mv_ext_q2_K_f32_r1_2" : weight_type == DS4_METAL_TENSOR_Q4_K ?
         "kernel_mul_mv_ext_q4_K_f32_r1_2" : "kernel_mul_mv_ext_q4_0_f32_r1_2";
-    case 3: return weight_type == DS4_METAL_TENSOR_Q4_K ?
+    case 3: return weight_type == DS4_METAL_TENSOR_Q2_K ?
+        "kernel_mul_mv_ext_q2_K_f32_r1_3" : weight_type == DS4_METAL_TENSOR_Q4_K ?
         "kernel_mul_mv_ext_q4_K_f32_r1_3" : "kernel_mul_mv_ext_q4_0_f32_r1_3";
-    case 4: return weight_type == DS4_METAL_TENSOR_Q4_K ?
+    case 4: return weight_type == DS4_METAL_TENSOR_Q2_K ?
+        "kernel_mul_mv_ext_q2_K_f32_r1_4" : weight_type == DS4_METAL_TENSOR_Q4_K ?
         "kernel_mul_mv_ext_q4_K_f32_r1_4" : "kernel_mul_mv_ext_q4_0_f32_r1_4";
-    case 5: return weight_type == DS4_METAL_TENSOR_Q4_K ?
+    case 5: return weight_type == DS4_METAL_TENSOR_Q2_K ?
+        "kernel_mul_mv_ext_q2_K_f32_r1_5" : weight_type == DS4_METAL_TENSOR_Q4_K ?
         "kernel_mul_mv_ext_q4_K_f32_r1_5" : "kernel_mul_mv_ext_q4_0_f32_r1_5";
     default:
         (void)prefix;
@@ -19380,6 +19387,7 @@ static const char *ds4_gpu_q4_mv_ext_name(uint32_t weight_type, int16_t r1ptg) {
 static const char *ds4_gpu_q4_mm_name(uint32_t weight_type) {
     switch (weight_type) {
     case DS4_METAL_TENSOR_Q4_0: return "kernel_mul_mm_q4_0_f32";
+    case DS4_METAL_TENSOR_Q2_K: return "kernel_mul_mm_q2_K_f32";
     case DS4_METAL_TENSOR_Q4_K: return "kernel_mul_mm_q4_K_f32";
     default: return NULL;
     }
@@ -19395,6 +19403,11 @@ static const char *ds4_gpu_q4_nax_name(uint32_t weight_type, uint64_t tile_n) {
         return tile_n == 128u ? "kernel_mul_mm_q4_K_f32_nax_direct_rhs_n128" :
                tile_n == 64u  ? "kernel_mul_mm_q4_K_f32_nax_direct_rhs_n64" :
                                  "kernel_mul_mm_q4_K_f32_nax_direct_rhs";
+    }
+    if (weight_type == DS4_METAL_TENSOR_Q2_K) {
+        return tile_n == 128u ? "kernel_mul_mm_q2_K_f32_nax_direct_rhs_n128" :
+               tile_n == 64u  ? "kernel_mul_mm_q2_K_f32_nax_direct_rhs_n64" :
+                                 "kernel_mul_mm_q2_K_f32_nax_direct_rhs";
     }
     return NULL;
 }
