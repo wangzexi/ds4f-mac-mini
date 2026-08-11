@@ -1290,9 +1290,6 @@ static int ds4_expert_hotlist_sort_cmp(const void *a, const void *b) {
     return 0;
 }
 
-#include "ds4_streaming_hotlist.inc"
-#include "ds4_streaming_hotlist_glm52.inc"
-
 static void ds4_json_write_string(FILE *fp, const char *s) {
     fputc('"', fp);
     if (s) {
@@ -21159,41 +21156,15 @@ static bool metal_graph_streaming_expert_hotlist_load_default(
         uint32_t    counts[DS4_MAX_LAYER],
         bool        seen[DS4_MAX_LAYER][DS4_MAX_EXPERT],
         uint32_t   *loaded_out) {
-    if (max_entries == 0 || !experts || !priorities || !counts || !seen || !loaded_out) {
-        return false;
-    }
-    const uint16_t (*hotlist)[2] = NULL;
-    uint32_t hotlist_count = 0;
-    if (g_ds4_shape.variant == DS4_VARIANT_PRO) {
-        hotlist = ds4_default_streaming_hotlist_pro;
-        hotlist_count = ds4_default_streaming_hotlist_pro_count;
-    } else if (g_ds4_shape.variant == DS4_VARIANT_FLASH) {
-        hotlist = ds4_default_streaming_hotlist_flash;
-        hotlist_count = ds4_default_streaming_hotlist_flash_count;
-    } else if (g_ds4_shape.variant == DS4_VARIANT_GLM52) {
-        hotlist = ds4_default_streaming_hotlist_glm52;
-        hotlist_count = ds4_default_streaming_hotlist_glm52_count;
-    } else {
-        *loaded_out = 0;
-        return true;
-    }
-    uint32_t loaded = 0;
-    for (uint32_t i = 0;
-         i < hotlist_count && loaded < max_entries;
-         i++) {
-        if (!metal_graph_streaming_expert_hotlist_add(
-                hotlist[i][0],
-                hotlist[i][1],
-                max_entries - loaded,
-                experts,
-                priorities,
-                counts,
-                seen,
-                &loaded)) {
-            return false;
-        }
-    }
-    *loaded_out = loaded;
+    /* This fixed Flash runtime deliberately has no corpus-global default
+     * route list. Prompt-local KV heat is the sole prediction signal. */
+    (void)max_entries;
+    (void)experts;
+    (void)priorities;
+    (void)counts;
+    (void)seen;
+    if (!loaded_out) return false;
+    *loaded_out = 0;
     return true;
 }
 
@@ -21244,6 +21215,9 @@ static bool metal_graph_seed_streaming_expert_cache_layer_from_mapped_hotlist(
         const ds4_model   *model,
         const ds4_weights *weights,
         uint32_t           il) {
+#if 0
+    /* Retired upstream fixed-hotlist implementation. Kept out of the
+     * translation unit while the surrounding generic graph code is pruned. */
     const char *hotlist_path = glm_graph_env_value(
             "DS4_ROCM_STREAMING_EXPERT_HOTLIST",
             "DS4_METAL_STREAMING_EXPERT_HOTLIST");
@@ -21325,6 +21299,12 @@ static bool metal_graph_seed_streaming_expert_cache_layer_from_mapped_hotlist(
                                                               experts,
                                                               priorities,
                                                               n) != 0;
+#endif
+    (void)g;
+    (void)model;
+    (void)weights;
+    (void)il;
+    return true;
 }
 #endif
 
