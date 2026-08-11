@@ -55,6 +55,13 @@ Holding three complete 1.69 GiB Metal expert layers produced different
 long-prompt logits on this machine; one layer ahead is byte-identical to demand
 loading and still reduced the measured 300-row run from 60.15 s to 40.11 s.
 
+The server deliberately retains a 2,048-row idle scheduling quantum even
+though the shared workspace can hold 4,096 rows.  A 3,971-row one-shot trial
+kept SSD activation waits near zero but took roughly 12 seconds per layer,
+whereas the established two-2,048-row path completed the same request at about
+19.2 token/s.  The current exact per-row layer kernel therefore scales
+unfavorably past 2K; increasing the outer quantum is not a prefill speedup.
+
 ## Explicit I/O and paging
 
 - Model and packed-expert descriptors use `F_NOCACHE`.
