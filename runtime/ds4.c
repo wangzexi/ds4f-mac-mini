@@ -21502,6 +21502,18 @@ static bool metal_graph_decode_cpu_router(
                         "resident=%u kept=%u kept_resident=%u kept_mass=%.6f total_mass=%.6f\n",
                         il, token, mass_pct, effective_mass_pct,
                         resident, kept, retained_resident, kept_mass, total_mass);
+                if (getenv("DS4F_SPEED_CACHE_AWARE_PROFILE_DETAIL") != NULL) {
+                    fprintf(stderr, "ds4-cache-aware-detail: layer=%u token=%u routes=", il, token);
+                    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+                        fprintf(stderr,
+                                "%s%d:%.6f:%c",
+                                i == 0 ? "" : ",",
+                                selected[i],
+                                (double)weights[i],
+                                (resident_mask & (1u << i)) ? 'R' : 'M');
+                    }
+                    fputc('\n', stderr);
+                }
             }
         }
     }
