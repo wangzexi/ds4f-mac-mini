@@ -1,5 +1,30 @@
 # ds4f-mini
 
+## Local development, Mini execution
+
+The source repository can live on the development Mac while the 77+ GiB model,
+packed experts, KV cache, builds, and inference remain on the M4 Mini. The
+local clone uses a Git remote named `mini` that points directly to
+`/Users/zexi/workspace/ds4f-mini` on the Mini.
+
+Use the repository-local helper from the development Mac:
+
+```sh
+./mini status       # remote Git, process, memory, and API health
+./mini deploy       # push committed code and build remotely
+./mini test         # numerical regression with automatic service restore
+./mini restart      # restart and health-check the production API
+./mini ship         # deploy + regression + restart + health check
+./mini logs         # follow the production log
+./mini shell        # open a shell in the remote repository
+```
+
+`push`, `deploy`, and `ship` intentionally require a clean local worktree.
+The Mini repository uses Git's `receive.denyCurrentBranch=updateInstead`, so a
+push updates its checked-out `main` branch but refuses to overwrite uncommitted
+remote changes. Model and cache paths are ignored by Git and never enter the
+local clone.
+
 `ds4f-mini` is a single-purpose DeepSeek V4 Flash 0731 inference runtime for
 an Apple M4 Mac mini with 16GB unified memory. It intentionally supports one
 model layout, one 32K context target, and the Metal SSD-streaming path only.
