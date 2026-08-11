@@ -8474,6 +8474,7 @@ struct server {
     bool model_stopping;
     int decode_pending;
     int active_generations;
+    int idle_prefill_quantum;
     int mixed_prefill_quantum;
     int last_prefill_slot;
     bool dynamic_memory_planner;
@@ -10873,7 +10874,8 @@ static void server_prefill_leave(server *s) {
 
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
-    return generation_active ? s->mixed_prefill_quantum : 2048;
+    return generation_active ? s->mixed_prefill_quantum :
+        (s->idle_prefill_quantum > 0 ? s->idle_prefill_quantum : 2048);
 }
 
 static int server_prefill_quantum(server *s) {
@@ -13147,6 +13149,7 @@ typedef struct {
     int tool_memory_max_ids;
     bool enable_cors;
     int batched_sessions;
+    int idle_prefill_quantum;
     int mixed_prefill_quantum;
 } server_config;
 
@@ -13286,6 +13289,7 @@ static server_config parse_options(int argc, char **argv) {
         .ctx_size = 32768,
         .default_tokens = 393216,
         .tool_memory_max_ids = DS4_TOOL_MEMORY_DEFAULT_MAX_IDS,
+        .idle_prefill_quantum = 2048,
         .mixed_prefill_quantum = 128,
     };
     c.kv_cache = kv_cache_default_options();
@@ -13357,6 +13361,9 @@ static server_config parse_options(int argc, char **argv) {
             c.trace_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--batched-session")) {
             c.batched_sessions = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--idle-prefill-quantum")) {
+            c.idle_prefill_quantum =
+                parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mixed-prefill-quantum")) {
             c.mixed_prefill_quantum =
                 parse_int_arg(need_arg(&i, argc, argv, arg), arg);
@@ -13576,6 +13583,7 @@ int main(int argc, char **argv) {
     s.ctx_size = cfg.ctx_size;
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
+    s.idle_prefill_quantum = cfg.idle_prefill_quantum;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
@@ -13858,11 +13866,22 @@ static void test_mixed_prefill_quantum_option(void) {
     server_config custom = parse_options(3, custom_argv);
     TEST_ASSERT(custom.mixed_prefill_quantum == 2048);
 
-    server s = {.mixed_prefill_quantum = custom.mixed_prefill_quantum};
+    server s = {
+        .idle_prefill_quantum = defaults.idle_prefill_quantum,
+        .mixed_prefill_quantum = custom.mixed_prefill_quantum,
+    };
     TEST_ASSERT(server_prefill_quantum_for(&s, false) == 2048);
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
+
+    char *idle_argv[] = {
+        "ds4-server", "--idle-prefill-quantum", "8192"
+    };
+    server_config idle = parse_options(3, idle_argv);
+    TEST_ASSERT(idle.idle_prefill_quantum == 8192);
+    s.idle_prefill_quantum = idle.idle_prefill_quantum;
+    TEST_ASSERT(server_prefill_quantum_for(&s, false) == 8192);
 }
 
 static void test_batched_live_continuation_slot_binding(void) {
