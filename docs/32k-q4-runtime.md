@@ -38,6 +38,12 @@ cache-aware router 的初步速度档位：
 
 设置 `DS4F_SPEED_CACHE_AWARE_PROFILE=1` 会逐层记录 router 的总 mass、实际保留 mass、命中缓存数和保留专家数。它只用于寻找更可靠的自适应 decode 阈值，不改变默认 exact 路径。
 
+Decode 的 cache-hit/miss split 也以 950 槽 exact 路径重新测过。默认只在至少
+3 个专家未命中时先算 resident 部分、并行读取 miss；把阈值降到 2 或 1 虽保持
+完整 greedy trace 一致，但 `你好` 32-token 分别为 2.11 / 2.13 t/s，默认为
+2.15 t/s。额外 command stage 没有换来足够的 I/O 隐藏，因此仍用 3；
+`DS4_METAL_STREAMING_EXPERT_SPLIT_MIN_MISSES=1..6` 仅保留为复现实验的开关。
+
 2026-08-11 在当前 600-slot Mini 部署上，以 `你好` 生成 32 token 的新对照为：exact 为 1.95 token/s，30% mass turbo 为 4.49 token/s，20% mass 为 4.55 token/s。20% 的收益不足 2%，却在第一个生成 token 即与 exact 分叉，不能作为可用档位。当前瓶颈不是再少保留一个专家，而是让保留集合更常命中真正需要的专家。
 
 ## 预填充 workspace 复用
