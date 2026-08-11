@@ -21478,6 +21478,39 @@ static bool metal_graph_decode_cpu_router(
                 kept_mass += weights[best];
                 kept++;
             }
+
+            /* A cache miss for a genuinely tiny route is the only cheap
+             * approximation worth considering on this machine: it avoids a
+             * 6.75 MiB SSD read while retaining every resident route and all
+             * material selected mass.  Unlike the mass floor above, this
+             * threshold is relative to the dominant route in *this* layer.
+             * It remains entirely opt-in because it changes model math. */
+            const char *drop_text =
+                getenv("DS4F_SPEED_CACHE_AWARE_DROP_MISS_BELOW_TOP_PCT");
+            if (drop_text && drop_text[0] && kept > 1u) {
+                char *drop_end = NULL;
+                const long drop_pct = strtol(drop_text, &drop_end, 10);
+                if (drop_end != drop_text && *drop_end == '\0' &&
+                    drop_pct >= 1 && drop_pct < 100) {
+                    float top_weight = 0.0f;
+                    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+                        if (keep[i] && weights[i] > top_weight) {
+                            top_weight = weights[i];
+                        }
+                    }
+                    const float drop_below =
+                        top_weight * (float)drop_pct / 100.0f;
+                    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+                        if (keep[i] &&
+                            (resident_mask & (1u << i)) == 0 &&
+                            weights[i] < drop_below && kept > 1u) {
+                            keep[i] = false;
+                            kept_mass -= weights[i];
+                            kept--;
+                        }
+                    }
+                }
+            }
             if (kept != 0 && kept < DS4_N_EXPERT_USED && kept_mass > 0.0f) {
                 uint32_t fallback = 0;
                 while (fallback < DS4_N_EXPERT_USED && !keep[fallback]) fallback++;
