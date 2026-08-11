@@ -34,8 +34,8 @@ run_quantizer() {
 plan=$(run_quantizer --dry-run)
 type_changes=$(printf '%s\n' "$plan" | sed -n 's/^type_changes: //p')
 file_bytes=$(printf '%s\n' "$plan" | sed -n 's/^approx_file_bytes: //p')
-if [ -z "$type_changes" ] || [ -z "$file_bytes" ] ||
-   [ "$type_changes" -le 0 ] || [ "$file_bytes" -ge 82853553024 ]; then
+if [ "$type_changes" != 258 ] || [ -z "$file_bytes" ] ||
+   [ "$file_bytes" -ge 82853553024 ]; then
     printf '%s\n' "$plan" >&2
     printf 'unexpected Q2-core dry-run contract: type_changes=%s file_bytes=%s\n' \
         "${type_changes:-missing}" "${file_bytes:-missing}" >&2
