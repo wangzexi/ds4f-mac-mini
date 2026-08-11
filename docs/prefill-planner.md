@@ -33,6 +33,8 @@ prompts read all experts in packed-file order. A KV-prefix hit additionally
 restores decayed Router-weight heat. Below the 256-token full-layer crossover,
 that heat selects 12/24/64 candidates. They are sorted by heat, then each
 eight-expert priority group is put in packed-file order for SSD locality.
+`DS4_METAL_PREFILL_HOT_EXPERT_PREFETCH_COUNT=0..256` overrides that number
+for reproducible Mini A/B measurements; normal service leaves it unset.
 
 The candidate reader publishes only fully-read expert slots. When the first
 real Router result for that layer arrives, it stops at the next slot boundary,

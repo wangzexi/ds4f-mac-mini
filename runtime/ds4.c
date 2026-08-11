@@ -19753,6 +19753,17 @@ static uint32_t metal_graph_prefill_expert_prefetch_count(
  * is becoming available, and can be discarded at the first expert boundary. */
 static uint32_t metal_graph_prefill_hot_expert_prefetch_count(
         uint32_t n_tokens) {
+    /* A measurement-only override for this fixed Mini.  Zero deliberately
+     * disables heat speculation so the same cached prefix can be benchmarked
+     * against exact demand loading. */
+    const char *env = getenv("DS4_METAL_PREFILL_HOT_EXPERT_PREFETCH_COUNT");
+    if (env && env[0]) {
+        char *end = NULL;
+        const unsigned long parsed = strtoul(env, &end, 10);
+        if (end != env && *end == '\0') {
+            return parsed >= DS4_N_EXPERT ? DS4_N_EXPERT : (uint32_t)parsed;
+        }
+    }
     if (n_tokens < 16u) return 12u;
     if (n_tokens < 64u) return 24u;
     if (n_tokens < 256u) return 64u;
