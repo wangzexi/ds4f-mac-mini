@@ -29,6 +29,13 @@ layer-major and exact. If no retained Decode map exists (server start, cold
 request, or an incompatible backend), Prefill uses the normal streamed-trunk
 path below.
 
+The dedicated `scripts/run-server.sh` additionally installs that same static
+map before it reports ready (`DS4F_SERVER_PRELOAD_STATIC_DECODE_TRUNK=1`). It
+is deliberately a single-session launcher policy: it spends an extra 4.60 GiB
+while idle and delays readiness by one sequential SSD read, then makes the
+first request use the retained-map path as well. Set the variable to `0` to
+recover lazy first-decode loading for measurements.
+
 | Prompt rows | Cold learned-router staging | KV-prefix heat staging |
 | ---: | ---: | ---: |
 | 1-255 | wait for Router, then exact-read | disabled by default (measured faster) |

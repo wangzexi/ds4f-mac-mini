@@ -36,6 +36,13 @@ e62ac715fd77449a655d2319b8c74b0cc0d11dd81067cccb640f4d89a689aa3d
 了 5.68 GiB 实际专家缓冲，低于 6.37 GiB Decode 预算。完整数值回归仍输出
 `6111 2004 28` 与 `23385 33951 6573 303`。
 
+同一启动器还会在监听前预读 Decode 的 90 个静态主干 span（4.60 GiB）。因此
+`server ready` 的含义是 L0 和完整 Decode 主干均已就绪；第一条请求直接以
+`static_trunk=reuse` 进入 exact Prefill，而不是在首 token 前再花约 2.3--2.6 秒
+读取主干。2026-08-12 的冷启动后 13-token 请求实测 prompt 7.20 s、首 token
+0.97 s、总计 8.16 s；同量级的 lazy-trunk 冷路径约 11 s。该策略只在单活跃会话
+启动器启用，可通过 `DS4F_SERVER_PRELOAD_STATIC_DECODE_TRUNK=0` 回退。
+
 这不是盲目锁死所有权重：相位规划按真实 Metal 缓冲字节数（包括 shared Prefill
 staging 与 slab 预留）而不是逻辑条目数判断。若下一阶段装不下，缓存仍会整体释放，
 以保证 16GB 机器不因保留热缓存进入内存压力。
@@ -108,6 +115,11 @@ Prefill 的尾部专家交接仍是独立的精确实验：
 0.70 t/s。它减少了首个实际 decode 的 SSD miss，但会占用全局 decode cache；
 32-token 连续生成尚未显示稳定净收益，故服务默认仍关闭。短提示只有一行可留，
 设为 18 与 6 得到相同集合，不能据此推断长尾效果。
+
+主干启动预热后的受控 A/B 也否决了较小交接：相同启动、相同预热、11-token
+prompt + 4-token exact 输出中，不交接为 2.73 s Decode；保留每层 6 个或仅 1 个
+tail expert 均约 4.70--4.76 s，输出文本相同。它会扰乱全局专家缓存的生命周期，
+故不应默认开启，即使其不改变数值。
 
 真实 server 的内存检查进一步否决了把它设为默认：5-token 输入、2-token输出时，
 开启 6-entry handoff 的进程 RSS 约为 7.1 GiB，而空闲默认服务约 2.0 GiB。
