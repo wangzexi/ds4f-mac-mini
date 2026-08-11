@@ -138,6 +138,14 @@ A/B。隔离 KV 目录、相同 13-token prompt 与 4-token greedy 输出 `您�
 6.35/2.50/8.85 s。输出完全一致但没有净收益，故保持关闭。它可在后续改变缓存实现后
 重新评估，但当前不应为了“首 token 命中”干扰全局 Decode cache。
 
+也完整复查了 CPU router 是否应回退到 GPU router。关闭
+`DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER` 后，正式 `check-production` 两组 greedy
+token-ID 回归都通过，短 4-token fixture 的输出与耗时也近似相同；但干净服务、5-token
+prompt、32-token greedy 输出的受控 A/B 明确显示 GPU router 为 3.54 s Prefill +
+19.31 s Decode（1.66 t/s），CPU router 为 3.53 s + 16.27 s（1.97 t/s），文本完全相同。
+GPU 路由的 selected-id readback/异步交接没有在该模型上抵消调度开销；CPU router 能在
+MoE 编码前直接给出 six experts，故仍为 Mini 的默认精确路径。
+
 ### 单会话 KV 与 L0 的独立性
 
 服务空闲时仍保留三个彼此独立的状态：完整 L0（256 experts）、静态 Decode 主干映射，
