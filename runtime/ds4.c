@@ -34229,9 +34229,6 @@ static bool metal_graph_prefill_deferred_full_expert_layer(
 
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t hc_bytes = hc_dim * sizeof(float);
-    const uint64_t mix_hc =
-        2ull * DS4_N_HC + (uint64_t)DS4_N_HC * DS4_N_HC;
-    const uint64_t hc_split_bytes = mix_hc * sizeof(float);
     const uint64_t norm_bytes = (uint64_t)DS4_N_EMBD * sizeof(float);
     const uint64_t selected_bytes =
         (uint64_t)DS4_N_EXPERT_USED * sizeof(int32_t);
@@ -34278,10 +34275,6 @@ static bool metal_graph_prefill_deferred_full_expert_layer(
                 (uint64_t)t * hc_bytes,
                 metal_graph_after_attn_hc(g), 0, hc_bytes) != 0;
         if (ok) ok = ds4_gpu_tensor_copy(
-                metal_graph_batch_hc_split(g),
-                (uint64_t)t * hc_split_bytes,
-                metal_graph_hc_split(g), 0, hc_split_bytes) != 0;
-        if (ok) ok = ds4_gpu_tensor_copy(
                 metal_graph_batch_ffn_norm(g),
                 (uint64_t)t * norm_bytes,
                 metal_graph_ffn_norm(g), 0, norm_bytes) != 0;
@@ -34323,10 +34316,6 @@ static bool metal_graph_prefill_deferred_full_expert_layer(
         ok = ds4_gpu_tensor_copy(metal_graph_after_attn_hc(g), 0,
                                  metal_graph_batch_after_attn_hc(g),
                                  (uint64_t)t * hc_bytes, hc_bytes) != 0;
-        if (ok) ok = ds4_gpu_tensor_copy(metal_graph_hc_split(g), 0,
-                                         metal_graph_batch_hc_split(g),
-                                         (uint64_t)t * hc_split_bytes,
-                                         hc_split_bytes) != 0;
         if (ok) ok = ds4_gpu_tensor_copy(metal_graph_ffn_norm(g), 0,
                                          metal_graph_batch_ffn_norm(g),
                                          (uint64_t)t * norm_bytes,
