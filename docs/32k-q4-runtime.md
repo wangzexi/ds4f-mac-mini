@@ -58,6 +58,11 @@ Decode 的 cache-hit/miss split 也以 950 槽 exact 路径重新测过。默认
 仅作诊断开关，不形成新的 balanced 档位。瓶颈仍是提高所保留专家的真实命中，
 不是在 miss 时再少算一个专家。
 
+解码时第 1、2 个 hash 路由层的专家可由 token ID 精确提前算出；也试过在
+前一层 MoE 执行期间预读这些 six-expert 集合。开/关在同一 950 槽 32-token
+trace 中完全一致，但 generation 都是 2.05 t/s。现有 selected-expert early
+load 已处于同一同步边界，额外读请求没有形成可用重叠，因此该实验未保留。
+
 ## 预填充 workspace 复用
 
 预填充是 layer-major：同一批 token 完成某层 attention 后才进入该层 FFN。因此 attention-only 和 FFN-only 中间 tensor 生命周期不重叠。`DS4_METAL_PREFILL_STAGE_ALIAS=1` 会释放独立 FFN batch buffer，并让它们成为已结束 attention buffer 的不重叠 view；KV、跨阶段 HC、权重和计算公式均不改变。
