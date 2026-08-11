@@ -14956,7 +14956,7 @@ static uint32_t ds4_gpu_stream_expert_layer_prefetch_reconcile_selected(
         const int32_t                     *selected_ids,
         uint32_t                           n_selected) {
     if (!table || !selected_ids || n_selected == 0 ||
-        n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED) {
+        n_selected > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
         return 0;
     }
     ds4_gpu_stream_expert_layer_prefetch *p =
@@ -16707,6 +16707,24 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                 unique_ids[unique_count++] = selected_id;
             }
         }
+    }
+    if (ok && unique_count != 0) {
+        /* The batch address-table path reads every Router choice at once.
+         * Reconcile its live speculative layer before building the unique
+         * cache set, so recovered candidates are ordinary cache hits below. */
+        const ds4_gpu_stream_expert_table table = {
+            .model_map = model_map,
+            .model_size = model_size,
+            .layer = layer,
+            .n_total_expert = n_total_expert,
+            .gate_offset = gate_offset,
+            .up_offset = up_offset,
+            .down_offset = down_offset,
+            .gate_expert_bytes = gate_expert_bytes,
+            .down_expert_bytes = down_expert_bytes,
+        };
+        (void)ds4_gpu_stream_expert_layer_prefetch_reconcile_selected(
+                &table, unique_ids, unique_count);
     }
     if (ok) {
         ds4_gpu_stream_expert_cache_maybe_decay_route_hotness();

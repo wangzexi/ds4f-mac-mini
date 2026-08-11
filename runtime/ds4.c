@@ -34218,8 +34218,12 @@ static bool metal_graph_prefill_layer_major_decode_rows(
                             hash_expert_counts[next],
                             il);
                 } else {
+                    /* Trunk reads can be queued further ahead because their
+                     * payload is small. Expert prediction is deliberately
+                     * one layer ahead: the Mini has one SSD queue, and
+                     * competing candidate layers defeat cancellation. */
                     for (uint32_t d = 1;
-                         d <= lookahead && il + d < DS4_N_LAYER;
+                         d <= 1u && il + d < DS4_N_LAYER;
                          d++) {
                         if (il + d < DS4_N_HASH_LAYER) continue;
                         (void)metal_graph_prefetch_prefill_expert_layer(
