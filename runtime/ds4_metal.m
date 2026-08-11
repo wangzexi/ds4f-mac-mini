@@ -13944,6 +13944,10 @@ static void ds4_gpu_stream_expert_cache_clear_entry(
 }
 
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
+    if (getenv("DS4_METAL_HASH_LAYER0_CACHE_TRACE") != NULL) {
+        fprintf(stderr, "ds4: hash-l0 clear-all entries=%u\n",
+                g_stream_expert_cache_layer_count[0]);
+    }
     ds4_gpu_stream_expert_pending_load_clear();
     g_stream_expert_cache_done_seq = g_stream_expert_cache_cb_seq;
     g_stream_expert_cache_batch_seq = 0;
@@ -15461,6 +15465,11 @@ static int ds4_gpu_stream_expert_cache_keep_hash_layer_zero(void) {
 
 void ds4_gpu_stream_expert_cache_release_layer(uint32_t layer) {
     if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return;
+    if (layer == 0 && getenv("DS4_METAL_HASH_LAYER0_CACHE_TRACE") != NULL) {
+        fprintf(stderr, "ds4: hash-l0 release-layer entries=%u keep=%d\n",
+                g_stream_expert_cache_layer_count[0],
+                ds4_gpu_stream_expert_cache_keep_hash_layer_zero());
+    }
     if (layer == 0 &&
         g_stream_expert_cache_layer_count[0] ==
             DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
@@ -16922,6 +16931,10 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
 
 static void ds4_gpu_stream_expert_cache_clear_layer(uint32_t layer) {
     if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return;
+    if (layer == 0 && getenv("DS4_METAL_HASH_LAYER0_CACHE_TRACE") != NULL) {
+        fprintf(stderr, "ds4: hash-l0 clear-layer entries=%u\n",
+                g_stream_expert_cache_layer_count[0]);
+    }
     for (uint32_t expert = 0;
          expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
          expert++) {
