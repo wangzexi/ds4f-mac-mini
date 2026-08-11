@@ -55,12 +55,6 @@ Holding three complete 1.69 GiB Metal expert layers produced different
 long-prompt logits on this machine; one layer ahead is byte-identical to demand
 loading and still reduced the measured 300-row run from 60.15 s to 40.11 s.
 
-The server uses the graph's full prefill capacity for an idle request (currently
-4,096 rows on the deployed 32K service), rather than arbitrarily slicing it at
-2,048 rows.  The per-request memory plan already owns that workspace.  When a
-different session is generating, it deliberately falls back to the small mixed
-prefill quantum so a long upload cannot monopolize decode latency.
-
 ## Explicit I/O and paging
 
 - Model and packed-expert descriptors use `F_NOCACHE`.

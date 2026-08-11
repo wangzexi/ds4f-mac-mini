@@ -8475,7 +8475,6 @@ struct server {
     int decode_pending;
     int active_generations;
     int mixed_prefill_quantum;
-    int idle_prefill_quantum;
     int last_prefill_slot;
     bool dynamic_memory_planner;
     bool memory_calibration;
@@ -10874,27 +10873,7 @@ static void server_prefill_leave(server *s) {
 
 static int server_prefill_quantum_for(const server *s,
                                       bool generation_active) {
-    if (!s) return 2048;
-    /* In the normal single-request case there is no fairness reason to split
-     * a prompt below the graph's actual prefill capacity.  Doing so makes the
-     * fixed-Mini runtime repeat the layer-major SSD pipeline (and its 43
-     * routed layers) for an otherwise fitting suffix.  The request memory
-     * planner has already reserved this exact workspace before sync begins.
-     *
-     * Keep the deliberately small mixed quantum when another request is
-    * decoding: then response latency, rather than standalone prefill
-    * throughput, is the scheduler's contract.  A null engine is retained as
-    * a conservative fallback for server-only unit tests. */
-    if (generation_active) return s->mixed_prefill_quantum;
-    /* The session owns the actual graph workspace.  Query it here rather
-     * than relying solely on the engine's construction-time default: the
-     * server may share or resize its prefill workspace while sessions are
-     * being created. */
-    if (s->slot_count == 1 && s->slots && s->slots[0].session) {
-        const int cap = ds4_session_prefill_cap(s->slots[0].session);
-        if (cap > 0) return cap;
-    }
-    return s->idle_prefill_quantum > 0 ? s->idle_prefill_quantum : 2048;
+    return generation_active ? s->mixed_prefill_quantum : 2048;
 }
 
 static int server_prefill_quantum(server *s) {
@@ -13598,9 +13577,6 @@ int main(int argc, char **argv) {
     s.slot_count = slot_count;
     s.batched_mode = cfg.batched_sessions > 0;
     s.mixed_prefill_quantum = cfg.mixed_prefill_quantum;
-    const uint32_t prefill_cap = ds4_engine_prefill_chunk(engine);
-    s.idle_prefill_quantum =
-        prefill_cap <= (uint32_t)INT_MAX ? (int)prefill_cap : 0;
     s.last_prefill_slot = slot_count - 1;
     s.default_tokens = cfg.default_tokens;
     s.disable_exact_dsml_tool_replay = cfg.disable_exact_dsml_tool_replay;
@@ -13885,10 +13861,7 @@ static void test_mixed_prefill_quantum_option(void) {
     server s = {.mixed_prefill_quantum = custom.mixed_prefill_quantum};
     TEST_ASSERT(server_prefill_quantum_for(&s, false) == 2048);
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 2048);
-    s.idle_prefill_quantum = 4096;
-    TEST_ASSERT(server_prefill_quantum_for(&s, false) == 4096);
     s.mixed_prefill_quantum = defaults.mixed_prefill_quantum;
-    TEST_ASSERT(server_prefill_quantum_for(&s, false) == 4096);
     TEST_ASSERT(server_prefill_quantum_for(&s, true) == 128);
 }
 
