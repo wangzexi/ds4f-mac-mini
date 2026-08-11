@@ -457,6 +457,7 @@ static int ds4_gpu_stream_expert_cache_entry_protected(
         uint32_t       protect_layer,
         const int32_t *protect_ids,
         uint32_t       n_protect);
+static int ds4_gpu_stream_expert_cache_keep_hash_layer_zero(void);
 
 /* The async selected-load worker registers itself so cache paths that would
  * flush/wait on command buffers (a race against the encoding thread) fail
@@ -14155,6 +14156,12 @@ static int ds4_gpu_stream_expert_cache_entry_protected(
                 &g_stream_expert_cache[layer][expert])) {
         return 1;
     }
+    if (layer == 0 &&
+        g_stream_expert_cache_layer_count[0] ==
+            DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
+        ds4_gpu_stream_expert_cache_keep_hash_layer_zero()) {
+        return 1;
+    }
     return layer == protect_layer &&
            ds4_gpu_stream_expert_cache_is_protected(expert,
                                                     protect_ids,
@@ -15443,8 +15450,23 @@ void ds4_gpu_stream_expert_layer_prefetch_cancel_all(void) {
     }
 }
 
+/* The fixed Mini server spends 1.69 GiB on an exact all-expert L0 preload.
+ * Unlike learned layers, L0 is token-id routed, so it is useful for every
+ * Prefill after a KV miss. The phase resize path still drops it if the next
+ * memory budget cannot hold the actual backing buffer. */
+static int ds4_gpu_stream_expert_cache_keep_hash_layer_zero(void) {
+    const char *value = getenv("DS4_METAL_KEEP_HASH_LAYER0");
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
 void ds4_gpu_stream_expert_cache_release_layer(uint32_t layer) {
     if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return;
+    if (layer == 0 &&
+        g_stream_expert_cache_layer_count[0] ==
+            DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
+        ds4_gpu_stream_expert_cache_keep_hash_layer_zero()) {
+        return;
+    }
     for (uint32_t expert = 0;
          expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
          expert++) {
@@ -15454,6 +15476,12 @@ void ds4_gpu_stream_expert_cache_release_layer(uint32_t layer) {
 
 void ds4_gpu_stream_expert_cache_release_layer_keep_recent(uint32_t layer,
                                                             uint32_t keep) {
+    if (layer == 0 &&
+        g_stream_expert_cache_layer_count[0] ==
+            DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
+        ds4_gpu_stream_expert_cache_keep_hash_layer_zero()) {
+        return;
+    }
     if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER || keep == 0) {
         ds4_gpu_stream_expert_cache_release_layer(layer);
         return;
