@@ -87,6 +87,26 @@ increasing the outer quantum is not a service Prefill speedup.  The
 `--idle-prefill-quantum` switch exists only to reproduce this calibration; its
 production default remains 2,048.
 
+## Decode-trunk handoff experiment
+
+After Prefill, the first decode transition normally maps 90 static trunk spans
+(4.60 GiB of I/O).  On this Mini that synchronous map takes about 2.32--2.64 s.
+`DS4_METAL_PREFILL_STATIC_DECODE_PREFETCH=1` starts that exact same explicit
+read while the final Prefill layer computes, then transfers the completed
+buffers to the normal decode-static map.  It does not change any tensor,
+Router decision, or logits.  The feature is off by default and is limited to
+at most 1,024 Prefill rows; the limit can be adjusted only for an explicit
+experiment with `DS4_METAL_PREFILL_STATIC_DECODE_PREFETCH_MAX_TOKENS`.
+
+On the 994-token server request, the 4.60 GiB read took 2.236 s but only
+8.5 ms remained exposed at the handoff; the direct runner produced the same
+first two greedy IDs as the unmodified path.  On a shorter roughly 250-token
+fixture, 1.420 s remained exposed: Prefill fell from 4.87 to 4.67 t/s, while
+the following two-token generation rose from 0.61 to 2.11 t/s.  Thus it can
+reduce total post-request latency for a long prompt, but it deliberately moves
+some work before the first streamed token.  It remains an opt-in long-prompt
+latency experiment rather than a default chat-server behavior.
+
 ## Rejected scheduler experiments
 
 The project retains a true-batch Prefill implementation for diagnostic work;
