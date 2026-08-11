@@ -13857,8 +13857,11 @@ static void ds4_gpu_stream_expert_cache_clear_entry_internal(
         &g_stream_expert_cache[layer][expert];
     if (!e->valid) return;
     if (layer == 0 && getenv("DS4_METAL_HASH_LAYER0_CACHE_TRACE") != NULL) {
-        fprintf(stderr, "ds4: hash-l0 clear-entry expert=%u entries=%u\n",
-                expert, g_stream_expert_cache_layer_count[0]);
+        fprintf(stderr,
+                "ds4: hash-l0 clear-entry expert=%u entries=%u eviction=%d "
+                "recycle=%d reuse=%d\n",
+                expert, g_stream_expert_cache_layer_count[0], count_eviction,
+                recycle_slab_slot, reuse != NULL);
     }
     if (ds4_gpu_stream_expert_cache_entry_inflight(e)) {
         return;
