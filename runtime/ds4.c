@@ -34269,7 +34269,17 @@ static bool metal_graph_prefill_layer_major_decode_rows(
         return false;
     }
 
-    if (g->ssd_streaming) {
+    /* A completed Decode already owns every non-routed tensor plus the token
+     * embedding and output head.  Retain that exact view across the next
+     * Prefill when the server admitted its memory footprint: replacing it
+     * with a token/layer view would force the next Decode to reread 4.60 GiB
+     * of unchanged trunk weights.  Routed experts retain their independent
+     * cache and continue to be scheduled per layer below. */
+    const bool reuse_static_decode_map = g->ssd_streaming &&
+        g->streaming_static_decode_map_current &&
+        metal_graph_stream_decode_static_map_enabled() &&
+        metal_graph_stream_decode_static_map_state_cache_enabled();
+    if (g->ssd_streaming && !reuse_static_decode_map) {
         g->streaming_static_decode_map_current = false;
         if (!metal_graph_stream_map_token(model, weights)) return false;
     }
@@ -34360,7 +34370,8 @@ static bool metal_graph_prefill_layer_major_decode_rows(
              * adopts the owned buffer filled while the preceding layer was
              * executing; a failed/disabled prefetch falls back to the exact
              * synchronous path. */
-            if (!ds4_gpu_model_prefetch_spans_activate(il) &&
+            if (!reuse_static_decode_map &&
+                !ds4_gpu_model_prefetch_spans_activate(il) &&
                 !metal_graph_stream_map_prefill_trunk(model, weights, il)) {
                 ok = false;
                 break;
@@ -34376,14 +34387,18 @@ static bool metal_graph_prefill_layer_major_decode_rows(
                                                                 weights,
                                                                 il);
             }
-            const uint32_t lookahead =
-                metal_graph_prefill_expert_prefetch_count(n_tokens) ==
-                    DS4_N_EXPERT ? 1u :
-                    metal_graph_prefill_prefetch_lookahead();
-            for (uint32_t d = 1; d <= lookahead && il + d < DS4_N_LAYER; d++) {
-                (void)metal_graph_prefetch_prefill_trunk(model,
-                                                         weights,
-                                                         il + d);
+            if (!reuse_static_decode_map) {
+                const uint32_t lookahead =
+                    metal_graph_prefill_expert_prefetch_count(n_tokens) ==
+                        DS4_N_EXPERT ? 1u :
+                        metal_graph_prefill_prefetch_lookahead();
+                for (uint32_t d = 1;
+                     d <= lookahead && il + d < DS4_N_LAYER;
+                     d++) {
+                    (void)metal_graph_prefetch_prefill_trunk(model,
+                                                             weights,
+                                                             il + d);
+                }
             }
             const uint32_t next = il + 1u;
             if (next < DS4_N_LAYER) {
@@ -34418,7 +34433,7 @@ static bool metal_graph_prefill_layer_major_decode_rows(
                     }
                 }
             }
-            if (il + 1u == DS4_N_LAYER) {
+            if (!reuse_static_decode_map && il + 1u == DS4_N_LAYER) {
                 static_decode_prefetch_started =
                     metal_graph_prefetch_decode_static_all(model,
                                                           weights,
@@ -34555,7 +34570,7 @@ static bool metal_graph_prefill_layer_major_decode_rows(
                 metal_graph_batch_cur_hc(g), n_tokens - 1u, hc_dim);
         ok = last_hc != NULL;
     }
-    if (ok && logits && g->ssd_streaming) {
+    if (ok && logits && g->ssd_streaming && !reuse_static_decode_map) {
         if (!static_decode_prefetch_installed) {
             g->streaming_static_decode_map_current = false;
         }
@@ -58564,6 +58579,21 @@ uint32_t ds4_engine_streaming_expert_cache_locked_count(ds4_engine *e) {
 #else
     (void)e;
     return 0;
+#endif
+}
+
+bool ds4_session_streaming_static_decode_map_current(ds4_session *s) {
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+    if (!s || !s->engine || !s->engine->ssd_streaming ||
+        s->engine->backend != DS4_BACKEND_METAL) {
+        return false;
+    }
+    return s->graph.streaming_static_decode_map_current &&
+        metal_graph_stream_decode_static_map_enabled() &&
+        metal_graph_stream_decode_static_map_state_cache_enabled();
+#else
+    (void)s;
+    return false;
 #endif
 }
 

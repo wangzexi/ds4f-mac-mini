@@ -8621,6 +8621,15 @@ static server_request_memory_plan server_build_request_memory_plan(
      * the complete non-routed trunk after its one-time phase transition. */
     plan.decode.resident_model_bytes =
         plan.decode.decode_resident_model_bytes;
+    const bool reuse_static_decode_map = uncached != 0 &&
+        slot && ds4_session_streaming_static_decode_map_current(slot->session);
+    if (reuse_static_decode_map) {
+        /* The exact Prefill path below will use the existing Decode map
+         * instead of replacing it. Price the whole trunk now so the expert
+         * cache shrinks before any new routed expert can be read. */
+        plan.prefill.resident_model_bytes =
+            plan.prefill.decode_resident_model_bytes;
+    }
     plan.valid = true;
     plan.prompt_tokens = prompt_tokens;
     plan.cached_tokens = cached_tokens;
@@ -8682,12 +8691,14 @@ static void server_memory_plan_begin_prefill(
             &plan->prefill,
             plan->prefill_workspace_bytes);
     server_log(DS4_LOG_PREFILL,
-               "ds4-server: memory plan prefill uncached=%d prompt=%d output=%d ctx=%d rows=%u base=%.2f GiB fixed_graph=%.2f MiB workspace=%.2f GiB logical_graph=%.2f MiB cache=%u/%.2f GiB pinned_target=%u/%.2f GiB locked_now=%u workspace_reacquired=%.2f GiB",
+               "ds4-server: memory plan prefill uncached=%d prompt=%d output=%d ctx=%d rows=%u static_trunk=%s base=%.2f GiB fixed_graph=%.2f MiB workspace=%.2f GiB logical_graph=%.2f MiB cache=%u/%.2f GiB pinned_target=%u/%.2f GiB locked_now=%u workspace_reacquired=%.2f GiB",
                plan->uncached_tokens,
                plan->prompt_tokens,
                plan->output_tokens,
                plan->planned_context_tokens,
                plan->prefill.prefill_tokens,
+               plan->prefill.resident_model_bytes ==
+                       plan->prefill.decode_resident_model_bytes ? "reuse" : "stream",
                (double)base / 1073741824.0,
                (double)plan->prefill.fixed_graph_bytes / 1048576.0,
                (double)plan->prefill_workspace_bytes / 1073741824.0,

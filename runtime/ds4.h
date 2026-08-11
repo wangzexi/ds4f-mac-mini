@@ -456,6 +456,9 @@ void ds4_session_rewind(ds4_session *s, int pos);
 int ds4_session_pos(ds4_session *s);
 int ds4_session_ctx(ds4_session *s);
 int ds4_session_prefill_cap(ds4_session *s);
+/* True when this session still owns the complete non-routed Decode trunk in
+ * the explicit-Metal model view. */
+bool ds4_session_streaming_static_decode_map_current(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
