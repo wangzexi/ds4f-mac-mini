@@ -17,8 +17,6 @@ out=$out_dir/DeepSeek-V4-Flash-0731-Mini-Q2CoreTrunk-IQ2Experts.gguf
 python=/cygdrive/c/Users/Zexi/AppData/Local/Programs/Python/Python312/python.exe
 restart_script='D:\ds4f-build\q2-tools\restart-hf-download.ps1'
 last_download_restart=$(date +%s)
-last_download_progress=$(date +%s)
-last_download_signature=
 
 win_bash() {
     ssh "$win_host" 'C:\cygwin64\bin\bash.exe -s' \
@@ -32,17 +30,22 @@ download_complete() {
     [[ $shard_count == 46 && -z $lock ]]
 }
 
-download_progress_signature() {
+download_progress_status() {
     win_bash "
 latest=\$(find '$hf_dir/.cache/huggingface/download' -type f -name '*.incomplete' \\
     -printf '%T@ %p\\n' 2>/dev/null | sort -nr | head -n 1)
 test -n \"\$latest\"
 path=\${latest#* }
 # Hugging Face can reserve the final logical file length before all bytes
-# arrive.  Blocks, size and mtime together are a progress signature: restart
-# only if none changes for a full watchdog interval.
+# arrive.  The mtime tracks actual writes; size and allocated blocks are kept
+# in the diagnostic output to distinguish a sparse reservation from payload.
 stat -c '%Y %s %b %n' \"\$path\"
 "
+}
+
+active_lock_mtime() {
+    win_bash "find '$hf_dir/.cache/huggingface/download' -type f -name '*.lock' \\
+        -printf '%T@\\n' -quit 2>/dev/null"
 }
 
 restart_stalled_download() {
@@ -56,17 +59,24 @@ while ! download_complete; do
     lock=$(win_bash "find '$hf_dir/.cache/huggingface/download' -type f -name '*.lock' -printf '%f\\n' -quit 2>/dev/null")
     printf 'waiting for official weights: shards=%s/46 active=%s\n' \
         "${shard_count:-0}" "${lock:-none}" >&2
-    if signature=$(download_progress_signature 2>/dev/null); then
+    if status=$(download_progress_status 2>/dev/null); then
+        read -r progress_mtime progress_size progress_blocks progress_path <<< "$status"
         now=$(date +%s)
-        if [[ $signature != "$last_download_signature" ]]; then
-            last_download_signature=$signature
-            last_download_progress=$now
-        elif (( now - last_download_progress >= 300 &&
-                now - last_download_restart >= 300 )); then
+        lock_mtime=$(active_lock_mtime 2>/dev/null || true)
+        lock_mtime=${lock_mtime%%.*}
+        # A new lock may appear shortly before its new incomplete file.  Give
+        # it two minutes before considering an older residual incomplete
+        # file; after that, a five-minute lack of real writes is a stall.
+        if [[ ${progress_mtime:-x} =~ ^[0-9]+$ &&
+              ${lock_mtime:-x} =~ ^[0-9]+$ &&
+              $((now - progress_mtime)) -ge 300 &&
+              $((now - lock_mtime)) -ge 120 &&
+              $((now - last_download_restart)) -ge 300 ]]; then
+            printf 'download stalled: payload_age=%ss lock_age=%ss size=%s blocks=%s\n' \\
+                "$((now - progress_mtime))" "$((now - lock_mtime))" \\
+                "${progress_size:-?}" "${progress_blocks:-?}" >&2
             restart_stalled_download
             last_download_restart=$(date +%s)
-            last_download_progress=$last_download_restart
-            last_download_signature=
         fi
     fi
     if [[ $wait_once == 1 ]]; then
