@@ -47,3 +47,51 @@ build.
 5. Mini baseline prompts are compared against the verified model before speed tuning.
 6. Runtime memory remains safe at a 32768-token context.
 7. Decode and prefill measurements report quality mode and expert-cache settings.
+
+## Experimental Q2 trunk candidates
+
+The Q4 deployment remains the only accepted production model.  Two Q2_K trunk
+candidates exist solely to test whether saved static-trunk memory can buy
+enough additional expert cache on this fixed M4/16GB machine to compensate for
+their quality loss.  Both retain the routed IQ2_XXS/Q2_K payload byte-for-byte;
+they therefore share the existing packed-expert sidecar only after its payload
+identity has been verified.
+
+- `scripts/build-q2-core-model.sh` changes 258 Q4_K tensors (attention Q/KV
+  projections and all shared-expert projections) to Q2_K.  It leaves the 86
+  attention-output projections and embedding/output heads at Q4_K, retaining
+  the specialized batched prefill kernels.  Expected raw reduction from Q4 is
+  655,196,160 bytes (0.610 GiB).
+- `scripts/build-q2-full-model.sh` changes all 346 Q4_K tensors to Q2_K for an
+  expected raw reduction of 1,579,745,280 bytes (1.471 GiB).  This is a more
+  aggressive candidate and can lose both quality and prefill speed.
+
+Build scripts require `HF_DIR`, `TEMPLATE`, and `OUT`; they abort unless their
+dry run reports exactly 258 or 346 changes respectively.  After building, run:
+
+```sh
+python3 tools/verify_q2_core_model.py --profile core "$TEMPLATE" "$OUT"
+python3 tools/verify_routed_copy.py "$TEMPLATE" "$OUT"
+```
+
+Use `--profile full` for the full candidate.  The second command is deliberately
+a full routed-payload scan, not a header-only comparison.
+
+Before considering a candidate for deployment, test it on Mini with the shared
+sidecar override enabled, record a current-Q4 fixed-suite baseline, then compare
+the candidate:
+
+```sh
+scripts/evaluate-fixed-greedy-suite.py ds4f-q4-speed Q4.gguf \
+  --out results/quality/q4-fixed-greedy.tsv --repeat 2
+
+DS4_METAL_STREAMING_EXPERT_PACK_PATH=IQ2Experts-packed.bin \
+DS4_METAL_STREAMING_EXPERT_PACK_ALLOW_SAME_EXPERTS=1 \
+scripts/evaluate-fixed-greedy-suite.py ds4f-q4-speed Q2-candidate.gguf \
+  --reference results/quality/q4-fixed-greedy.tsv \
+  --out results/quality/q2-fixed-greedy.tsv --repeat 2
+```
+
+The suite is a small deterministic divergence gate, not a claim of broad model
+quality.  The candidate must also pass a 32K memory-plan, prefill, and decode
+I/O A/B with an expert-cache ceiling above the old fixed 1,800-slot limit.
