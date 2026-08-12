@@ -1,0 +1,19 @@
+# Fixed single-turn Mini evaluation prompts.
+# One UTF-8 prompt per line.  This is deliberately small: it gates candidate
+# quantization before the longer manual quality pass, not a general benchmark.
+你好
+你是谁？请用一句话回答。
+用一句话解释为什么 1+1=2。
+计算 37 × 18，只输出结果。
+把“深度学习”翻译成英文。
+给“坚持”写一个不超过十五字的中文释义。
+用 Python 写一个返回斐波那契数列前 n 项的函数。
+解释 HTTP 404 的含义，不要超过两句。
+将下列单词按字母顺序排列：pear apple orange。
+写出 2 的 10 次方，只输出数字。
+What is the capital of Japan? Answer in one word.
+Summarize the purpose of a cache in one sentence.
+Return a JSON object with keys "name" and "ok"; set name to "mini" and ok to true.
+判断“所有鸟都会飞”是否正确，并说明一个反例。
+给一个简短建议：如何在不泄露隐私的前提下记录个人待办？
+Explain the difference between RAM and SSD in two short sentences.
