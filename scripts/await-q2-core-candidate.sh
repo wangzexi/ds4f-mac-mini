@@ -16,7 +16,10 @@ out_dir=/cygdrive/d/ds4f-build/q2-candidates
 out=$out_dir/DeepSeek-V4-Flash-0731-Mini-Q2CoreTrunk-IQ2Experts.gguf
 python=/cygdrive/c/Users/Zexi/AppData/Local/Programs/Python/Python312/python.exe
 restart_script='D:\ds4f-build\q2-tools\restart-hf-download.ps1'
-last_download_restart=$(date +%s)
+# A monitor restart must not add another blind five-minute interval to a
+# download that was already stuck.  Once *this* monitor has restarted the
+# downloader, the timestamp below provides the normal retry cooldown.
+last_download_restart=0
 
 win_bash() {
     ssh "$win_host" 'C:\cygwin64\bin\bash.exe -s' \
