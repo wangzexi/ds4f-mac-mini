@@ -16,6 +16,12 @@ The D-drive template is consumed sequentially for routed tensors. It must not
 be used as the Hugging Face source directory because shard and tensor lookup can
 be random.
 
+The development-Mac CLI `scripts/resume-template-to-windows.sh` copies the
+immutable Mini Q4/IQ2 template to `D:\ds4f-build\template` through an SSH
+stream with a MiB-aligned resume point and final SHA-256 check.  It does not
+stage model data on the development Mac, never overwrites an existing validated
+destination, and refuses to run while Hugging Face download lock files exist.
+
 ## Reproducibility inputs
 
 - Official repository: `deepseek-ai/DeepSeek-V4-Flash`
