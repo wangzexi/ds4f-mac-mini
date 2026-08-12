@@ -4,8 +4,8 @@ set -eu
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 runtime_dir="$project_dir/runtime"
-model="$project_dir/models/DeepSeek-V4-Flash-0731-Mini-Q4Trunk-IQ2Experts.gguf"
-pack="$project_dir/models/DeepSeek-V4-Flash-0731-IQ2Experts-packed.bin"
+model=${DS4F_SERVER_MODEL:-"$project_dir/models/DeepSeek-V4-Flash-0731-Mini-Q4Trunk-IQ2Experts.gguf"}
+pack=${DS4F_SERVER_EXPERT_PACK:-"$project_dir/models/DeepSeek-V4-Flash-0731-IQ2Experts-packed.bin"}
 
 host=${DS4F_SERVER_HOST:-0.0.0.0}
 port=${DS4F_SERVER_PORT:-8000}
@@ -22,6 +22,7 @@ kv_cache_mib=${DS4F_SERVER_KV_CACHE_MIB:-10240}
 kv_cache_min_tokens=${DS4F_SERVER_KV_CACHE_MIN_TOKENS:-1}
 prefill_measurements=${DS4F_SERVER_PREFILL_MEASUREMENTS:-$project_dir/cache/prefill-measurements.tsv}
 preload_static_decode=${DS4F_SERVER_PRELOAD_STATIC_DECODE_TRUNK:-1}
+allow_shared_expert_sidecar=${DS4F_SERVER_ALLOW_SHARED_EXPERT_SIDECAR:-0}
 
 if [ ! -x "$project_dir/ds4f-server" ]; then
     echo "missing ds4f-server; run: make server" >&2
@@ -31,6 +32,22 @@ if [ ! -r "$model" ] || [ ! -r "$pack" ]; then
     echo "fixed model or packed expert sidecar is missing from $project_dir/models" >&2
     exit 1
 fi
+
+# A Q2 trunk candidate has a different GGUF total size but can reuse the
+# byte-identical routed-expert sidecar.  This is opt-in only after the full
+# routed-payload verifier has passed; production always keeps strict matching.
+case "$allow_shared_expert_sidecar" in
+    0)
+        unset DS4_METAL_STREAMING_EXPERT_PACK_ALLOW_SAME_EXPERTS
+        ;;
+    1)
+        export DS4_METAL_STREAMING_EXPERT_PACK_ALLOW_SAME_EXPERTS=1
+        ;;
+    *)
+        echo "DS4F_SERVER_ALLOW_SHARED_EXPERT_SIDECAR must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
 
 cd "$runtime_dir"
 exec env \
