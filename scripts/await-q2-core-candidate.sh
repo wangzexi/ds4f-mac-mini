@@ -17,6 +17,8 @@ out=$out_dir/DeepSeek-V4-Flash-0731-Mini-Q2CoreTrunk-IQ2Experts.gguf
 python=/cygdrive/c/Users/Zexi/AppData/Local/Programs/Python/Python312/python.exe
 restart_script='D:\ds4f-build\q2-tools\restart-hf-download.ps1'
 last_download_restart=$(date +%s)
+last_download_progress=$(date +%s)
+last_download_signature=
 
 win_bash() {
     ssh "$win_host" 'C:\cygwin64\bin\bash.exe -s' \
@@ -30,20 +32,21 @@ download_complete() {
     [[ $shard_count == 46 && -z $lock ]]
 }
 
-download_stall_age() {
+download_progress_signature() {
     win_bash "
 latest=\$(find '$hf_dir/.cache/huggingface/download' -type f -name '*.incomplete' \\
-    -printf '%T@ %s\\n' 2>/dev/null | sort -nr | head -n 1)
-set -- \$latest
-if test \$# -ne 2; then exit 1; fi
-now=\$(date +%s)
-mtime=\${1%.*}
-printf '%s %s\\n' \$((now - mtime)) \$2
+    -printf '%T@ %p\\n' 2>/dev/null | sort -nr | head -n 1)
+test -n \"\$latest\"
+path=\${latest#* }
+# Hugging Face can reserve the final logical file length before all bytes
+# arrive.  Blocks, size and mtime together are a progress signature: restart
+# only if none changes for a full watchdog interval.
+stat -c '%Y %s %b %n' \"\$path\"
 "
 }
 
 restart_stalled_download() {
-    printf 'restarting zero-byte stalled official download\n' >&2
+    printf 'restarting persistently stalled official download\n' >&2
     ssh "$win_host" \
         "powershell -NoProfile -ExecutionPolicy Bypass -File $restart_script"
 }
@@ -53,13 +56,17 @@ while ! download_complete; do
     lock=$(win_bash "find '$hf_dir/.cache/huggingface/download' -type f -name '*.lock' -printf '%f\\n' -quit 2>/dev/null")
     printf 'waiting for official weights: shards=%s/46 active=%s\n' \
         "${shard_count:-0}" "${lock:-none}" >&2
-    if status=$(download_stall_age 2>/dev/null); then
-        set -- $status
+    if signature=$(download_progress_signature 2>/dev/null); then
         now=$(date +%s)
-        if [[ ${1:-0} =~ ^[0-9]+$ && ${2:-1} == 0 && $1 -ge 300 &&
-              $((now - last_download_restart)) -ge 300 ]]; then
+        if [[ $signature != "$last_download_signature" ]]; then
+            last_download_signature=$signature
+            last_download_progress=$now
+        elif (( now - last_download_progress >= 300 &&
+                now - last_download_restart >= 300 )); then
             restart_stalled_download
             last_download_restart=$(date +%s)
+            last_download_progress=$last_download_restart
+            last_download_signature=
         fi
     fi
     if [[ $wait_once == 1 ]]; then
