@@ -15,6 +15,8 @@ tools_dir=/cygdrive/d/ds4f-build/q2-tools
 out_dir=/cygdrive/d/ds4f-build/q2-candidates
 out=$out_dir/DeepSeek-V4-Flash-0731-Mini-Q2CoreTrunk-IQ2Experts.gguf
 python=/cygdrive/c/Users/Zexi/AppData/Local/Programs/Python/Python312/python.exe
+restart_script='D:\ds4f-build\q2-tools\restart-hf-download.ps1'
+last_download_restart=$(date +%s)
 
 win_bash() {
     ssh "$win_host" 'C:\cygwin64\bin\bash.exe -s' \
@@ -28,11 +30,38 @@ download_complete() {
     [[ $shard_count == 46 && -z $lock ]]
 }
 
+download_stall_age() {
+    win_bash "
+latest=\$(find '$hf_dir/.cache/huggingface/download' -type f -name '*.incomplete' \\
+    -printf '%T@ %s\\n' 2>/dev/null | sort -nr | head -n 1)
+set -- \$latest
+if test \$# -ne 2; then exit 1; fi
+now=\$(date +%s)
+mtime=\${1%.*}
+printf '%s %s\\n' \$((now - mtime)) \$2
+"
+}
+
+restart_stalled_download() {
+    printf 'restarting zero-byte stalled official download\n' >&2
+    ssh "$win_host" \
+        "powershell -NoProfile -ExecutionPolicy Bypass -File $restart_script"
+}
+
 while ! download_complete; do
     shard_count=$(win_bash "find '$hf_dir' -maxdepth 1 -type f -name 'model-*-of-00046.safetensors' | wc -l")
     lock=$(win_bash "find '$hf_dir/.cache/huggingface/download' -type f -name '*.lock' -printf '%f\\n' -quit 2>/dev/null")
     printf 'waiting for official weights: shards=%s/46 active=%s\n' \
         "${shard_count:-0}" "${lock:-none}" >&2
+    if status=$(download_stall_age 2>/dev/null); then
+        set -- $status
+        now=$(date +%s)
+        if [[ ${1:-0} =~ ^[0-9]+$ && ${2:-1} == 0 && $1 -ge 300 &&
+              $((now - last_download_restart)) -ge 300 ]]; then
+            restart_stalled_download
+            last_download_restart=$(date +%s)
+        fi
+    fi
     if [[ $wait_once == 1 ]]; then
         exit 4
     fi
