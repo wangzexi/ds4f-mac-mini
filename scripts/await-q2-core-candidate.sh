@@ -75,8 +75,8 @@ while ! download_complete; do
               $((now - progress_mtime)) -ge 300 &&
               $((now - lock_mtime)) -ge 120 &&
               $((now - last_download_restart)) -ge 300 ]]; then
-            printf 'download stalled: payload_age=%ss lock_age=%ss size=%s blocks=%s\n' \\
-                "$((now - progress_mtime))" "$((now - lock_mtime))" \\
+            printf 'download stalled: payload_age=%ss lock_age=%ss size=%s blocks=%s\n' \
+                "$((now - progress_mtime))" "$((now - lock_mtime))" \
                 "${progress_size:-?}" "${progress_blocks:-?}" >&2
             restart_stalled_download
             last_download_restart=$(date +%s)
