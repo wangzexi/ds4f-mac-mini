@@ -3795,11 +3795,15 @@ uint32_t ds4_gpu_resize_streaming_expert_cache_budget(
             (uint64_t)experts * g_stream_expert_cache_expert_bytes : 0;
     g_stream_expert_cache_budget_override = experts;
     g_stream_expert_cache_mlock_budget_override = pinned_experts;
-    if (pinned_experts > old_mlock_budget) {
-        /* A larger phase follows a smaller prefill phase after its purgeable
-         * workspace has been discarded. A cap learned while that workspace
-         * was resident is stale, so allow one fresh kernel-accounted attempt. */
-        g_stream_expert_cache_mlock_budget_cap = 0;
+    if (pinned_experts > old_mlock_budget &&
+        g_stream_expert_cache_mlock_budget_cap == 0) {
+        /* No kernel limit has been observed yet, so the larger Decode phase
+         * may establish its wired tier after Prefill releases its workspace.
+         * Once mlock has rejected a slot, however, its measured cap is an
+         * operating-system constraint, not a per-phase estimate.  Preserve it
+         * across subsequent Prefill -> Decode transitions: those transitions
+         * otherwise clear the cap and reattempt the same failing slot on every
+         * request.  Above the cap the expert cache remains valid but pageable. */
         g_stream_expert_cache_mlock_warned = 0;
     }
     if (release_resident && shrinking_total &&
