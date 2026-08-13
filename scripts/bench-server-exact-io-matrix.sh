@@ -50,10 +50,13 @@ cleanup() {
     fi
     rm -rf "$tmp_dir"
 }
-# A benchmark is usually driven over SSH.  Treat a dropped controller
-# connection exactly like an interrupt so its private server cannot outlive
-# the measurement and block the production server's restart.
-trap cleanup EXIT HUP INT TERM
+# A benchmark is usually driven over SSH.  A signal handler must explicitly
+# exit after cleanup: merely returning from a HUP trap lets Bash continue the
+# loop and leaves a later private server alive after the controller is gone.
+trap cleanup EXIT
+trap 'cleanup; exit 129' HUP
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 printf 'prompt=%q\ntokens=%s\ncache_experts=%s\nrepeats=%s\nthreads=%s\nport=%s\n' \
     "$prompt" "$tokens" "$cache_experts" "$repeats" "$threads_csv" "$port" \
