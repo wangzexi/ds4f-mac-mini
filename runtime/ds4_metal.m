@@ -14276,15 +14276,6 @@ static int ds4_gpu_stream_expert_cache_is_protected(
     return 0;
 }
 
-/* Diagnostic policy switch for the fixed Mini: keep the exact model path and
- * SSD request order unchanged, altering only which already-cached expert is
- * reused when the slab is full.  It is deliberately opt-in until a real
- * server A/B confirms that recency beats the persisted route-weight heat. */
-static int ds4_gpu_stream_expert_cache_lru_requested(void) {
-    const char *value = getenv("DS4_METAL_STREAMING_EXPERT_CACHE_LRU");
-    return value && value[0] && strcmp(value, "0") != 0;
-}
-
 static void ds4_gpu_stream_expert_cache_prune_layer(
         uint32_t layer,
         uint32_t n_total_expert,
@@ -14306,7 +14297,6 @@ static void ds4_gpu_stream_expert_cache_prune_layer(
         uint32_t victim = UINT32_MAX;
         float lowest_hotness = FLT_MAX;
         uint64_t oldest = UINT64_MAX;
-        const int lru = ds4_gpu_stream_expert_cache_lru_requested();
         for (uint32_t expert = 0; expert < n_total_expert; expert++) {
             ds4_gpu_stream_expert_cache_entry *e =
                 &g_stream_expert_cache[layer][expert];
@@ -14317,9 +14307,8 @@ static void ds4_gpu_stream_expert_cache_prune_layer(
             }
             const float hotness =
                 g_stream_expert_cache_route_hotness[layer][expert];
-            if ((lru && e->last_used < oldest) ||
-                (!lru && (hotness < lowest_hotness ||
-                          (hotness == lowest_hotness && e->last_used < oldest)))) {
+            if (hotness < lowest_hotness ||
+                (hotness == lowest_hotness && e->last_used < oldest)) {
                 lowest_hotness = hotness;
                 oldest = e->last_used;
                 victim = expert;
@@ -14396,7 +14385,6 @@ retry:
     uint32_t victim_expert = UINT32_MAX;
     float lowest_hotness = FLT_MAX;
     uint64_t oldest = UINT64_MAX;
-    const int lru = ds4_gpu_stream_expert_cache_lru_requested();
     int skipped_inflight = 0;
     const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
     const double scan_t0 = timing ? ds4_gpu_now_ms() : 0.0;
@@ -14428,9 +14416,8 @@ retry:
             }
             const float hotness =
                 g_stream_expert_cache_route_hotness[layer][expert];
-            if ((lru && e->last_used < oldest) ||
-                (!lru && (hotness < lowest_hotness ||
-                          (hotness == lowest_hotness && e->last_used < oldest)))) {
+            if (hotness < lowest_hotness ||
+                (hotness == lowest_hotness && e->last_used < oldest)) {
                 lowest_hotness = hotness;
                 oldest = e->last_used;
                 victim_layer = layer;
@@ -14516,7 +14503,6 @@ retry:
     uint64_t victim_last_used[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
     uint32_t victim_count = 0;
     int skipped_inflight = 0;
-    const int lru = ds4_gpu_stream_expert_cache_lru_requested();
     const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
     const double scan_t0 = timing ? ds4_gpu_now_ms() : 0.0;
     uint64_t scan_entries = 0;
@@ -14567,19 +14553,15 @@ retry:
 
             uint32_t worst = 0;
             for (uint32_t i = 1; i < victim_count; i++) {
-                if ((lru && victim_last_used[i] > victim_last_used[worst]) ||
-                    (!lru &&
-                     (victim_hotness[i] > victim_hotness[worst] ||
-                      (victim_hotness[i] == victim_hotness[worst] &&
-                       victim_last_used[i] > victim_last_used[worst])))) {
+                if (victim_hotness[i] > victim_hotness[worst] ||
+                    (victim_hotness[i] == victim_hotness[worst] &&
+                     victim_last_used[i] > victim_last_used[worst])) {
                     worst = i;
                 }
             }
-            if ((lru && last_used < victim_last_used[worst]) ||
-                (!lru &&
-                 (hotness < victim_hotness[worst] ||
-                  (hotness == victim_hotness[worst] &&
-                   last_used < victim_last_used[worst])))) {
+            if (hotness < victim_hotness[worst] ||
+                (hotness == victim_hotness[worst] &&
+                 last_used < victim_last_used[worst])) {
                 victim_layers[worst] = layer;
                 victim_experts[worst] = expert;
                 victim_hotness[worst] = hotness;
@@ -14951,7 +14933,6 @@ static void ds4_gpu_stream_expert_cache_prune_global(
         uint32_t victim_expert = UINT32_MAX;
         float lowest_hotness = FLT_MAX;
         uint64_t oldest = UINT64_MAX;
-        const int lru = ds4_gpu_stream_expert_cache_lru_requested();
         for (uint32_t layer = 0;
              layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
              layer++) {
@@ -14970,9 +14951,8 @@ static void ds4_gpu_stream_expert_cache_prune_global(
                 }
                 const float hotness =
                     g_stream_expert_cache_route_hotness[layer][expert];
-            if ((lru && e->last_used < oldest) ||
-                (!lru && (hotness < lowest_hotness ||
-                          (hotness == lowest_hotness && e->last_used < oldest)))) {
+                if (hotness < lowest_hotness ||
+                    (hotness == lowest_hotness && e->last_used < oldest)) {
                     lowest_hotness = hotness;
                     oldest = e->last_used;
                     victim_layer = layer;
