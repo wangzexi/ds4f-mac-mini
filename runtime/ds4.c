@@ -30520,12 +30520,6 @@ static bool metal_graph_encode_layer_batch(
     return ok;
 }
 
-static void metal_graph_decode_prefetch_hash_layers(
-        const ds4_gpu_graph *g,
-        const ds4_model     *model,
-        const ds4_weights   *weights,
-        int                  token);
-
 static bool metal_graph_eval_token_raw_swa_streaming(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -30549,11 +30543,6 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
     metal_graph_dspark_capture_begin(g);
-
-    /* The streaming Decode entry point is used by the fixed Mini server,
-     * including its layer-batched static-map path.  Start the exact L0/L1/L2
-     * token-id routes here, before the first command buffer is encoded. */
-    metal_graph_decode_prefetch_hash_layers(g, model, weights, token);
 
     const bool static_decode_map = metal_graph_stream_decode_static_map_enabled();
     const bool static_map_state_cache =
@@ -31231,72 +31220,6 @@ typedef struct {
  * This remains opt-in until an end-to-end greedy trace establishes that the
  * extra cache handoff has no scheduler-sensitive side effect on the Mini.
  */
-static bool metal_graph_decode_hash_prefetch_requested(void) {
-    return getenv("DS4_METAL_ENABLE_DECODE_HASH_PREFETCH") != NULL &&
-           getenv("DS4_METAL_DISABLE_DECODE_HASH_PREFETCH") == NULL;
-}
-
-static uint32_t metal_graph_decode_hash_prefetch_mask(uint32_t hash_layers) {
-    /* The fixed Mini has three hash layers.  A bitmask keeps the A/B surface
-     * narrow: 1=L0, 2=L1, 4=L2.  The default requests all known hash layers;
-     * experiments can isolate the useful lookahead without changing code. */
-    uint32_t mask = hash_layers >= 32u ? UINT32_MAX :
-        ((1u << hash_layers) - 1u);
-    const char *env = getenv("DS4_METAL_DECODE_HASH_PREFETCH_MASK");
-    if (!env || !env[0]) return mask;
-    char *end = NULL;
-    const unsigned long value = strtoul(env, &end, 0);
-    if (end == env || *end != '\0' || value > UINT32_MAX) return mask;
-    return (uint32_t)value & mask;
-}
-
-static void metal_graph_decode_prefetch_hash_layers(
-        const ds4_gpu_graph *g,
-        const ds4_model     *model,
-        const ds4_weights   *weights,
-        int                  token) {
-    if (!metal_graph_decode_hash_prefetch_requested() ||
-        !g || !g->ssd_streaming || !model || !weights ||
-        token < 0 || (uint32_t)token >= DS4_N_VOCAB) {
-        return;
-    }
-
-    const uint32_t hash_layers =
-        DS4_N_HASH_LAYER < DS4_N_LAYER ? DS4_N_HASH_LAYER : DS4_N_LAYER;
-    const uint32_t mask = metal_graph_decode_hash_prefetch_mask(hash_layers);
-    for (uint32_t il = 0; il < hash_layers; il++) {
-        if ((mask & (1u << il)) == 0) continue;
-        const ds4_layer_weights *layer = &weights->layer[il];
-        if (!layer->ffn_gate_tid2eid || !layer->ffn_gate_exps ||
-            !layer->ffn_up_exps || !layer->ffn_down_exps) {
-            continue;
-        }
-        uint64_t gate_expert_bytes = 0;
-        uint64_t down_expert_bytes = 0;
-        if (!streaming_layer_gate_down_expert_bytes(layer,
-                                                    &gate_expert_bytes,
-                                                    &down_expert_bytes)) {
-            continue;
-        }
-
-        int selected[DS4_MAX_EXPERT_USED];
-        int32_t selected_i32[DS4_MAX_EXPERT_USED];
-        layer_hash_selected_experts(selected, model, layer, token);
-        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
-            selected_i32[i] = (int32_t)selected[i];
-        }
-        const ds4_gpu_stream_expert_table table =
-            graph_stream_expert_table_make(model, layer, il,
-                                           gate_expert_bytes,
-                                           down_expert_bytes);
-        /* A cache reservation can legitimately lose a race with a prior
-         * Decode load.  The normal per-layer exact load remains authoritative
-         * in that case, so a missed speculative opportunity is not an error. */
-        (void)ds4_gpu_stream_expert_layer_prefetch_begin(
-                &table, selected_i32, DS4_N_EXPERT_USED, UINT32_MAX);
-    }
-}
-
 /* Greedy verifier helper.  Speculative decoding only needs the target model's
  * top token after most accepted draft rows; the full vocabulary row is needed
  * once, for the final committed state that normal sampling will continue from.
@@ -31315,8 +31238,6 @@ static bool metal_graph_eval_token_raw_swa_top(
         bool                   force_fast_attention) {
     if (!top_id) return false;
     if (top2) memset(top2, 0, sizeof(*top2));
-
-    metal_graph_decode_prefetch_hash_layers(g, model, weights, token);
 
     const bool fast_attention =
         allow_split_top1 &&
