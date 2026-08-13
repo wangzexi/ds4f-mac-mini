@@ -11895,6 +11895,11 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     if (getenv("DS4_SERVER_EXPERT_HEAT_PREDICTION_PROFILE") != NULL) {
         ds4_gpu_stream_expert_cache_heat_prediction_profile_begin();
     }
+    if (getenv("DS4_METAL_STREAMING_EXPERT_CHURN_PROFILE") != NULL) {
+        /* Decode boundary only: counter reset after Prefill, without changing
+         * the cache, its heat, or the eviction policy. */
+        ds4_gpu_stream_expert_cache_churn_profile_begin_decode();
+    }
     if (cold_store_len == prompt_for_sync->len) {
         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
                                        cold_store_len, "cold")) {
@@ -12684,6 +12689,9 @@ decode_again:
     }
     if (getenv("DS4_SERVER_EXPERT_HEAT_PREDICTION_PROFILE") != NULL) {
         ds4_gpu_stream_expert_cache_heat_prediction_profile_print();
+    }
+    if (getenv("DS4_METAL_STREAMING_EXPERT_CHURN_PROFILE") != NULL) {
+        ds4_gpu_stream_expert_cache_churn_profile_print_decode();
     }
     /* The network response is already complete at this point.  Persist the
      * exact post-response frontier before the worker accepts another request,

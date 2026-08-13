@@ -229,6 +229,10 @@ void ds4_gpu_stream_expert_cache_note_route_weights(
         const int32_t *selected_ids,
         const float   *selected_weights,
         uint32_t       n_selected);
+/* Decode-only cache-churn diagnostic.  These calls merely collect counters:
+ * they do not change expert residency, route heat, or eviction policy. */
+void ds4_gpu_stream_expert_cache_churn_profile_begin_decode(void);
+void ds4_gpu_stream_expert_cache_churn_profile_print_decode(void);
 /* Diagnostic-only: snapshot the current route-weight heat, then report how
  * well that immutable snapshot predicted Decode's subsequently selected
  * experts.  Used to decide whether heat-based Decode preloading can repay its

@@ -691,6 +691,25 @@ static uint64_t g_stream_expert_cache_layer_last_pread_bytes[DS4_METAL_STREAM_EX
 static double g_stream_expert_cache_layer_last_pread_ms[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static float
     g_stream_expert_cache_route_hotness[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+/* Decode-only churn profile.  A "one-shot" entry was installed during the
+ * measured Decode, then evicted before its cache entry got a second lookup.
+ * Keep a pending bit after that eviction so a later install of the same
+ * (layer, expert) measures the avoidable read-back directly. */
+static int g_stream_expert_cache_churn_profile_active;
+static uint8_t
+    g_stream_expert_cache_churn_profile_loaded[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+static uint8_t
+    g_stream_expert_cache_churn_profile_one_shot_pending[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+static uint64_t g_stream_expert_cache_churn_profile_loads;
+static uint64_t g_stream_expert_cache_churn_profile_evictions;
+static uint64_t g_stream_expert_cache_churn_profile_one_shot_evictions;
+static uint64_t g_stream_expert_cache_churn_profile_one_shot_quick_evictions;
+static uint64_t g_stream_expert_cache_churn_profile_one_shot_reloads;
+static uint64_t g_stream_expert_cache_churn_profile_one_shot_reload_bytes;
+static uint64_t
+    g_stream_expert_cache_churn_profile_layer_one_shot_evictions[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static uint64_t
+    g_stream_expert_cache_churn_profile_layer_one_shot_reloads[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_cache_gate_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_cache_up_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_cache_down_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
@@ -13306,6 +13325,64 @@ void ds4_gpu_stream_expert_cache_note_route_weights(
             layer, selected_ids, selected_weights, n_selected, 0);
 }
 
+void ds4_gpu_stream_expert_cache_churn_profile_begin_decode(void) {
+    g_stream_expert_cache_churn_profile_active = 1;
+    memset(g_stream_expert_cache_churn_profile_loaded,
+           0,
+           sizeof(g_stream_expert_cache_churn_profile_loaded));
+    memset(g_stream_expert_cache_churn_profile_one_shot_pending,
+           0,
+           sizeof(g_stream_expert_cache_churn_profile_one_shot_pending));
+    memset(g_stream_expert_cache_churn_profile_layer_one_shot_evictions,
+           0,
+           sizeof(g_stream_expert_cache_churn_profile_layer_one_shot_evictions));
+    memset(g_stream_expert_cache_churn_profile_layer_one_shot_reloads,
+           0,
+           sizeof(g_stream_expert_cache_churn_profile_layer_one_shot_reloads));
+    g_stream_expert_cache_churn_profile_loads = 0;
+    g_stream_expert_cache_churn_profile_evictions = 0;
+    g_stream_expert_cache_churn_profile_one_shot_evictions = 0;
+    g_stream_expert_cache_churn_profile_one_shot_quick_evictions = 0;
+    g_stream_expert_cache_churn_profile_one_shot_reloads = 0;
+    g_stream_expert_cache_churn_profile_one_shot_reload_bytes = 0;
+}
+
+void ds4_gpu_stream_expert_cache_churn_profile_print_decode(void) {
+    if (!g_stream_expert_cache_churn_profile_active) return;
+    const double one_shot_fraction =
+        g_stream_expert_cache_churn_profile_loads != 0 ?
+        (double)g_stream_expert_cache_churn_profile_one_shot_evictions /
+            (double)g_stream_expert_cache_churn_profile_loads : 0.0;
+    const double reload_fraction =
+        g_stream_expert_cache_churn_profile_one_shot_evictions != 0 ?
+        (double)g_stream_expert_cache_churn_profile_one_shot_reloads /
+            (double)g_stream_expert_cache_churn_profile_one_shot_evictions : 0.0;
+    fprintf(stderr,
+            "ds4: decode cache churn loads=%llu evictions=%llu one_shot_evictions=%llu (%.3f of loads, quick<=6-lookups=%llu) one_shot_reloads=%llu (%.3f of one-shot) logical_reread=%.2f GiB\n",
+            (unsigned long long)g_stream_expert_cache_churn_profile_loads,
+            (unsigned long long)g_stream_expert_cache_churn_profile_evictions,
+            (unsigned long long)g_stream_expert_cache_churn_profile_one_shot_evictions,
+            one_shot_fraction,
+            (unsigned long long)g_stream_expert_cache_churn_profile_one_shot_quick_evictions,
+            (unsigned long long)g_stream_expert_cache_churn_profile_one_shot_reloads,
+            reload_fraction,
+            ds4_gpu_gib(g_stream_expert_cache_churn_profile_one_shot_reload_bytes));
+    for (uint32_t layer = 0;
+         layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
+         layer++) {
+        const uint64_t evictions =
+            g_stream_expert_cache_churn_profile_layer_one_shot_evictions[layer];
+        const uint64_t reloads =
+            g_stream_expert_cache_churn_profile_layer_one_shot_reloads[layer];
+        if (evictions == 0 && reloads == 0) continue;
+        fprintf(stderr,
+                "ds4:   decode cache churn layer=%u one_shot_evictions=%llu one_shot_reloads=%llu\n",
+                layer,
+                (unsigned long long)evictions,
+                (unsigned long long)reloads);
+    }
+}
+
 static void ds4_gpu_stream_expert_cache_note_tokens(uint32_t layer_index,
                                                     uint32_t n_tokens) {
     if (!g_ssd_streaming_mode || layer_index != 0 ||
@@ -14046,6 +14123,22 @@ static void ds4_gpu_stream_expert_cache_clear_entry_internal(
     }
 
     const uint64_t bytes = e->logical_bytes;
+    if (g_stream_expert_cache_churn_profile_active &&
+        g_stream_expert_cache_churn_profile_loaded[layer][expert]) {
+        if (count_eviction) {
+            g_stream_expert_cache_churn_profile_evictions++;
+            if (e->use_count <= 1) {
+                g_stream_expert_cache_churn_profile_one_shot_evictions++;
+                g_stream_expert_cache_churn_profile_layer_one_shot_evictions[layer]++;
+                if (g_stream_expert_cache_clock >= e->last_used &&
+                    g_stream_expert_cache_clock - e->last_used <= 6) {
+                    g_stream_expert_cache_churn_profile_one_shot_quick_evictions++;
+                }
+                g_stream_expert_cache_churn_profile_one_shot_pending[layer][expert] = 1;
+            }
+        }
+        g_stream_expert_cache_churn_profile_loaded[layer][expert] = 0;
+    }
     ds4_gpu_stream_expert_evict_dontneed_range(e->model_map,
                                                e->model_size,
                                                e->gate_abs_offset,
@@ -15127,6 +15220,16 @@ ds4_gpu_stream_expert_cache_install_loaded(
     }
     e->shared_prefetch = 0;
     e->valid = 1;
+    if (g_stream_expert_cache_churn_profile_active) {
+        if (g_stream_expert_cache_churn_profile_one_shot_pending[layer][expert]) {
+            g_stream_expert_cache_churn_profile_one_shot_reloads++;
+            g_stream_expert_cache_churn_profile_layer_one_shot_reloads[layer]++;
+            g_stream_expert_cache_churn_profile_one_shot_reload_bytes += logical_bytes;
+            g_stream_expert_cache_churn_profile_one_shot_pending[layer][expert] = 0;
+        }
+        g_stream_expert_cache_churn_profile_loaded[layer][expert] = 1;
+        g_stream_expert_cache_churn_profile_loads++;
+    }
     g_stream_expert_cache_layer_count[layer]++;
     if (g_stream_expert_cache_entry_count < UINT32_MAX) {
         g_stream_expert_cache_entry_count++;
