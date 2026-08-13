@@ -28,7 +28,10 @@ restore() {
         sleep 1
     done
     mkdir -p "$(dirname -- "$restore_log")"
-    nohup "$script_dir/run-server.sh" >"$restore_log" 2>&1 < /dev/null &
+    # Benchmark policy overrides must never leak into the restored production
+    # server.  Production's verified baseline is Decode LRU.
+    nohup env DS4F_SERVER_DECODE_EVICTION_POLICY=lru \
+        "$script_dir/run-server.sh" >"$restore_log" 2>&1 < /dev/null &
 }
 trap restore EXIT HUP INT TERM
 
