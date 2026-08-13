@@ -28,9 +28,24 @@ restore() {
         sleep 1
     done
     mkdir -p "$(dirname -- "$restore_log")"
-    # Benchmark policy overrides must never leak into the restored production
-    # server.  Production's verified baseline is Decode LRU.
-    nohup env DS4F_SERVER_DECODE_EVICTION_POLICY=lru \
+    # Benchmark policy and diagnostic overrides must never leak into the
+    # restored production server.  In particular, decode ablations preserve
+    # dispatch timing by intentionally retaining stale buffers, so allowing
+    # DS4_GLM_DECODE_ABLATE to survive this exec would make production answer
+    # garbage.  Production's verified baseline is Decode LRU, split threshold
+    # 2, and no diagnostic routing/Metal profiling state.
+    nohup env \
+        -u DS4_GLM_DECODE_ABLATE \
+        -u DS4_METAL_DECODE_STAGE_PROFILE \
+        -u DS4_METAL_DECODE_STAGE_PROFILE_LAYER \
+        -u DS4_METAL_DIAG_POST_PREFILL_EXPERT_HOTLIST \
+        -u DS4_MOE_RECORD_SELECTED_IDS \
+        -u DS4_MOE_RECORD_SELECTED_IDS_TAGGED \
+        -u DS4_MOE_RECORD_SELECTED_IDS_SYNC \
+        -u DS4_METAL_GRAPH_TOKEN_PROFILE \
+        -u DS4_METAL_GRAPH_TOKEN_PROFILE_SPLIT \
+        DS4F_SERVER_DECODE_EVICTION_POLICY=lru \
+        DS4F_SERVER_DECODE_SPLIT_MIN_MISSES=2 \
         "$script_dir/run-server.sh" >"$restore_log" 2>&1 < /dev/null &
 }
 trap restore EXIT HUP INT TERM
