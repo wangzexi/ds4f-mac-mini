@@ -145,7 +145,7 @@ for threads in "${threads_list[@]}"; do
         server_pid=$!
         wait_for_server "$log"
 
-        curl -fsS --connect-timeout 5 --max-time 900 \
+        request_seconds=$(curl -fsS --connect-timeout 5 --max-time 900 \
             -H 'Content-Type: application/json' \
             -d "$(python3 - "$prompt" "$tokens" <<'PY'
 import json
@@ -159,7 +159,9 @@ print(json.dumps({
 }, ensure_ascii=False))
 PY
 )" \
-            "http://127.0.0.1:${port}/v1/chat/completions" > "$response"
+            -o "$response" \
+            -w '%{time_total}' \
+            "http://127.0.0.1:${port}/v1/chat/completions")
 
         trace=$(sed -n -E 's/.*trace token\[[0-9]+\]=([0-9]+).*/\1/p' "$log" | paste -sd, -)
         if [[ -z $trace ]]; then
@@ -187,8 +189,15 @@ PY
             echo "actual trace:   $trace" >&2
             exit 1
         fi
-        printf 'pread_threads=%s repeat=%s trace=%s response_sha256=%s\n' \
-            "$threads" "$repeat" "$trace" "$response_hash" >> "$out_dir/runs.tsv"
+        printf 'pread_threads=%s repeat=%s request_seconds=%s decode_tokens_per_s=%s trace=%s response_sha256=%s\n' \
+            "$threads" "$repeat" "$request_seconds" \
+            "$(python3 - "$tokens" "$request_seconds" <<'PY'
+import sys
+t = float(sys.argv[2])
+print(f'{int(sys.argv[1]) / t:.4f}' if t > 0 else 'inf')
+PY
+)" \
+            "$trace" "$response_hash" >> "$out_dir/runs.tsv"
         stop_server
     done
 done
