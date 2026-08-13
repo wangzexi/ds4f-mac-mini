@@ -184,6 +184,14 @@ MoE 编码前直接给出 six experts，故仍为 Mini 的默认精确路径。
 保留专家复制为紧凑的普通 cache slots 并释放整层 buffer，否则该路径只能作为诊断，
 不能占用 Mini 宝贵的 Decode 预算。
 
+该紧凑复制版本随后也已做过真实 server 的冷启动 A/B（2026-08-13，6 PREAD
+readers，各两次，`你好` → 32 个 exact greedy token）。它保持跨组完整 token-ID
+trace 与响应字节一致，且 Decode expert load 由 1,192 降到 1,184；但 Decode 中位数
+由 18.15 s 变为 18.59 s（1.77 → 1.73 t/s）。它把原本全 miss 的层改成更多 mixed
+层，反而扰动了全局 cache 的后续生命周期，节省的 8 个读取不足以抵消代价。因此
+`DS4_METAL_PREFILL_TAIL_EXPERT_HANDOFF[_COMPACT]` 继续不进入生产；后续优先研究
+Decode 阶段的全局 cache 命中，而不是 Prompt→Decode 交接。
+
 尾部交接也没有改变“低权重 miss 补零”的结论。保留 6 个尾部专家、600 槽、
 `你好` 16-token 对照中，0/10/15/20% 的 generation 为
 1.82/1.81/1.80/1.81 t/s；10% 与 exact 的全部 token ID 一致，15% 与 20%
