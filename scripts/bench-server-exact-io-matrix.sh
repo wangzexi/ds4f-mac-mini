@@ -111,7 +111,7 @@ for threads in "${threads_list[@]}"; do
             DS4_METAL_STREAMING_EXPERT_LAYER_STATS=1 \
             DS4_METAL_STREAMING_EXPERT_LAYER_STATS_DELTA=1 \
             DS4_METAL_GPU_BUSY_PROFILE=1 \
-            DS4_TOKEN_TIMING=1 \
+            DS4_SERVER_EXPERT_PHASE_PROFILE=1 \
             DS4_SERVER_TRACE_TOKEN_IDS=1 \
             "$script_dir/run-server.sh" >"$log" 2>&1 &
         server_pid=$!

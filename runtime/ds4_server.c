@@ -1,5 +1,6 @@
 #include "ds4.h"
 #include "ds4_distributed.h"
+#include "ds4_gpu.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
 #include "ds4_kvstore.h"
@@ -11885,6 +11886,12 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                req_flags[0] ? " " : "",
                req_flags,
                now_sec() - t0);
+    /* This is an explicit diagnostic boundary, not part of scheduling.  The
+     * Metal report maintains a timing snapshot, so a second mark after Decode
+     * reports only the autoregressive expert I/O delta. */
+    if (getenv("DS4_SERVER_EXPERT_PHASE_PROFILE") != NULL) {
+        ds4_gpu_print_memory_report("server exact prefill phase");
+    }
     if (cold_store_len == prompt_for_sync->len) {
         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
                                        cold_store_len, "cold")) {
@@ -12668,6 +12675,9 @@ decode_again:
                        final_finish,
                        now_sec() - t0);
         }
+    }
+    if (getenv("DS4_SERVER_EXPERT_PHASE_PROFILE") != NULL) {
+        ds4_gpu_print_memory_report("server exact decode phase");
     }
     /* The network response is already complete at this point.  Persist the
      * exact post-response frontier before the worker accepts another request,

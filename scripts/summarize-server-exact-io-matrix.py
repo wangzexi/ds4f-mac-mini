@@ -15,7 +15,11 @@ GPU = re.compile(r"gpu busy total=([0-9.]+) ms command_buffers=(\d+)")
 PREFILL = re.compile(r"prompt done ([0-9.]+)s")
 DECODE = re.compile(r"decoding chunk=[0-9.]+ t/s avg=([0-9.]+) t/s ([0-9.]+)s")
 TOTAL = re.compile(r"finish=[^ ]+ ([0-9.]+)s")
-TOKEN_EVAL = re.compile(r"gpu decode eval \d+ took ([0-9.]+) ms")
+PHASE_MARK = re.compile(r"memory report \((server exact (?:prefill|decode) phase)\)")
+TIMING_DELTA = re.compile(
+    r"streaming expert timing delta .*?load_calls=(\d+).*?load_pread_avg=([0-9.]+) ms"
+    r".*?cache_all_resident=(\d+) cache_all_missing=(\d+) cache_mixed=(\d+)"
+)
 
 
 def last_float(pattern: re.Pattern[str], text: str, group: int = 1) -> float | None:
@@ -51,22 +55,33 @@ def main() -> int:
         if decode:
             row["decode_tps"] = float(decode[-1][0])
             row["decode_s"] = float(decode[-1][1])
-        token_eval = [float(value) for value in TOKEN_EVAL.findall(text)]
-        if token_eval:
-            ordered = sorted(token_eval)
-            row["token_eval_ms_p50"] = statistics.median(ordered)
-            row["token_eval_ms_p95"] = ordered[max(0, (len(ordered) * 95 + 99) // 100 - 1)]
         cache = CACHE.findall(text)
         if cache:
             hits, misses, rate = cache[-1]
             row["hits"] = float(hits)
             row["misses"] = float(misses)
             row["hit_rate"] = float(rate)
+        phase = None
+        for line in text.splitlines():
+            mark = PHASE_MARK.search(line)
+            if mark:
+                phase = mark.group(1)
+                continue
+            timing = TIMING_DELTA.search(line)
+            if phase and timing:
+                loads, pread, all_resident, all_missing, mixed = timing.groups()
+                prefix = "prefill" if "prefill" in phase else "decode"
+                row[f"{prefix}_load_calls"] = float(loads)
+                row[f"{prefix}_pread_avg_ms"] = float(pread)
+                row[f"{prefix}_all_resident_layers"] = float(all_resident)
+                row[f"{prefix}_all_missing_layers"] = float(all_missing)
+                row[f"{prefix}_mixed_layers"] = float(mixed)
+                phase = None
         rows.setdefault(int(match.group(1)), []).append(row)
 
     print(
-        "pread_threads\truns\tdecode_tps_p50\tdecode_s_p50\ttoken_eval_ms_p50\t"
-        "token_eval_ms_p95\tprefill_s_p50\tpread_avg_ms_p50\thit_rate_p50\t"
+        "pread_threads\truns\tdecode_tps_p50\tdecode_s_p50\tprefill_s_p50\t"
+        "pread_avg_ms_p50\thit_rate_p50\t"
         "misses_p50\tgpu_busy_ms_p50\ttotal_s_p50"
     )
     for threads, samples in sorted(rows.items()):
@@ -76,9 +91,17 @@ def main() -> int:
 
         print(
             f"{threads}\t{len(samples)}\t{median('decode_tps')}\t{median('decode_s')}\t"
-            f"{median('token_eval_ms_p50')}\t{median('token_eval_ms_p95')}\t"
             f"{median('prefill_s')}\t{median('pread_avg_ms')}\t{median('hit_rate')}\t"
             f"{median('misses')}\t{median('gpu_busy_ms')}\t{median('total_s')}"
+        )
+        print(
+            "  phase delta: "
+            f"prefill loads={median('prefill_load_calls')} "
+            f"decode loads={median('decode_load_calls')} "
+            f"decode resident/all-miss/mixed="
+            f"{median('decode_all_resident_layers')}/"
+            f"{median('decode_all_missing_layers')}/"
+            f"{median('decode_mixed_layers')}"
         )
     return 0
 
