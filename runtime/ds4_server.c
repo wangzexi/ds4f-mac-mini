@@ -11900,6 +11900,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
          * the cache, its heat, or the eviction policy. */
         ds4_gpu_stream_expert_cache_churn_profile_begin_decode();
     }
+    ds4_gpu_stream_expert_cache_decode_eviction_policy_begin();
     if (cold_store_len == prompt_for_sync->len) {
         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
                                        cold_store_len, "cold")) {
@@ -12693,6 +12694,7 @@ decode_again:
     if (getenv("DS4_METAL_STREAMING_EXPERT_CHURN_PROFILE") != NULL) {
         ds4_gpu_stream_expert_cache_churn_profile_print_decode();
     }
+    ds4_gpu_stream_expert_cache_decode_eviction_policy_end();
     /* The network response is already complete at this point.  Persist the
      * exact post-response frontier before the worker accepts another request,
      * so a future full-history prompt can restore it from disk safely. */
