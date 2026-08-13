@@ -35,6 +35,11 @@ allow_shared_expert_sidecar=${DS4F_SERVER_ALLOW_SHARED_EXPERT_SIDECAR:-0}
 # chain.  Its earlier 4K output difference was traced to chunked Prefill
 # itself: a repeat with the heat baseline diverged at the same second chunk.
 decode_eviction_policy=${DS4F_SERVER_DECODE_EVICTION_POLICY:-lru}
+# Decode on the fixed M4 Mini is usually a 4--5 resident / 1--2 missing
+# expert mix.  Splitting even one miss overlaps its SSD read with the already
+# resident work.  On the 1K-prefix exact A/B this averaged 1.95 tok/s versus
+# 1.90 tok/s at the historical threshold of three, with the same greedy trace.
+decode_split_min_misses=${DS4F_SERVER_DECODE_SPLIT_MIN_MISSES:-1}
 
 if [ ! -x "$project_dir/ds4f-server" ]; then
     echo "missing ds4f-server; run: make server" >&2
@@ -70,6 +75,15 @@ case "$decode_eviction_policy" in
         ;;
 esac
 
+case "$decode_split_min_misses" in
+    1|2|3|4|5|6)
+        ;;
+    *)
+        echo "DS4F_SERVER_DECODE_SPLIT_MIN_MISSES must be an integer 1..6" >&2
+        exit 2
+        ;;
+esac
+
 cd "$runtime_dir"
 exec env \
     DS4_METAL_STREAMING_EXPERT_PACK_PATH="$pack" \
@@ -80,6 +94,7 @@ exec env \
     DS4_METAL_STREAMING_EXPERT_PREAD_THREADS="$pread_threads" \
     DS4_METAL_STREAMING_EXPERT_PREAD_POOL=1 \
     DS4_METAL_STREAMING_EXPERT_DECODE_EVICTION_POLICY="$decode_eviction_policy" \
+    DS4_METAL_STREAMING_EXPERT_SPLIT_MIN_MISSES="$decode_split_min_misses" \
     DS4_METAL_PREFILL_MEASUREMENTS_PATH="$prefill_measurements" \
     DS4_SERVER_PRELOAD_STATIC_DECODE_TRUNK="$preload_static_decode" \
     DS4_SERVER_WORKING_SET_MIB="$working_set_mib" \
