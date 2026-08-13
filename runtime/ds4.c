@@ -42047,6 +42047,14 @@ static bool glm_graph_encode_sparse_ffn_one(
                                          pos,
                                          1,
                                          stage_t0);
+    if (ok) {
+        metal_graph_debug_dump_tensor("glm_token_router_logits",
+                                      g->router_logits, DS4_N_EXPERT, il, pos);
+        metal_graph_debug_dump_i32_tensor("glm_token_router_selected",
+                                          g->router_selected, DS4_N_EXPERT_USED, il, pos);
+        metal_graph_debug_dump_tensor("glm_token_router_weights",
+                                      g->router_weights, DS4_N_EXPERT_USED, il, pos);
+    }
     if (ok) ok = glm_graph_profile_router_selection(g, l, il, pos);
     const bool resident_decode_layer =
         g->ssd_streaming && glm_stream_resident_decode_layer_enabled(l, il);
@@ -42265,6 +42273,10 @@ static bool glm_graph_encode_sparse_ffn_one(
                                          pos,
                                          1,
                                          stage_t0);
+    if (ok) {
+        metal_graph_debug_dump_tensor("glm_token_routed_out",
+                                      ffn_out, DS4_N_EMBD, il, pos);
+    }
     if (ok && !shared_first &&
         !(glm_decode_ablate_mask() & DS4_GLM_ABLATE_SHARED)) {
         ok = glm_graph_encode_shared_swiglu_one(ffn_mid,
@@ -42319,6 +42331,12 @@ static bool glm_graph_encode_sparse_ffn_one(
                                          pos,
                                          1,
                                          stage_t0);
+    if (ok) {
+        metal_graph_debug_dump_tensor("glm_token_shared_out",
+                                      ffn_sum, DS4_N_EMBD, il, pos);
+        metal_graph_debug_dump_tensor("glm_token_hidden_out",
+                                      next, DS4_N_EMBD, il, pos);
+    }
     if (async_profile) {
         const double now_ms = glm_graph_streaming_async_profile_ms();
         if (async_path_profiled) {
@@ -47424,6 +47442,11 @@ static bool glm_graph_forward_token(
                                                           &decode_stage_t0);
         }
 
+        if (ok) {
+            metal_graph_debug_dump_tensor("glm_token_hidden_in",
+                                          g->cur, DS4_N_EMBD, il, pos);
+        }
+
         if (ok) ok = ds4_gpu_rms_norm_weight_tensor(g->attn_norm,
                                                     g->cur,
                                                     model->map,
@@ -47859,6 +47882,10 @@ static bool glm_graph_forward_token(
                                                               g->ssd_streaming) != 0;
         }
         DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_attn", "attn_output");
+        if (ok) {
+            metal_graph_debug_dump_tensor("glm_token_attn_out",
+                                          g->attn_out, DS4_N_EMBD, il, pos);
+        }
         if (ok) ok = ds4_gpu_add_rms_norm_weight_tensor(g->ffn_norm,
                                                         g->after_attn,
                                                         g->cur,
@@ -47869,6 +47896,12 @@ static bool glm_graph_forward_token(
                                                         DS4_N_EMBD,
                                                         DS4_RMS_EPS) != 0;
         DS4_GLM_PROFILE_DECODE_STAGE("glm_decode_ffn", "ffn_norm");
+        if (ok) {
+            metal_graph_debug_dump_tensor("glm_token_after_attn",
+                                          g->after_attn, DS4_N_EMBD, il, pos);
+            metal_graph_debug_dump_tensor("glm_token_ffn_norm",
+                                          g->ffn_norm, DS4_N_EMBD, il, pos);
+        }
         if (ok) ok = glm_graph_encode_ffn_one_normed_from(g,
                                                           model,
                                                           l,
