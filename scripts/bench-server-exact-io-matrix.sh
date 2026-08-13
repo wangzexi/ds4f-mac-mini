@@ -22,6 +22,9 @@ threads_csv=${DS4F_BENCH_PREAD_THREADS:-1,2,3,4,6}
 port=${DS4F_BENCH_SERVER_PORT:-18080}
 out_dir=${DS4F_BENCH_OUT_DIR:-"$project_dir/results/benchmarks/server-exact-io-$(date +%Y%m%d-%H%M%S)"}
 record_selected_ids=${DS4F_BENCH_RECORD_SELECTED_IDS:-0}
+if [[ $out_dir != /* ]]; then
+    out_dir="$project_dir/$out_dir"
+fi
 
 if [[ ! -x "$server" || ! -r "$model" || ! -r "$pack" ]]; then
     echo "missing fixed Mini server, model, or packed experts" >&2
