@@ -101,11 +101,12 @@ for threads in "${threads_list[@]}"; do
         kv_dir="$tmp_dir/kv-${threads}-${repeat}"
         mkdir -p "$kv_dir"
 
-        record_env=()
         if [[ $record_selected_ids != 0 ]]; then
-            record_env=(DS4_MOE_RECORD_SELECTED_IDS="$out_dir/server-pread-${threads}-run-${repeat}.selected-i32le")
+            export DS4_MOE_RECORD_SELECTED_IDS="$out_dir/server-pread-${threads}-run-${repeat}.selected-i32le"
+        else
+            unset DS4_MOE_RECORD_SELECTED_IDS || true
         fi
-        env "${record_env[@]}" \
+        env \
             DS4F_SERVER_HOST=127.0.0.1 \
             DS4F_SERVER_PORT="$port" \
             DS4F_SERVER_CACHE_EXPERTS="$cache_experts" \
