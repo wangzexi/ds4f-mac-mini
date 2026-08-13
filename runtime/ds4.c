@@ -30449,6 +30449,9 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     const bool profile =
         glm_graph_env_present("DS4_ROCM_GRAPH_TOKEN_PROFILE",
                               "DS4_METAL_GRAPH_TOKEN_PROFILE");
+    const bool split_profile = profile &&
+        glm_graph_env_present("DS4_ROCM_GRAPH_TOKEN_PROFILE_SPLIT",
+                              "DS4_METAL_GRAPH_TOKEN_PROFILE_SPLIT");
     const bool throttle = graph_power_throttle_enabled(g);
     const double t0 = (profile || throttle) ? now_sec() : 0.0;
     const uint32_t raw_row = pos % g->raw_cap;
@@ -30504,6 +30507,10 @@ static bool metal_graph_eval_token_raw_swa_streaming(
                 ok = metal_graph_dspark_capture_decode_layer(g, il);
             }
         }
+        const double t_layers_encoded = (profile || throttle) ? now_sec() : 0.0;
+        if (ok && split_profile) ok = ds4_gpu_end_commands() != 0;
+        const double t_layers_done = (profile || throttle) ? now_sec() : 0.0;
+        if (ok && split_profile && logits) ok = ds4_gpu_begin_commands() != 0;
         if (ok && logits) {
             ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
         }
@@ -30515,6 +30522,20 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         }
         const double t_read = (profile || throttle) ? now_sec() : 0.0;
         if (profile) {
+            if (split_profile) {
+                fprintf(stderr,
+                        "ds4: metal SSD streaming transformer token pos=%u "
+                        "encode=%.3f ms execute=%.3f ms\n",
+                        pos,
+                        (t_layers_encoded - t0) * 1000.0,
+                        (t_layers_done - t_layers_encoded) * 1000.0);
+                fprintf(stderr,
+                        "ds4: metal SSD streaming output token pos=%u "
+                        "encode=%.3f ms execute=%.3f ms\n",
+                        pos,
+                        (t_encoded - t_layers_done) * 1000.0,
+                        (t_done - t_encoded) * 1000.0);
+            }
             fprintf(stderr,
                     "ds4: metal SSD streaming batched token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",
                     pos,
