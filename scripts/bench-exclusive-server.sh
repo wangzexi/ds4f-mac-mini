@@ -7,6 +7,7 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 stop_pid=${DS4F_BENCH_STOP_PID:?set DS4F_BENCH_STOP_PID to the inspected production PID}
 restore_log=${DS4F_BENCH_RESTORE_LOG:-"$project_dir/results/server/production-after-exclusive-bench-$(date +%Y%m%d-%H%M%S).log"}
+bench_kind=${DS4F_BENCH_KIND:-io-matrix}
 
 if [[ ! $stop_pid =~ ^[1-9][0-9]*$ ]] || ! kill -0 "$stop_pid" 2>/dev/null; then
     echo "DS4F_BENCH_STOP_PID is not a live PID: $stop_pid" >&2
@@ -44,6 +45,11 @@ restore() {
         -u DS4_MOE_RECORD_SELECTED_IDS_SYNC \
         -u DS4_METAL_GRAPH_TOKEN_PROFILE \
         -u DS4_METAL_GRAPH_TOKEN_PROFILE_SPLIT \
+        -u DS4_METAL_ENABLE_STREAMING_EXPERT_ADDR_TABLE \
+        -u DS4_METAL_ENABLE_STREAMING_COMPACT_ADDR \
+        -u DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE \
+        -u DS4_METAL_ENABLE_STREAMING_EXPERT_HIT_VALIDATOR \
+        -u DS4_METAL_ENABLE_STREAMING_EXPERT_MASKED_ADDR \
         DS4F_SERVER_DECODE_EVICTION_POLICY=lru \
         DS4F_SERVER_DECODE_SPLIT_MIN_MISSES=2 \
         "$script_dir/run-server.sh" >"$restore_log" 2>&1 < /dev/null &
@@ -60,4 +66,18 @@ if pgrep -x ds4f-server >/dev/null; then
     exit 1
 fi
 
-"$script_dir/bench-server-exact-io-matrix.sh"
+case "$bench_kind" in
+    io-matrix)
+        "$script_dir/bench-server-exact-io-matrix.sh"
+        ;;
+    resident-token)
+        : "${DS4F_BENCH_PROMPT:?set DS4F_BENCH_PROMPT for resident-token}"
+        "$script_dir/measure-decode-resident-token.sh" \
+            "$DS4F_BENCH_PROMPT" \
+            "${DS4F_BENCH_OUT_DIR:-$project_dir/results/measurements/decode-resident-token-$(date +%Y%m%d-%H%M%S)}"
+        ;;
+    *)
+        echo "unknown DS4F_BENCH_KIND: $bench_kind (expected io-matrix or resident-token)" >&2
+        exit 2
+        ;;
+esac
