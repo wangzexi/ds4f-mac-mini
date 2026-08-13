@@ -15,6 +15,8 @@ CACHE = re.compile(
     r"streaming expert cache .*?hits=(\d+) misses=(\d+) hit_rate=([0-9.]+)"
 )
 GPU = re.compile(r"gpu busy total=([0-9.]+) ms command_buffers=(\d+)")
+THROUGHPUT = re.compile(r"ds4: prefill: ([0-9.]+) t/s, generation: ([0-9.]+) t/s")
+DECODE_EVAL = re.compile(r"ds4: gpu decode eval \d+ took ([0-9.]+) ms")
 
 
 def find(pattern: re.Pattern[str], text: str, group: int = 1) -> float | None:
@@ -49,17 +51,34 @@ def main() -> int:
             item["hit_rate"] = float(rate)
         if (value := find(GPU, text)) is not None:
             item["gpu_busy_ms"] = value
+        if (throughput := THROUGHPUT.findall(text)):
+            prefill_tps, generation_tps = throughput[-1]
+            item["prefill_tps"] = float(prefill_tps)
+            item["generation_tps"] = float(generation_tps)
+        decode_eval_ms = [float(value) for value in DECODE_EVAL.findall(text)]
+        if decode_eval_ms:
+            item["decode_eval_ms_p50"] = statistics.median(decode_eval_ms)
+            item["decode_eval_ms_p95"] = (
+                sorted(decode_eval_ms)[max(0, (len(decode_eval_ms) * 95 + 99) // 100 - 1)]
+            )
         rows.setdefault(int(match.group(1)), []).append(item)
 
-    print("pread_threads\truns\twall_s_p50\tpread_avg_ms_p50\thit_rate_p50\tmisses_p50\tgpu_busy_ms_p50")
+    print(
+        "pread_threads\truns\tgeneration_tps_p50\tdecode_eval_ms_p50\t"
+        "decode_eval_ms_p95\tprefill_tps_p50\tpread_avg_ms_p50\thit_rate_p50\t"
+        "misses_p50\tgpu_busy_ms_p50\twall_s_p50"
+    )
     for threads, samples in sorted(rows.items()):
         def median(key: str) -> str:
             values = [sample[key] for sample in samples if key in sample]
             return f"{statistics.median(values):.3f}" if values else "-"
 
         print(
-            f"{threads}\t{len(samples)}\t{median('wall_s')}\t{median('pread_avg_ms')}\t"
-            f"{median('hit_rate')}\t{median('misses')}\t{median('gpu_busy_ms')}"
+            f"{threads}\t{len(samples)}\t{median('generation_tps')}\t"
+            f"{median('decode_eval_ms_p50')}\t{median('decode_eval_ms_p95')}\t"
+            f"{median('prefill_tps')}\t{median('pread_avg_ms')}\t"
+            f"{median('hit_rate')}\t{median('misses')}\t{median('gpu_busy_ms')}\t"
+            f"{median('wall_s')}"
         )
     return 0
 

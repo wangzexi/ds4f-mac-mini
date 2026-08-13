@@ -81,6 +81,10 @@ scripts/bench-exact-io-matrix.sh
 python3 scripts/summarize-exact-io-matrix.py results/benchmarks/exact-io-*/
 ```
 
+The summary's decision metric is `generation_tps_p50`, which excludes process
+startup and the prompt Prefill.  It also reports per-token Decode p50/p95 from
+the exact greedy trace.  `wall_s_p50` remains only as a whole-run sanity check.
+
 Each log keeps the global cache hit/miss counts, selected-expert read timing,
 per-layer stats, process wall time, and cumulative Metal GPU-busy time.  The
 matrix exists to decide whether the next change should be I/O queueing,

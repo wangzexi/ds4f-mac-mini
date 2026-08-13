@@ -75,6 +75,7 @@ for threads in "${threads_list[@]}"; do
             DS4_METAL_STREAMING_EXPERT_LAYER_STATS=1 \
             DS4_METAL_STREAMING_EXPERT_LAYER_STATS_DELTA=1 \
             DS4_METAL_GPU_BUSY_PROFILE=1 \
+            DS4_TOKEN_TIMING=1 \
             "$runner" "$model" "$prompt" "$tokens" \
             >"$log" 2>&1
 
