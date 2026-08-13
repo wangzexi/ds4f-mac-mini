@@ -1597,7 +1597,7 @@ static void ds4_gpu_moe_selected_trace_tagged_close(void) {
     }
 }
 
-static int ds4_gpu_moe_selected_trace_tagged_record(
+static int ds4_gpu_moe_selected_trace_tagged_write(
         uint32_t       layer,
         const int32_t  selected_ids[6],
         uint32_t       n_selected) {
@@ -39069,7 +39069,7 @@ int ds4_gpu_routed_moe_one_tensor(
                         n_expert,
                         1);
                 if (!ds4_gpu_moe_selected_trace_record(selected_ids, n_expert) ||
-                    !ds4_gpu_moe_selected_trace_tagged_record(layer_index,
+                    !ds4_gpu_moe_selected_trace_tagged_write(layer_index,
                                                                selected_ids,
                                                                n_expert) ||
                     !ds4_gpu_moe_selected_hotlist_record(layer_index,
