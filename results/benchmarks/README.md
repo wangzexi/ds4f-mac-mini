@@ -66,3 +66,22 @@ env \
   DS4_METAL_PREFILL_CHUNK=8192 \
   scripts/run-32k.sh exact @results/benchmarks/long-prompt-15k.txt 1
 ```
+
+## Exact Decode SSD-I/O matrix
+
+`scripts/bench-exact-io-matrix.sh` is the next diagnostic step for this fixed
+Mini only.  It runs an exclusive, cold-process `你好` 32-token greedy Decode
+matrix at the deployed Q4/IQ2 layout, 950 expert slots, and `pread` thread
+counts `1,2,3,4,6,9`.  It enables `F_NOCACHE` through the normal streaming
+runtime and aborts if any run changes the baseline token-ID trace.  Stop the
+production server first, then run:
+
+```sh
+scripts/bench-exact-io-matrix.sh
+python3 scripts/summarize-exact-io-matrix.py results/benchmarks/exact-io-*/
+```
+
+Each log keeps the global cache hit/miss counts, selected-expert read timing,
+per-layer stats, process wall time, and cumulative Metal GPU-busy time.  The
+matrix exists to decide whether the next change should be I/O queueing,
+cache-policy work, or GPU-kernel work; it is not a production runtime mode.

@@ -3408,6 +3408,12 @@ void ds4_gpu_print_memory_report(const char *label) {
             ds4_gpu_mib(tensor_live_snap),
             ds4_gpu_mib(tensor_peak_snap));
     ds4_gpu_print_task_memory_report();
+    if (getenv("DS4_METAL_GPU_BUSY_PROFILE") && g_gpu_busy_cbs != 0) {
+        fprintf(stderr,
+                "ds4: gpu busy total=%.3f ms command_buffers=%llu\n",
+                g_gpu_busy_accum * 1000.0,
+                (unsigned long long)g_gpu_busy_cbs);
+    }
     fprintf(stderr,
             "ds4:   mmap model wrapper spans %llu buffers %.2f GiB total, %.2f GiB max (not copied)\n",
             (unsigned long long)g_model_wrap_count,
