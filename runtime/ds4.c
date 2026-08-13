@@ -21507,48 +21507,6 @@ static bool metal_graph_decode_set_hash_selected_override(
     return ds4_gpu_routed_moe_set_selected_override(selected_i32, DS4_N_EXPERT_USED) != 0;
 }
 
-/* L1's hash route is known as soon as the input token is known.  L0 is fully
- * resident in the fixed Mini server, so this exact, opt-in read has the whole
- * L0 attention/FFN interval in which to finish.  Only L1 is issued: one
- * pending selected-load slot is intentionally shared by the streaming cache,
- * and competing L2 I/O would destroy the useful L1 overlap. */
-static bool metal_graph_decode_early_hash_layer1_prefetch(
-        const ds4_gpu_graph *g,
-        const ds4_model     *model,
-        const ds4_weights   *weights,
-        int                  token) {
-    const char *enabled = getenv("DS4_METAL_DECODE_EARLY_HASH_LAYER1_PREFETCH");
-    if (!enabled || !enabled[0] || strcmp(enabled, "0") == 0) return true;
-    if (!g || !g->ssd_streaming || !model || !weights ||
-        DS4_N_HASH_LAYER < 2u || DS4_N_LAYER < 2u) {
-        return true;
-    }
-    const uint32_t il = 1u;
-    const ds4_layer_weights *layer = &weights->layer[il];
-    if (!layer->ffn_gate_tid2eid) return true;
-    int selected[DS4_MAX_EXPERT_USED];
-    int32_t selected_i32[DS4_MAX_EXPERT_USED];
-    layer_hash_selected_experts(selected, model, layer, token);
-    for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
-        selected_i32[i] = (int32_t)selected[i];
-    }
-    uint64_t gate_expert_bytes = 0;
-    uint64_t down_expert_bytes = 0;
-    if (!streaming_layer_gate_down_expert_bytes(layer,
-                                                &gate_expert_bytes,
-                                                &down_expert_bytes)) {
-        return false;
-    }
-    const ds4_gpu_stream_expert_table table =
-        graph_stream_expert_table_make(model,
-                                       layer,
-                                       il,
-                                       gate_expert_bytes,
-                                       down_expert_bytes);
-    return ds4_gpu_stream_expert_cache_begin_selected_load(
-                   &table, selected_i32, DS4_N_EXPERT_USED) != 0;
-}
-
 static bool metal_graph_decode_cpu_router(
         ds4_gpu_graph          *g,
         const ds4_model        *model,
@@ -30500,12 +30458,6 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     }
     if (ok && !static_decode_map && DS4_N_LAYER > 0) {
         metal_graph_stream_readahead_layer_decode(model, weights, 0);
-    }
-    if (ok) {
-        ok = metal_graph_decode_early_hash_layer1_prefetch(g,
-                                                           model,
-                                                           weights,
-                                                           token);
     }
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
