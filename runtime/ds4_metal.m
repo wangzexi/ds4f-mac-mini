@@ -701,6 +701,11 @@ static float
 static int g_stream_expert_cache_churn_profile_active;
 static int g_stream_expert_cache_decode_lru_policy_active;
 static int g_stream_expert_cache_decode_reuse_heat_policy_active;
+/* Decode-only probation LRU: a freshly read expert gets one short chance to
+ * be selected again before it competes with the mature cache.  This is an
+ * experiment for the small unified-memory Mini, where a global cache can
+ * otherwise discard a just-loaded expert before its next same-layer visit. */
+static int g_stream_expert_cache_decode_probation_lru_policy_active;
 static uint8_t
     g_stream_expert_cache_churn_profile_loaded[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
 static uint8_t
@@ -13457,8 +13462,11 @@ void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(void) {
         policy && strcmp(policy, "lru") == 0;
     g_stream_expert_cache_decode_reuse_heat_policy_active =
         policy && strcmp(policy, "reuse-heat") == 0;
+    g_stream_expert_cache_decode_probation_lru_policy_active =
+        policy && strcmp(policy, "probation-lru") == 0;
     if (policy && policy[0] && !g_stream_expert_cache_decode_lru_policy_active &&
         !g_stream_expert_cache_decode_reuse_heat_policy_active &&
+        !g_stream_expert_cache_decode_probation_lru_policy_active &&
         strcmp(policy, "heat") != 0) {
         fprintf(stderr,
                 "ds4: unknown Decode expert eviction policy %s; using heat+LRU\n",
@@ -13470,18 +13478,52 @@ void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(void) {
     } else if (g_stream_expert_cache_decode_reuse_heat_policy_active) {
         fprintf(stderr,
                 "ds4: Decode expert eviction policy=reuse-heat (Prefill remains heat+LRU)\n");
+    } else if (g_stream_expert_cache_decode_probation_lru_policy_active) {
+        fprintf(stderr,
+                "ds4: Decode expert eviction policy=probation-lru (Prefill remains heat+LRU)\n");
     }
 }
 
 void ds4_gpu_stream_expert_cache_decode_eviction_policy_end(void) {
     g_stream_expert_cache_decode_lru_policy_active = 0;
     g_stream_expert_cache_decode_reuse_heat_policy_active = 0;
+    g_stream_expert_cache_decode_probation_lru_policy_active = 0;
+}
+
+static uint64_t ds4_gpu_stream_expert_cache_probation_lookups(void) {
+    /* One complete Flash Decode pass normally performs 43 * 6 routed-expert
+     * lookups.  An override lets us sweep the tenure without code changes. */
+    const char *env = getenv("DS4_METAL_STREAMING_EXPERT_PROBATION_LOOKUPS");
+    if (env && env[0]) {
+        char *end = NULL;
+        const unsigned long long value = strtoull(env, &end, 10);
+        if (end != env && value <= UINT64_MAX) return (uint64_t)value;
+    }
+    /* This renderer is deliberately fixed to Flash-0731: 43 routed layers
+     * times six selected experts per Decode token. */
+    return 43u * 6u;
+}
+
+static int ds4_gpu_stream_expert_cache_entry_on_probation(
+        const ds4_gpu_stream_expert_cache_entry *entry) {
+    if (!g_stream_expert_cache_decode_probation_lru_policy_active ||
+        !entry || entry->use_count != 1 ||
+        g_stream_expert_cache_clock < entry->last_used) {
+        return 0;
+    }
+    return g_stream_expert_cache_clock - entry->last_used <
+           ds4_gpu_stream_expert_cache_probation_lookups();
 }
 
 static float ds4_gpu_stream_expert_cache_eviction_heat(
         uint32_t                                      layer,
         uint32_t                                      expert,
         const ds4_gpu_stream_expert_cache_entry      *entry) {
+    if (ds4_gpu_stream_expert_cache_entry_on_probation(entry)) {
+        /* This remains a valid fallback victim when every entry is young:
+         * the finite penalty makes all mature candidates win first. */
+        return FLT_MAX / 4.0f;
+    }
     if (g_stream_expert_cache_decode_lru_policy_active ||
         (g_stream_expert_cache_decode_reuse_heat_policy_active &&
          (!entry || entry->use_count < 2))) {
