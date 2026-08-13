@@ -31,10 +31,10 @@ kv_cache_min_tokens=${DS4F_SERVER_KV_CACHE_MIN_TOKENS:-1}
 prefill_measurements=${DS4F_SERVER_PREFILL_MEASUREMENTS:-$project_dir/cache/prefill-measurements.tsv}
 preload_static_decode=${DS4F_SERVER_PRELOAD_STATIC_DECODE_TRUNK:-1}
 allow_shared_expert_sidecar=${DS4F_SERVER_ALLOW_SHARED_EXPERT_SIDECAR:-0}
-# The LRU A/B is much faster on long Decode, but a 4K exact trace diverged at
-# token 8.  Keep production on the established heat+LRU baseline until the
-# cache-reuse ordering issue is resolved; experiments override this explicitly.
-decode_eviction_policy=${DS4F_SERVER_DECODE_EVICTION_POLICY:-heat}
+# Decode LRU has lower churn and removes the long-context in-flight wait
+# chain.  Its earlier 4K output difference was traced to chunked Prefill
+# itself: a repeat with the heat baseline diverged at the same second chunk.
+decode_eviction_policy=${DS4F_SERVER_DECODE_EVICTION_POLICY:-lru}
 
 if [ ! -x "$project_dir/ds4f-server" ]; then
     echo "missing ds4f-server; run: make server" >&2
