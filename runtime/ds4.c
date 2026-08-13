@@ -21084,7 +21084,11 @@ static bool metal_graph_streaming_expert_cache_seed_layer_expected(
         !g->quality &&
         layer->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
         layer->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
-        layer->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS &&
+        /* Flash stores the routed down projection in Q2_K, while the
+         * gate/up pair is IQ2_XXS.  Treat it as the same selected-cache
+         * slab class; otherwise an exact diagnostic seed is silently
+         * rejected even though ordinary decode uses this cache path. */
+        layer->ffn_down_exps->type == DS4_TENSOR_Q2_K &&
         DS4_N_EXPERT_USED != 0 &&
         DS4_N_EXPERT_USED <= 8 &&
         DS4_N_EXPERT >= 128 &&
