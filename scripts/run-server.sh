@@ -62,10 +62,10 @@ case "$allow_shared_expert_sidecar" in
 esac
 
 case "$decode_eviction_policy" in
-    lru|heat|reuse-heat|2q)
+    lru|heat|reuse-heat)
         ;;
     *)
-        echo "DS4F_SERVER_DECODE_EVICTION_POLICY must be lru, heat, reuse-heat, or 2q" >&2
+        echo "DS4F_SERVER_DECODE_EVICTION_POLICY must be lru, heat, or reuse-heat" >&2
         exit 2
         ;;
 esac
