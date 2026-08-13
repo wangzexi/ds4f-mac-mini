@@ -16191,6 +16191,49 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         return 1;
     }
 
+    /* A pending read for a future layer must survive a request from an
+     * already-resident layer.  In particular, the Mini keeps all L0 hash
+     * experts resident while an exact L1 request can be read underneath L0's
+     * attention/FFN work.  The old unconditional clear below erased that
+     * overlap even though this request has no I/O to start. */
+    int all_resident = 1;
+    for (uint32_t i = 0; i < n_selected; i++) {
+        if (selected_ids[i] < 0 ||
+            (uint32_t)selected_ids[i] >= n_total_expert) {
+            all_resident = 0;
+            break;
+        }
+        const uint64_t expert = (uint64_t)(uint32_t)selected_ids[i];
+        if (expert > UINT64_MAX / gate_expert_bytes ||
+            expert > UINT64_MAX / down_expert_bytes) {
+            all_resident = 0;
+            break;
+        }
+        const uint64_t gate_rel = expert * gate_expert_bytes;
+        const uint64_t down_rel = expert * down_expert_bytes;
+        if (gate_rel > UINT64_MAX - gate_offset ||
+            gate_rel > UINT64_MAX - up_offset ||
+            down_rel > UINT64_MAX - down_offset) {
+            all_resident = 0;
+            break;
+        }
+        const ds4_gpu_stream_expert_cache_entry *e =
+            &g_stream_expert_cache[layer][(uint32_t)expert];
+        if (!ds4_gpu_stream_expert_cache_entry_matches(
+                    e,
+                    model_map,
+                    model_size,
+                    gate_offset + gate_rel,
+                    up_offset + gate_rel,
+                    down_offset + down_rel,
+                    gate_expert_bytes,
+                    down_expert_bytes)) {
+            all_resident = 0;
+            break;
+        }
+    }
+    if (all_resident) return 1;
+
     ds4_gpu_stream_expert_pending_load_clear();
     ds4_gpu_stream_expert_pending_load *p = &g_stream_expert_pending_load;
     p->active = 0;
