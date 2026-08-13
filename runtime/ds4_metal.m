@@ -701,10 +701,6 @@ static float
 static int g_stream_expert_cache_churn_profile_active;
 static int g_stream_expert_cache_decode_lru_policy_active;
 static int g_stream_expert_cache_decode_reuse_heat_policy_active;
-/* Decode-only hybrid cache: retain a small floor per layer, then let the
- * remaining slots follow the normal global policy.  Zero is the canonical
- * all-global LRU behavior. */
-static uint32_t g_stream_expert_cache_decode_layer_floor;
 /* Decode-only probation LRU: a freshly read expert gets one short chance to
  * be selected again before it competes with the mature cache.  This is an
  * experiment for the small unified-memory Mini, where a global cache can
@@ -13468,26 +13464,6 @@ void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(void) {
         policy && strcmp(policy, "reuse-heat") == 0;
     g_stream_expert_cache_decode_probation_lru_policy_active =
         policy && strcmp(policy, "probation-lru") == 0;
-    g_stream_expert_cache_decode_layer_floor = 0;
-    const char *floor_env =
-        getenv("DS4_METAL_STREAMING_EXPERT_DECODE_LAYER_FLOOR");
-    if (floor_env && floor_env[0]) {
-        char *end = NULL;
-        errno = 0;
-        const unsigned long parsed = strtoul(floor_env, &end, 10);
-        const uint32_t max_floor =
-            ds4_gpu_stream_expert_cache_configured_budget() /
-            DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
-        if (end != floor_env && *end == '\0' && errno == 0 &&
-            parsed <= max_floor) {
-            g_stream_expert_cache_decode_layer_floor = (uint32_t)parsed;
-        } else {
-            fprintf(stderr,
-                    "ds4: invalid Decode layer floor %s (allowed 0..%u); using 0\n",
-                    floor_env,
-                    max_floor);
-        }
-    }
     if (policy && policy[0] && !g_stream_expert_cache_decode_lru_policy_active &&
         !g_stream_expert_cache_decode_reuse_heat_policy_active &&
         !g_stream_expert_cache_decode_probation_lru_policy_active &&
@@ -13506,25 +13482,12 @@ void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(void) {
         fprintf(stderr,
                 "ds4: Decode expert eviction policy=probation-lru (Prefill remains heat+LRU)\n");
     }
-    if (g_stream_expert_cache_decode_layer_floor != 0) {
-        fprintf(stderr,
-                "ds4: Decode expert cache hybrid layer floor=%u (remaining slots stay global)\n",
-                g_stream_expert_cache_decode_layer_floor);
-    }
 }
 
 void ds4_gpu_stream_expert_cache_decode_eviction_policy_end(void) {
     g_stream_expert_cache_decode_lru_policy_active = 0;
     g_stream_expert_cache_decode_reuse_heat_policy_active = 0;
     g_stream_expert_cache_decode_probation_lru_policy_active = 0;
-    g_stream_expert_cache_decode_layer_floor = 0;
-}
-
-static int ds4_gpu_stream_expert_cache_entry_below_decode_floor(uint32_t layer) {
-    return g_stream_expert_cache_decode_layer_floor != 0 &&
-           layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER &&
-           g_stream_expert_cache_layer_count[layer] <=
-               g_stream_expert_cache_decode_layer_floor;
 }
 
 static uint64_t ds4_gpu_stream_expert_cache_probation_lookups(void) {
@@ -14703,9 +14666,6 @@ retry:
                                                             n_protect)) {
                 continue;
             }
-            if (ds4_gpu_stream_expert_cache_entry_below_decode_floor(layer)) {
-                continue;
-            }
             const float hotness =
                 ds4_gpu_stream_expert_cache_eviction_heat(layer, expert, e);
             if (hotness < lowest_hotness ||
@@ -14828,9 +14788,6 @@ retry:
                                                             protect_layer,
                                                             protect_ids,
                                                             n_protect)) {
-                continue;
-            }
-            if (ds4_gpu_stream_expert_cache_entry_below_decode_floor(layer)) {
                 continue;
             }
 
