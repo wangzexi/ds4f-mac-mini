@@ -18,6 +18,10 @@ prefill_full_layer_parallel_pread=${DS4F_SERVER_PREFILL_FULL_LAYER_PARALLEL_PREA
 # ordering at L3; it remains an explicit experiment until that numerical
 # divergence is eliminated.
 keep_hash_layer0=${DS4F_SERVER_KEEP_HASH_LAYER0:-1}
+# Preserve the three exact hash-routed layers, then reclaim L0 before the
+# learned stack.  On this fixed model that keeps the canonical L3 route while
+# freeing one 256-expert slab for all later prefill/decode staging.
+prefill_release_hash_layer0_after=${DS4F_SERVER_PREFILL_RELEASE_HASH_LAYER0_AFTER:-2}
 # Flash Decode selects at most six routed experts per transformer layer.  On
 # this Mini, a fresh 32-token exact A/B found five readers marginally faster
 # than six (the sixth only contends for the same SSD); both remain exact.
@@ -97,12 +101,21 @@ case "$keep_hash_layer0" in
         ;;
 esac
 
+case "$prefill_release_hash_layer0_after" in
+    0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32|33|34|35|36|37|38|39|40|41|42) ;;
+    *)
+        echo "DS4F_SERVER_PREFILL_RELEASE_HASH_LAYER0_AFTER must be a layer index 0..42" >&2
+        exit 2
+        ;;
+esac
+
 cd "$runtime_dir"
 exec env \
     DS4_METAL_STREAMING_EXPERT_PACK_PATH="$pack" \
     DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER=1 \
     DS4_METAL_PREFILL_STAGE_ALIAS=1 \
     DS4_METAL_KEEP_HASH_LAYER0="$keep_hash_layer0" \
+    DS4_METAL_PREFILL_RELEASE_HASH_LAYER0_AFTER="$prefill_release_hash_layer0_after" \
     DS4_METAL_PREFILL_FULL_LAYER_PARALLEL_PREAD="$prefill_full_layer_parallel_pread" \
     DS4_METAL_STREAMING_EXPERT_PREAD_THREADS="$pread_threads" \
     DS4_METAL_STREAMING_EXPERT_PREAD_POOL=1 \

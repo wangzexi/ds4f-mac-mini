@@ -33,6 +33,7 @@ DS4F_SERVER_TOKENS
 DS4F_SERVER_CACHE_EXPERTS
 DS4F_SERVER_PREFILL_FULL_LAYER_PARALLEL_PREAD
 DS4F_SERVER_KEEP_HASH_LAYER0
+DS4F_SERVER_PREFILL_RELEASE_HASH_LAYER0_AFTER
 DS4F_SERVER_PREAD_THREADS
 DS4F_SERVER_WORKING_SET_MIB
 DS4F_SERVER_PINNED_MIB
@@ -47,6 +48,12 @@ DS4F_SERVER_KV_CACHE_MIN_TOKENS
 Learned Router 数值路径。设为 `0` 的实验可以让后续 learned layer 连续整层预载，
 在 M4 Mini 的 1K Prefill 上从约 185 秒降至约 96–98 秒；但已测得它从 L3 的
 第一个 token 行开始改变 router 排序，因此在定位并消除该数值分歧前不得作为生产路径。
+
+生产路径保留 L0 直到 `DS4F_SERVER_PREFILL_RELEASE_HASH_LAYER0_AFTER=2`：三个
+hash-routed 层已经完整运行，随后在进入 learned stack 前归还 L0 的 256 个专家槽。
+512-token 精确测试的 22,231 条 Prefill 选路、两轮 32-token greedy 轨迹和输出哈希
+都与全程保留 L0 一致；Prefill 从约 89 秒降至 49–52 秒，Decode 从约 1.89 提升到
+2.43–2.46 token/s。
 
 默认还会在 `cache/kv/` 保留最多 10240MiB（10GiB）的磁盘 KV 前缀缓存。
 每次成功 response 已经发送给客户端后，server 同步保存当前完整 token frontier
