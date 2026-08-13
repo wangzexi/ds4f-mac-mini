@@ -27460,6 +27460,50 @@ static ds4_gpu_tensor *metal_graph_tensor_row_view(
                                  row_values * sizeof(float));
 }
 
+/* The single-token graph's dump hooks above naturally address one tensor row.
+ * Layer-major prefill instead keeps a whole chunk in each workspace tensor,
+ * so a dump position that is not the chunk's first token used to be
+ * unobservable.  Keep this strictly diagnostic: normal runs never allocate a
+ * view, synchronize, or read back anything here. */
+static void metal_graph_debug_dump_batch_f32_row(
+        const char       *name,
+        ds4_gpu_tensor  *base,
+        uint64_t          row_values,
+        uint32_t          il,
+        uint32_t          pos0,
+        uint32_t          n_rows) {
+    if (!base || row_values == 0 || n_rows == 0) return;
+    for (uint32_t row = 0; row < n_rows; row++) {
+        const uint32_t pos = pos0 + row;
+        if (!metal_graph_debug_wants(name, il, pos)) continue;
+        ds4_gpu_tensor *view = metal_graph_tensor_row_view(base, row, row_values);
+        if (view) {
+            metal_graph_debug_dump_tensor(name, view, row_values, il, pos);
+            ds4_gpu_tensor_free(view);
+        }
+    }
+}
+
+static void metal_graph_debug_dump_batch_i32_row(
+        const char       *name,
+        ds4_gpu_tensor  *base,
+        uint64_t          row_values,
+        uint32_t          il,
+        uint32_t          pos0,
+        uint32_t          n_rows) {
+    if (!base || row_values == 0 || n_rows == 0) return;
+    for (uint32_t row = 0; row < n_rows; row++) {
+        const uint32_t pos = pos0 + row;
+        if (!metal_graph_debug_wants(name, il, pos)) continue;
+        const uint64_t bytes = row_values * sizeof(int32_t);
+        ds4_gpu_tensor *view = ds4_gpu_tensor_view(base, (uint64_t)row * bytes, bytes);
+        if (view) {
+            metal_graph_debug_dump_i32_tensor(name, view, row_values, il, pos);
+            ds4_gpu_tensor_free(view);
+        }
+    }
+}
+
 /* Upload prompt token ids for kernels that need token-aware hash routing. */
 static bool metal_graph_upload_prompt_tokens(
         ds4_gpu_tensor *out_tokens,
@@ -28088,6 +28132,11 @@ static bool metal_graph_encode_layer_attention_batch(
     ds4_gpu_tensor *after_attn_hc_view = ds4_gpu_tensor_view(
             metal_graph_batch_after_attn_hc(g), 0, (uint64_t)n_tokens * hc_dim * sizeof(float));
     bool ok = hc_mix_view && hc_split_view && attn_cur_view && after_attn_hc_view;
+    if (ok) {
+        metal_graph_debug_dump_batch_f32_row("prefill_hc_attn_pre",
+                                             metal_graph_batch_cur_hc(g), hc_dim,
+                                             il, pos0, n_tokens);
+    }
     const bool fuse_hc_norm = n_tokens > 1 &&
                               DS4_N_HC == 4 &&
                               !metal_graph_use_reference_hc_decode() &&
@@ -29696,6 +29745,9 @@ static bool metal_graph_encode_layer_attention_batch(
         if (ok) {
             metal_graph_debug_dump_tensor("attn_out", metal_graph_batch_attn_out(g),
                                           (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
+            metal_graph_debug_dump_batch_f32_row("prefill_attn_out",
+                                                 metal_graph_batch_attn_out(g), DS4_N_EMBD,
+                                                 il, pos0, n_tokens);
         }
     }
     DS4_METAL_PROFILE_ATTN_STAGE("output_proj");
@@ -29744,6 +29796,9 @@ static bool metal_graph_encode_layer_attention_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", metal_graph_batch_after_attn_hc(g),
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
+        metal_graph_debug_dump_batch_f32_row("prefill_hc_attn_post",
+                                             metal_graph_batch_after_attn_hc(g), hc_dim,
+                                             il, pos0, n_tokens);
     }
     DS4_METAL_PROFILE_ATTN_STAGE("hc_post");
     ds4_gpu_tensor_free(tp_attn_out);
@@ -29877,6 +29932,9 @@ static bool metal_graph_encode_layer_ffn_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_pre", metal_graph_batch_ffn_cur(g),
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
+        metal_graph_debug_dump_batch_f32_row("prefill_hc_ffn_pre",
+                                             metal_graph_batch_ffn_cur(g), DS4_N_EMBD,
+                                             il, pos0, n_tokens);
     }
     DS4_METAL_PROFILE_FFN_STAGE("hc_pre");
     if (ok && !fuse_hc_norm) {
@@ -29937,6 +29995,15 @@ static bool metal_graph_encode_layer_ffn_batch(
                                           (uint64_t)n_tokens * DS4_N_EXPERT_USED, il, pos0);
         metal_graph_debug_dump_tensor("ffn_moe_weights_scaled", metal_graph_batch_router_weights(g),
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED, il, pos0);
+        metal_graph_debug_dump_batch_f32_row("prefill_ffn_moe_logits",
+                                             metal_graph_batch_router_logits(g), DS4_N_EXPERT,
+                                             il, pos0, n_tokens);
+        metal_graph_debug_dump_batch_i32_row("prefill_ffn_moe_topk",
+                                             metal_graph_batch_router_selected(g), DS4_N_EXPERT_USED,
+                                             il, pos0, n_tokens);
+        metal_graph_debug_dump_batch_f32_row("prefill_ffn_moe_weights_scaled",
+                                             metal_graph_batch_router_weights(g), DS4_N_EXPERT_USED,
+                                             il, pos0, n_tokens);
     }
     DS4_METAL_PROFILE_FFN_STAGE("router");
 
@@ -30289,6 +30356,9 @@ static bool metal_graph_encode_layer_ffn_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("ffn_moe_out", metal_graph_batch_routed_out(g),
                                       (uint64_t)n_tokens * DS4_N_EMBD, il, pos0);
+        metal_graph_debug_dump_batch_f32_row("prefill_ffn_moe_out",
+                                             metal_graph_batch_routed_out(g), DS4_N_EMBD,
+                                             il, pos0, n_tokens);
     }
     DS4_METAL_PROFILE_FFN_STAGE("routed_moe");
     if (!shared_done) {
@@ -30387,6 +30457,9 @@ static bool metal_graph_encode_layer_ffn_batch(
     if (ok) {
         metal_graph_debug_dump_tensor("hc_ffn_post", metal_graph_batch_next_hc(g),
                                       (uint64_t)n_tokens * hc_dim, il, pos0);
+        metal_graph_debug_dump_batch_f32_row("prefill_hc_ffn_post",
+                                             metal_graph_batch_next_hc(g), hc_dim,
+                                             il, pos0, n_tokens);
     }
     DS4_METAL_PROFILE_FFN_STAGE("hc_post");
     ds4_gpu_tensor_free(tp_ffn_x);
