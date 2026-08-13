@@ -85,6 +85,22 @@ The summary's decision metric is `generation_tps_p50`, which excludes process
 startup and the prompt Prefill.  It also reports per-token Decode p50/p95 from
 the exact greedy trace.  `wall_s_p50` remains only as a whole-run sanity check.
 
+For the final I/O decision, prefer the production-path matrix: it starts the
+real one-session server for each PREAD concurrency setting, including L0 and
+static Decode-trunk preloading plus the request memory planner.  It is
+exclusive: stop production first, then restore it afterwards.
+
+```sh
+scripts/bench-server-exact-io-matrix.sh
+python3 scripts/summarize-server-exact-io-matrix.py \
+  results/benchmarks/server-exact-io-*/
+```
+
+It rejects a running `ds4f-server`, uses an isolated temporary KV directory,
+and requires the generated token-ID trace and final response bytes to match in
+every run.  Decode has six packed expert reads at most, so its useful PREAD
+matrix is 1/2/3/4/6 threads; larger values cannot add storage parallelism.
+
 Each log keeps the global cache hit/miss counts, selected-expert read timing,
 per-layer stats, process wall time, and cumulative Metal GPU-busy time.  The
 matrix exists to decide whether the next change should be I/O queueing,

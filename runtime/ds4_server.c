@@ -11982,6 +11982,7 @@ decode_again:
     size_t tool_scan_from = 0;
     int next_tool_progress = 128;
     int next_decode_log = 50;
+    const bool trace_token_ids = getenv("DS4_SERVER_TRACE_TOKEN_IDS") != NULL;
     if (max_tokens < 0) max_tokens = 0;
     if (max_tokens > room) max_tokens = room;
     trace_event(s, trace_id, "prefill done; decode_max=%d ctx_room=%d", max_tokens, room);
@@ -12073,6 +12074,17 @@ decode_again:
             size_t piece_len = 0;
             char *piece = ds4_token_text(s->engine, token, &piece_len);
             completion++;
+
+            /* Benchmark-only exactness witness.  The public response remains
+             * unchanged; this lets an actual long-lived server compare greedy
+             * token IDs across storage/I/O scheduler variants, rather than
+             * comparing only rendered text. */
+            if (trace_token_ids) {
+                server_log(DS4_LOG_GENERATION,
+                           "ds4-server: trace token[%d]=%d",
+                           completion - 1,
+                           token);
+            }
 
             trace_piece(s, trace_id, piece, piece_len);
             buf_append(&text, piece, piece_len);
