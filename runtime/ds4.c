@@ -19961,6 +19961,19 @@ static uint32_t metal_graph_prefill_io_chunk_mib(void) {
     return 32u;
 }
 
+/* Keep L0 through the fixed hash prefix, then optionally reclaim its slab at
+ * a completed layer boundary.  This is a numerical-isolation probe: it lets
+ * us distinguish an early hash-layer lifetime issue from later learned-layer
+ * staging without changing the model's route or arithmetic. */
+static uint32_t metal_graph_prefill_release_hash_layer0_after(void) {
+    const char *env = getenv("DS4_METAL_PREFILL_RELEASE_HASH_LAYER0_AFTER");
+    if (!env || !env[0]) return UINT32_MAX;
+    char *end = NULL;
+    const unsigned long value = strtoul(env, &end, 10);
+    if (end == env || *end != '\0' || value >= DS4_N_LAYER) return UINT32_MAX;
+    return (uint32_t)value;
+}
+
 static uint32_t metal_graph_prefill_hash_expert_union(
         const ds4_model         *model,
         const ds4_layer_weights *layer,
@@ -34512,6 +34525,8 @@ static bool metal_graph_prefill_layer_major_decode_rows(
         strcmp(layer_profile_env, "0") != 0;
     uint32_t interrupted_layer = UINT32_MAX;
     uint32_t interrupted_row = UINT32_MAX;
+    const uint32_t release_hash_layer0_after =
+        metal_graph_prefill_release_hash_layer0_after();
     int32_t hash_expert_ids[DS4_N_HASH_LAYER][DS4_N_EXPERT];
     uint32_t hash_expert_counts[DS4_N_HASH_LAYER];
     memset(hash_expert_counts, 0, sizeof(hash_expert_counts));
@@ -34692,6 +34707,12 @@ static bool metal_graph_prefill_layer_major_decode_rows(
                         il, metal_graph_prefill_tail_expert_handoff_keep());
             } else {
                 ds4_gpu_stream_expert_cache_release_layer(il);
+            }
+            if (il == release_hash_layer0_after) {
+                ds4_gpu_stream_expert_cache_release_layer_force(0);
+                fprintf(stderr,
+                        "ds4: exact prefill released retained hash layer 0 after layer=%u\n",
+                        il);
             }
         }
 

@@ -15911,6 +15911,15 @@ void ds4_gpu_stream_expert_cache_release_layer(uint32_t layer) {
     }
 }
 
+void ds4_gpu_stream_expert_cache_release_layer_force(uint32_t layer) {
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return;
+    for (uint32_t expert = 0;
+         expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+         expert++) {
+        ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
+    }
+}
+
 void ds4_gpu_stream_expert_cache_release_layer_keep_recent(uint32_t layer,
                                                             uint32_t keep) {
     if (layer == 0 &&

@@ -302,6 +302,9 @@ int ds4_gpu_stream_expert_layer_prefetch_activate(
         const ds4_gpu_stream_expert_table *table);
 void ds4_gpu_stream_expert_layer_prefetch_cancel_all(void);
 void ds4_gpu_stream_expert_cache_release_layer(uint32_t layer);
+/* Diagnostic Prefill scheduling override: bypass the L0 keep policy after
+ * an exact layer boundary.  This never alters expert payload or math. */
+void ds4_gpu_stream_expert_cache_release_layer_force(uint32_t layer);
 /* Drop a finished prefill layer but preserve its most-recently-used expert
  * entries.  The exact layer-major prefill uses this to hand the tail-token
  * route to the first decode token without issuing another SSD read. */
