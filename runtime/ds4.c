@@ -31236,6 +31236,20 @@ static bool metal_graph_decode_hash_prefetch_requested(void) {
            getenv("DS4_METAL_DISABLE_DECODE_HASH_PREFETCH") == NULL;
 }
 
+static uint32_t metal_graph_decode_hash_prefetch_mask(uint32_t hash_layers) {
+    /* The fixed Mini has three hash layers.  A bitmask keeps the A/B surface
+     * narrow: 1=L0, 2=L1, 4=L2.  The default requests all known hash layers;
+     * experiments can isolate the useful lookahead without changing code. */
+    uint32_t mask = hash_layers >= 32u ? UINT32_MAX :
+        ((1u << hash_layers) - 1u);
+    const char *env = getenv("DS4_METAL_DECODE_HASH_PREFETCH_MASK");
+    if (!env || !env[0]) return mask;
+    char *end = NULL;
+    const unsigned long value = strtoul(env, &end, 0);
+    if (end == env || *end != '\0' || value > UINT32_MAX) return mask;
+    return (uint32_t)value & mask;
+}
+
 static void metal_graph_decode_prefetch_hash_layers(
         const ds4_gpu_graph *g,
         const ds4_model     *model,
@@ -31249,7 +31263,9 @@ static void metal_graph_decode_prefetch_hash_layers(
 
     const uint32_t hash_layers =
         DS4_N_HASH_LAYER < DS4_N_LAYER ? DS4_N_HASH_LAYER : DS4_N_LAYER;
+    const uint32_t mask = metal_graph_decode_hash_prefetch_mask(hash_layers);
     for (uint32_t il = 0; il < hash_layers; il++) {
+        if ((mask & (1u << il)) == 0) continue;
         const ds4_layer_weights *layer = &weights->layer[il];
         if (!layer->ffn_gate_tid2eid || !layer->ffn_gate_exps ||
             !layer->ffn_up_exps || !layer->ffn_down_exps) {
