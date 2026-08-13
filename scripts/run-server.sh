@@ -13,10 +13,11 @@ context=${DS4F_SERVER_CONTEXT:-32768}
 tokens=${DS4F_SERVER_TOKENS:-4096}
 cache_experts=${DS4F_SERVER_CACHE_EXPERTS:-1800}
 prefill_full_layer_parallel_pread=${DS4F_SERVER_PREFILL_FULL_LAYER_PARALLEL_PREAD:-1}
-# Keep L0 only until its current Prefill pass completes.  Releasing its full
-# 256-expert startup slab gives the next learned layer enough room for its
-# own full, exact asynchronous staging buffer.
-keep_hash_layer0=${DS4F_SERVER_KEEP_HASH_LAYER0:-0}
+# Keep the full L0 slab in the canonical server path.  Releasing it gives a
+# much faster long Prefill, but currently changes the first learned-router
+# ordering at L3; it remains an explicit experiment until that numerical
+# divergence is eliminated.
+keep_hash_layer0=${DS4F_SERVER_KEEP_HASH_LAYER0:-1}
 # Flash Decode selects at most six routed experts per transformer layer.  On
 # this Mini, a fresh 32-token exact A/B found five readers marginally faster
 # than six (the sixth only contends for the same SSD); both remain exact.
