@@ -698,7 +698,6 @@ static float
 static int g_stream_expert_cache_churn_profile_active;
 static int g_stream_expert_cache_decode_lru_policy_active;
 static int g_stream_expert_cache_decode_reuse_heat_policy_active;
-static int g_stream_expert_cache_decode_twoq_policy_active;
 static uint8_t
     g_stream_expert_cache_churn_profile_loaded[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
 static uint8_t
@@ -13392,11 +13391,8 @@ void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(void) {
         policy && strcmp(policy, "lru") == 0;
     g_stream_expert_cache_decode_reuse_heat_policy_active =
         policy && strcmp(policy, "reuse-heat") == 0;
-    g_stream_expert_cache_decode_twoq_policy_active =
-        policy && strcmp(policy, "2q") == 0;
     if (policy && policy[0] && !g_stream_expert_cache_decode_lru_policy_active &&
         !g_stream_expert_cache_decode_reuse_heat_policy_active &&
-        !g_stream_expert_cache_decode_twoq_policy_active &&
         strcmp(policy, "heat") != 0) {
         fprintf(stderr,
                 "ds4: unknown Decode expert eviction policy %s; using heat+LRU\n",
@@ -13408,16 +13404,12 @@ void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(void) {
     } else if (g_stream_expert_cache_decode_reuse_heat_policy_active) {
         fprintf(stderr,
                 "ds4: Decode expert eviction policy=reuse-heat (Prefill remains heat+LRU)\n");
-    } else if (g_stream_expert_cache_decode_twoq_policy_active) {
-        fprintf(stderr,
-                "ds4: Decode expert eviction policy=2q (55%% probation, Prefill remains heat+LRU)\n");
     }
 }
 
 void ds4_gpu_stream_expert_cache_decode_eviction_policy_end(void) {
     g_stream_expert_cache_decode_lru_policy_active = 0;
     g_stream_expert_cache_decode_reuse_heat_policy_active = 0;
-    g_stream_expert_cache_decode_twoq_policy_active = 0;
 }
 
 static float ds4_gpu_stream_expert_cache_eviction_heat(
@@ -13425,27 +13417,11 @@ static float ds4_gpu_stream_expert_cache_eviction_heat(
         uint32_t                                      expert,
         const ds4_gpu_stream_expert_cache_entry      *entry) {
     if (g_stream_expert_cache_decode_lru_policy_active ||
-        g_stream_expert_cache_decode_twoq_policy_active ||
         (g_stream_expert_cache_decode_reuse_heat_policy_active &&
          (!entry || entry->use_count < 2))) {
         return 0.0f;
     }
     return g_stream_expert_cache_route_hotness[layer][expert];
-}
-
-/* Decode-only 2Q admission.  A freshly loaded expert remains in the
- * probation queue (use_count == 1); the first hit promotes it into the main
- * queue.  When a cache miss needs a reusable buffer, keep about 55% of the
- * evictable entries available to probation.  That split was selected from
- * the fixed Mini's recorded 1K Decode trace, not guessed from a generic
- * workload. */
-static int ds4_gpu_stream_expert_cache_twoq_wants_probation_victim(
-        uint32_t eligible,
-        uint32_t probation) {
-    if (!g_stream_expert_cache_decode_twoq_policy_active || eligible == 0) {
-        return -1;
-    }
-    return probation * 100u >= eligible * 55u;
 }
 
 static void ds4_gpu_stream_expert_cache_note_tokens(uint32_t layer_index,
@@ -14465,32 +14441,12 @@ static void ds4_gpu_stream_expert_cache_prune_layer(
         uint32_t victim = UINT32_MAX;
         float lowest_hotness = FLT_MAX;
         uint64_t oldest = UINT64_MAX;
-        uint32_t eligible = 0;
-        uint32_t probation = 0;
         for (uint32_t expert = 0; expert < n_total_expert; expert++) {
             ds4_gpu_stream_expert_cache_entry *e =
                 &g_stream_expert_cache[layer][expert];
             if (!e->valid ||
                 ds4_gpu_stream_expert_cache_entry_inflight(e) ||
                 ds4_gpu_stream_expert_cache_is_protected(expert, protect_ids, n_protect)) {
-                continue;
-            }
-            eligible++;
-            if (e->use_count <= 1) probation++;
-        }
-        const int want_probation =
-            ds4_gpu_stream_expert_cache_twoq_wants_probation_victim(eligible,
-                                                                      probation);
-        for (uint32_t expert = 0; expert < n_total_expert; expert++) {
-            ds4_gpu_stream_expert_cache_entry *e =
-                &g_stream_expert_cache[layer][expert];
-            if (!e->valid ||
-                ds4_gpu_stream_expert_cache_entry_inflight(e) ||
-                ds4_gpu_stream_expert_cache_is_protected(expert, protect_ids, n_protect)) {
-                continue;
-            }
-            if (want_probation >= 0 &&
-                ((e->use_count <= 1) ? 1 : 0) != want_probation) {
                 continue;
             }
             const float hotness =
@@ -14577,32 +14533,6 @@ retry:
     const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
     const double scan_t0 = timing ? ds4_gpu_now_ms() : 0.0;
     uint64_t scan_entries = 0;
-    uint32_t twoq_eligible = 0;
-    uint32_t twoq_probation = 0;
-    if (g_stream_expert_cache_decode_twoq_policy_active) {
-        for (uint32_t layer = 0;
-             layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
-             layer++) {
-            for (uint32_t expert = 0;
-                 expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
-                 expert++) {
-                ds4_gpu_stream_expert_cache_entry *e =
-                    &g_stream_expert_cache[layer][expert];
-                if (!ds4_gpu_stream_expert_cache_entry_reusable(
-                        e, gate_expert_bytes, down_expert_bytes) ||
-                    ds4_gpu_stream_expert_cache_entry_inflight(e) ||
-                    ds4_gpu_stream_expert_cache_entry_protected(
-                        layer, expert, protect_layer, protect_ids, n_protect)) {
-                    continue;
-                }
-                twoq_eligible++;
-                if (e->use_count <= 1) twoq_probation++;
-            }
-        }
-    }
-    const int twoq_want_probation =
-        ds4_gpu_stream_expert_cache_twoq_wants_probation_victim(
-                twoq_eligible, twoq_probation);
     for (uint32_t layer = 0;
          layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
          layer++) {
@@ -14626,10 +14556,6 @@ retry:
                                                             protect_layer,
                                                             protect_ids,
                                                             n_protect)) {
-                continue;
-            }
-            if (twoq_want_probation >= 0 &&
-                ((e->use_count <= 1) ? 1 : 0) != twoq_want_probation) {
                 continue;
             }
             const float hotness =
@@ -14724,32 +14650,6 @@ retry:
     const int timing = ds4_gpu_stream_expert_timing_summary_enabled();
     const double scan_t0 = timing ? ds4_gpu_now_ms() : 0.0;
     uint64_t scan_entries = 0;
-    uint32_t twoq_eligible = 0;
-    uint32_t twoq_probation = 0;
-    if (g_stream_expert_cache_decode_twoq_policy_active) {
-        for (uint32_t layer = 0;
-             layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
-             layer++) {
-            for (uint32_t expert = 0;
-                 expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
-                 expert++) {
-                ds4_gpu_stream_expert_cache_entry *e =
-                    &g_stream_expert_cache[layer][expert];
-                if (!ds4_gpu_stream_expert_cache_entry_reusable(
-                        e, gate_expert_bytes, down_expert_bytes) ||
-                    ds4_gpu_stream_expert_cache_entry_inflight(e) ||
-                    ds4_gpu_stream_expert_cache_entry_protected(
-                        layer, expert, protect_layer, protect_ids, n_protect)) {
-                    continue;
-                }
-                twoq_eligible++;
-                if (e->use_count <= 1) twoq_probation++;
-            }
-        }
-    }
-    const int twoq_want_probation =
-        ds4_gpu_stream_expert_cache_twoq_wants_probation_victim(
-                twoq_eligible, twoq_probation);
     for (uint32_t i = 0; i < n_needed; i++) {
         victim_layers[i] = UINT32_MAX;
         victim_experts[i] = UINT32_MAX;
@@ -14780,10 +14680,6 @@ retry:
                                                             protect_layer,
                                                             protect_ids,
                                                             n_protect)) {
-                continue;
-            }
-            if (twoq_want_probation >= 0 &&
-                ((e->use_count <= 1) ? 1 : 0) != twoq_want_probation) {
                 continue;
             }
 
