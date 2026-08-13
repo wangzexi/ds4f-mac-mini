@@ -132,7 +132,7 @@ for threads in "${threads_list[@]}"; do
             DS4F_SERVER_KV_CACHE_DIR="$kv_dir" \
             DS4F_SERVER_KV_CACHE_MIB=1 \
             DS4F_SERVER_KV_CACHE_MIN_TOKENS=32769 \
-            DS4_METAL_STREAMING_EXPERT_PREAD_THREADS="$threads" \
+            DS4F_SERVER_PREAD_THREADS="$threads" \
             DS4_METAL_STREAMING_EXPERT_PREAD_POOL=1 \
             DS4_METAL_STREAMING_EXPERT_PREAD_PROFILE=1 \
             DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY=1 \
