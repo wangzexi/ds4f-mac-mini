@@ -13241,13 +13241,14 @@ static void ds4_gpu_stream_expert_cache_note_selected_hotness(
         uint32_t       layer,
         const int32_t *selected_ids,
         const float   *selected_weights,
-        uint32_t       n_selected) {
+        uint32_t       n_selected,
+        int            profile_prediction) {
     if (!selected_ids ||
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         n_selected == 0) {
         return;
     }
-    if (g_stream_expert_heat_predict_active) {
+    if (profile_prediction && g_stream_expert_heat_predict_active) {
         for (uint32_t i = 0; i < n_selected; i++) {
             if (selected_ids[i] < 0 ||
                 selected_ids[i] >=
@@ -13292,7 +13293,7 @@ void ds4_gpu_stream_expert_cache_note_route_weights(
         const float   *selected_weights,
         uint32_t       n_selected) {
     ds4_gpu_stream_expert_cache_note_selected_hotness(
-            layer, selected_ids, selected_weights, n_selected);
+            layer, selected_ids, selected_weights, n_selected, 0);
 }
 
 static void ds4_gpu_stream_expert_cache_note_tokens(uint32_t layer_index,
@@ -35813,7 +35814,8 @@ int ds4_gpu_glm_routed_moe_one_tensor(
                 ds4_gpu_stream_expert_cache_note_selected_hotness(layer_index,
                                                                   stream_selected_ids,
                                                                   stream_selected_weights,
-                                                                  n_expert);
+                                                                  n_expert,
+                                                                  1);
                 if (!ds4_gpu_moe_selected_hotlist_record(layer_index,
                                                          stream_selected_ids,
                                                          n_expert,
@@ -38832,7 +38834,8 @@ int ds4_gpu_routed_moe_one_tensor(
                         layer_index,
                         selected_ids,
                         selected_route_weights,
-                        n_expert);
+                        n_expert,
+                        1);
                 if (!ds4_gpu_moe_selected_trace_record(selected_ids, n_expert) ||
                     !ds4_gpu_moe_selected_hotlist_record(layer_index,
                                                          selected_ids,
