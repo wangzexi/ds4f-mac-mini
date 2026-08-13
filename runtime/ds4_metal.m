@@ -448,6 +448,11 @@ static int ds4_gpu_stream_expert_cache_note_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes);
 static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void);
+static int ds4_gpu_stream_expert_cache_per_layer_policy(void);
+static uint32_t ds4_gpu_stream_expert_cache_effective_cap(
+        uint32_t layer,
+        uint32_t n_total_expert,
+        uint32_t n_selected);
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats);
 static void ds4_gpu_stream_expert_pending_load_clear(void);
 static void ds4_gpu_stream_expert_pread_pool_shutdown(void);
@@ -3456,11 +3461,14 @@ void ds4_gpu_print_memory_report(const char *label) {
         const uint64_t lookups = g_stream_expert_cache_hits + g_stream_expert_cache_misses;
         const double hit_rate = lookups ?
             (double)g_stream_expert_cache_hits / (double)lookups : 0.0;
+        const char *policy = ds4_gpu_stream_expert_cache_per_layer_policy() ?
+            "per-layer-lru" : "global-heat-lru";
         if (g_stream_expert_cache_evict_advise_bytes != 0 ||
             g_stream_expert_cache_willneed_advise_bytes != 0 ||
             g_stream_expert_cache_pread_bytes != 0) {
             fprintf(stderr,
-                    "ds4:   streaming expert cache budget=%llu experts entries=%u expert=%.2f MiB target=%.2f GiB live=%.2f GiB, hits=%llu misses=%llu hit_rate=%.3f wraps=%llu evictions=%llu buffer_allocs=%llu buffer_reuses=%llu evict_dontneed=%.2f GiB miss_willneed=%.2f GiB miss_pread=%.2f GiB pread_ms=%.3f\n",
+                    "ds4:   streaming expert cache policy=%s budget=%llu experts entries=%u expert=%.2f MiB target=%.2f GiB live=%.2f GiB, hits=%llu misses=%llu hit_rate=%.3f wraps=%llu evictions=%llu buffer_allocs=%llu buffer_reuses=%llu evict_dontneed=%.2f GiB miss_willneed=%.2f GiB miss_pread=%.2f GiB pread_ms=%.3f\n",
+                    policy,
                     (unsigned long long)budget,
                     g_stream_expert_cache_entry_count,
                     ds4_gpu_mib(g_stream_expert_cache_expert_bytes),
@@ -3479,7 +3487,8 @@ void ds4_gpu_print_memory_report(const char *label) {
                     g_stream_expert_cache_pread_ms);
         } else {
             fprintf(stderr,
-                    "ds4:   streaming expert cache budget=%llu experts entries=%u expert=%.2f MiB target=%.2f GiB live=%.2f GiB, hits=%llu misses=%llu hit_rate=%.3f wraps=%llu evictions=%llu buffer_allocs=%llu buffer_reuses=%llu\n",
+                    "ds4:   streaming expert cache policy=%s budget=%llu experts entries=%u expert=%.2f MiB target=%.2f GiB live=%.2f GiB, hits=%llu misses=%llu hit_rate=%.3f wraps=%llu evictions=%llu buffer_allocs=%llu buffer_reuses=%llu\n",
+                    policy,
                     (unsigned long long)budget,
                     g_stream_expert_cache_entry_count,
                     ds4_gpu_mib(g_stream_expert_cache_expert_bytes),
@@ -3532,8 +3541,10 @@ void ds4_gpu_print_memory_report(const char *label) {
                 const uint32_t cached =
                     g_stream_expert_cache_layer_count[layer];
                 const uint32_t layer_slots =
-                    ds4_gpu_stream_expert_cache_configured_count() != 0 ?
-                        DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT : 0;
+                    ds4_gpu_stream_expert_cache_effective_cap(
+                            layer,
+                            DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT,
+                            DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED);
                 if (lookups == 0 && evictions == 0 && pread_bytes == 0 &&
                     cached == 0) {
                     continue;
@@ -11587,6 +11598,85 @@ static uint32_t ds4_gpu_stream_expert_cache_configured_budget(void) {
         requested - g_stream_expert_layer_prefetch_reserved_experts : 0;
 }
 
+/* Flash-0731 has 43 MoE layers.  The default global policy is useful when a
+ * generic model has uneven layers, but it lets one layer evict useful entries
+ * belonging to another even though routed weights never cross layer
+ * boundaries.  The fixed-model server can instead request a hard per-layer
+ * partition.  Layer 0 remains the separately protected 256-expert hash
+ * layer; the remaining slots are divided exactly among learned layers. */
+static int ds4_gpu_stream_expert_cache_per_layer_policy(void) {
+    static int checked = 0;
+    static int enabled = 0;
+    if (!checked) {
+        const char *policy = getenv("DS4_METAL_STREAMING_EXPERT_CACHE_POLICY");
+        enabled = policy &&
+            (!strcmp(policy, "per-layer") || !strcmp(policy, "per_layer"));
+        checked = 1;
+    }
+    return enabled;
+}
+
+static uint32_t ds4_gpu_stream_expert_cache_policy_layer_count(void) {
+    static int checked = 0;
+    static uint32_t count = 43;
+    if (!checked) {
+        const char *value = getenv("DS4_METAL_STREAMING_EXPERT_CACHE_LAYER_COUNT");
+        if (value && value[0]) {
+            char *end = NULL;
+            errno = 0;
+            unsigned long parsed = strtoul(value, &end, 10);
+            if (end != value && *end == '\0' && errno == 0 &&
+                parsed >= 2 &&
+                parsed <= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) {
+                count = (uint32_t)parsed;
+            } else {
+                fprintf(stderr,
+                        "ds4: invalid DS4_METAL_STREAMING_EXPERT_CACHE_LAYER_COUNT=%s; using 43\\n",
+                        value);
+            }
+        }
+        checked = 1;
+    }
+    return count;
+}
+
+static uint32_t ds4_gpu_stream_expert_cache_layer_budget(
+        uint32_t layer,
+        uint32_t n_total_expert,
+        uint32_t n_selected) {
+    const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
+    if (budget == 0) return 0;
+    if (!ds4_gpu_stream_expert_cache_per_layer_policy()) {
+        uint32_t cap = n_total_expert;
+        if (cap < n_selected) cap = n_selected;
+        if (cap > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+            cap = DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+        }
+        return cap;
+    }
+
+    const uint32_t layers = ds4_gpu_stream_expert_cache_policy_layer_count();
+    if (layer >= layers) return n_selected;
+    if (layer == 0 && ds4_gpu_stream_expert_cache_keep_hash_layer_zero()) {
+        return n_total_expert;
+    }
+
+    const uint32_t protected_hash =
+        ds4_gpu_stream_expert_cache_keep_hash_layer_zero() ?
+        DS4_METAL_HASH_LAYER0_EXPERTS : 0u;
+    const uint32_t distributable = budget > protected_hash ?
+        budget - protected_hash : 0u;
+    const uint32_t learned_layers = layers - 1u;
+    uint32_t cap = distributable / learned_layers;
+    /* Spread remainder deterministically over learned layers, making the
+     * sum of layer caps exactly equal to the supplied total cache budget. */
+    const uint32_t remainder = distributable % learned_layers;
+    if (layer >= 1u && layer <= remainder) cap++;
+    if (cap < n_selected) cap = n_selected;
+    if (cap > n_total_expert) cap = n_total_expert;
+    return cap;
+}
+
 static uint32_t ds4_gpu_stream_expert_cache_configured_mlock_budget(void) {
     uint32_t budget = g_stream_expert_cache_mlock_budget_override;
     const uint32_t total = ds4_gpu_stream_expert_cache_configured_budget();
@@ -11602,21 +11692,9 @@ static uint32_t ds4_gpu_stream_expert_cache_effective_cap(
         uint32_t layer,
         uint32_t n_total_expert,
         uint32_t n_selected) {
-    (void)layer;
-    if (ds4_gpu_stream_expert_cache_configured_budget() == 0) return 0;
-
-    /*
-     * The residency policy is global: every layer can use any expert slot it
-     * routes to, and global pruning decides which existing entry is least
-     * valuable.  A per-layer cap made cache size depend on model depth rather
-     * than the actual byte budget.
-     */
-    uint32_t cap = n_total_expert;
-    if (cap < n_selected) cap = n_selected;
-    if (cap > DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
-        cap = DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
-    }
-    return cap;
+    return ds4_gpu_stream_expert_cache_layer_budget(layer,
+                                                    n_total_expert,
+                                                    n_selected);
 }
 
 static int ds4_gpu_stream_expert_timing_summary_enabled(void) {
@@ -14402,6 +14480,10 @@ retry:
     for (uint32_t layer = 0;
          layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
          layer++) {
+        if (ds4_gpu_stream_expert_cache_per_layer_policy() &&
+            layer != protect_layer) {
+            continue;
+        }
         for (uint32_t expert = 0;
              expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
              expert++) {
@@ -14526,6 +14608,10 @@ retry:
     for (uint32_t layer = 0;
          layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
          layer++) {
+        if (ds4_gpu_stream_expert_cache_per_layer_policy() &&
+            layer != protect_layer) {
+            continue;
+        }
         for (uint32_t expert = 0;
              expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
              expert++) {
@@ -14812,6 +14898,15 @@ static int ds4_gpu_stream_expert_cache_prepare_load_buffers(
     *up_inner = 0;
     *down_inner = 0;
 
+    if (!force_reuse && ds4_gpu_stream_expert_cache_per_layer_policy() &&
+        g_stream_expert_cache_layer_count[layer] >=
+            ds4_gpu_stream_expert_cache_effective_cap(
+                    layer,
+                    DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT,
+                    DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED)) {
+        force_reuse = 1;
+    }
+
     ds4_gpu_stream_expert_reusable_buffers reuse = { nil, nil, nil, 0, 0, 0 };
     ds4_gpu_stream_expert_cache_entry *e =
         &g_stream_expert_cache[layer][expert];
@@ -14935,6 +15030,7 @@ static void ds4_gpu_stream_expert_cache_prune_global(
         uint32_t protect_layer,
         const int32_t *protect_ids,
         uint32_t n_protect) {
+    if (ds4_gpu_stream_expert_cache_per_layer_policy()) return;
     const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
     if (budget == 0 || g_stream_expert_cache_entry_count <= budget) return;
 
