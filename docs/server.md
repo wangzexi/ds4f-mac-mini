@@ -32,6 +32,7 @@ DS4F_SERVER_CONTEXT
 DS4F_SERVER_TOKENS
 DS4F_SERVER_CACHE_EXPERTS
 DS4F_SERVER_PREFILL_FULL_LAYER_PARALLEL_PREAD
+DS4F_SERVER_PREAD_THREADS
 DS4F_SERVER_WORKING_SET_MIB
 DS4F_SERVER_PINNED_MIB
 DS4F_SERVER_DECODE_PINNED_MIB
@@ -128,6 +129,25 @@ POST /v1/responses
 POST /v1/completions
 POST /v1/messages
 ```
+
+### Decode 专家读取并发
+
+2026-08-13 的实际单会话 server 基准（每档冷启动两次、L0 和静态 Decode 主干均预热、
+`你好` → 32 个 exact greedy token）证实，PREAD 读者数是当前 Decode 的直接瓶颈之一：
+
+| PREAD readers | Decode median | 32-token Decode median |
+|---:|---:|---:|
+| 1 | 1.50 t/s | 21.44 s |
+| 2 | 1.80 t/s | 17.85 s |
+| 3 | 1.82 t/s | 17.69 s |
+| 4 | 1.91 t/s | 16.80 s |
+| 6 | **1.94 t/s** | **16.53 s** |
+
+所有十次运行的 token-ID trace 和响应字节完全一致。每一层 top-6 最多发出六个
+连续 packed-expert `pread`，所以 6 是这个固定模型的并行上限；生产启动器固定使用
+6 个 persistent reader（可用 `DS4F_SERVER_PREAD_THREADS` 仅用于复现实验）。
+1→6 提升约 29%，但 4→6 只约 1.3%，说明下一阶段不应继续加 I/O 线程，而应提高
+真实 expert cache 命中并减少约 24GiB/32-token 的 miss 读取量。
 
 OpenAI Chat Completions：
 

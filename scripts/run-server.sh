@@ -13,6 +13,10 @@ context=${DS4F_SERVER_CONTEXT:-32768}
 tokens=${DS4F_SERVER_TOKENS:-4096}
 cache_experts=${DS4F_SERVER_CACHE_EXPERTS:-1800}
 prefill_full_layer_parallel_pread=${DS4F_SERVER_PREFILL_FULL_LAYER_PARALLEL_PREAD:-1}
+# Flash Decode selects at most six routed experts per transformer layer.  Six
+# persistent readers fully cover that fixed I/O fan-out; the generic runtime
+# default of nine only creates three permanently idle workers on this Mini.
+pread_threads=${DS4F_SERVER_PREAD_THREADS:-6}
 working_set_mib=${DS4F_SERVER_WORKING_SET_MIB:-11776}
 pinned_mib=${DS4F_SERVER_PINNED_MIB:-4096}
 decode_pinned_mib=${DS4F_SERVER_DECODE_PINNED_MIB:-6144}
@@ -56,6 +60,8 @@ exec env \
     DS4_METAL_PREFILL_STAGE_ALIAS=1 \
     DS4_METAL_KEEP_HASH_LAYER0=1 \
     DS4_METAL_PREFILL_FULL_LAYER_PARALLEL_PREAD="$prefill_full_layer_parallel_pread" \
+    DS4_METAL_STREAMING_EXPERT_PREAD_THREADS="$pread_threads" \
+    DS4_METAL_STREAMING_EXPERT_PREAD_POOL=1 \
     DS4_METAL_PREFILL_MEASUREMENTS_PATH="$prefill_measurements" \
     DS4_SERVER_PRELOAD_STATIC_DECODE_TRUNK="$preload_static_decode" \
     DS4_SERVER_WORKING_SET_MIB="$working_set_mib" \
