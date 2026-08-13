@@ -30510,6 +30510,8 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         const double t_layers_encoded = (profile || throttle) ? now_sec() : 0.0;
         if (ok && split_profile) ok = ds4_gpu_end_commands() != 0;
         const double t_layers_done = (profile || throttle) ? now_sec() : 0.0;
+        const double layers_gpu_busy_ms = split_profile ?
+            ds4_gpu_last_command_gpu_busy_ms() : 0.0;
         if (ok && split_profile && logits) ok = ds4_gpu_begin_commands() != 0;
         if (ok && logits) {
             ok = metal_graph_encode_output_head(g, model, weights, weights->output->dim[1]);
@@ -30517,6 +30519,8 @@ static bool metal_graph_eval_token_raw_swa_streaming(
         const double t_encoded = (profile || throttle) ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_end_commands() != 0;
         const double t_done = (profile || throttle) ? now_sec() : 0.0;
+        const double output_gpu_busy_ms = split_profile ?
+            ds4_gpu_last_command_gpu_busy_ms() : 0.0;
         if (ok && logits) {
             ok = ds4_gpu_tensor_read(metal_graph_logits(g), 0, logits, (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
         }
@@ -30525,16 +30529,18 @@ static bool metal_graph_eval_token_raw_swa_streaming(
             if (split_profile) {
                 fprintf(stderr,
                         "ds4: metal SSD streaming transformer token pos=%u "
-                        "encode=%.3f ms execute=%.3f ms\n",
+                        "encode=%.3f ms execute=%.3f ms gpu_busy=%.3f ms\n",
                         pos,
                         (t_layers_encoded - t0) * 1000.0,
-                        (t_layers_done - t_layers_encoded) * 1000.0);
+                        (t_layers_done - t_layers_encoded) * 1000.0,
+                        layers_gpu_busy_ms);
                 fprintf(stderr,
                         "ds4: metal SSD streaming output token pos=%u "
-                        "encode=%.3f ms execute=%.3f ms\n",
+                        "encode=%.3f ms execute=%.3f ms gpu_busy=%.3f ms\n",
                         pos,
                         (t_encoded - t_layers_done) * 1000.0,
-                        (t_done - t_encoded) * 1000.0);
+                        (t_done - t_encoded) * 1000.0,
+                        output_gpu_busy_ms);
             }
             fprintf(stderr,
                     "ds4: metal SSD streaming batched token pos=%u encode=%.3f ms execute=%.3f ms read=%.3f ms total=%.3f ms logits=%d\n",

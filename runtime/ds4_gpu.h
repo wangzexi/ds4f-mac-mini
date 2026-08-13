@@ -96,6 +96,9 @@ int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
                                              const char *label);
 #endif
 int ds4_gpu_end_commands(void);
+/* Last completed owned command buffer's device execution time.  This is
+ * diagnostic-only; 0 means the backend cannot provide GPU timestamps. */
+double ds4_gpu_last_command_gpu_busy_ms(void);
 int ds4_gpu_synchronize(void);
 
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);

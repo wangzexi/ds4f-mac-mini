@@ -1001,11 +1001,13 @@ static void ds4_gpu_close_batch_encoder(void) {
 
 static double g_gpu_busy_accum;
 static uint64_t g_gpu_busy_cbs;
+static double g_last_command_gpu_busy_ms;
 
 static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *label) {
     [cb waitUntilCompleted];
+    const double busy = cb.GPUEndTime - cb.GPUStartTime;
+    g_last_command_gpu_busy_ms = busy > 0.0 ? busy * 1000.0 : 0.0;
     if (getenv("DS4_METAL_GPU_BUSY_PROFILE")) {
-        const double busy = cb.GPUEndTime - cb.GPUStartTime;
         if (busy > 0) g_gpu_busy_accum += busy;
         if ((++g_gpu_busy_cbs % 64u) == 0u) {
             fprintf(stderr, "ds4: gpu busy accum %.1f ms over %llu cbs\n",
@@ -1019,6 +1021,10 @@ static int ds4_gpu_wait_command_buffer(id<MTLCommandBuffer> cb, const char *labe
         return 0;
     }
     return 1;
+}
+
+double ds4_gpu_last_command_gpu_busy_ms(void) {
+    return g_last_command_gpu_busy_ms;
 }
 
 static id<MTLCommandBuffer> ds4_gpu_new_command_buffer(void) {
