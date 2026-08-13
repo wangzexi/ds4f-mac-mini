@@ -32,6 +32,7 @@ DS4F_SERVER_CONTEXT
 DS4F_SERVER_TOKENS
 DS4F_SERVER_CACHE_EXPERTS
 DS4F_SERVER_PREFILL_FULL_LAYER_PARALLEL_PREAD
+DS4F_SERVER_KEEP_HASH_LAYER0
 DS4F_SERVER_PREAD_THREADS
 DS4F_SERVER_WORKING_SET_MIB
 DS4F_SERVER_PINNED_MIB
@@ -41,6 +42,12 @@ DS4F_SERVER_KV_CACHE_DIR
 DS4F_SERVER_KV_CACHE_MIB
 DS4F_SERVER_KV_CACHE_MIN_TOKENS
 ```
+
+`DS4F_SERVER_KEEP_HASH_LAYER0` 默认是 `0`：启动时仍会预载 L0，首轮
+Prefill 消费完 L0 后立即释放其完整 256 专家 slab，让后续 learned layer
+能够连续整层预载。M4 Mini 的 1K 精确 Prefill 实测从约 185 秒降至约 96–98
+秒，生成 token 轨迹不变。需要优先保留 L0 给后续冷短请求时可显式设为 `1`，
+代价是长 Prefill 会交替失去下一层的整层预载空间。
 
 默认还会在 `cache/kv/` 保留最多 10240MiB（10GiB）的磁盘 KV 前缀缓存。
 每次成功 response 已经发送给客户端后，server 同步保存当前完整 token frontier
