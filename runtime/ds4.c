@@ -31209,6 +31209,67 @@ typedef struct {
     bool fast_attention;
 } metal_graph_top2_result;
 
+/*
+ * Flash has three token-id hash routed layers.  Once the previous logits have
+ * selected the next input token, all three six-expert sets are known exactly;
+ * they do not depend on the hidden state produced by an earlier layer.  The
+ * ordinary per-layer path starts its selected I/O only when that layer is
+ * reached.  For Decode, start the three tiny, exact reads together before L0
+ * attention so L1/L2 have the preceding layer's compute time to finish.
+ *
+ * This remains opt-in until an end-to-end greedy trace establishes that the
+ * extra cache handoff has no scheduler-sensitive side effect on the Mini.
+ */
+static bool metal_graph_decode_hash_prefetch_requested(void) {
+    return getenv("DS4_METAL_ENABLE_DECODE_HASH_PREFETCH") != NULL &&
+           getenv("DS4_METAL_DISABLE_DECODE_HASH_PREFETCH") == NULL;
+}
+
+static void metal_graph_decode_prefetch_hash_layers(
+        const ds4_gpu_graph *g,
+        const ds4_model     *model,
+        const ds4_weights   *weights,
+        int                  token) {
+    if (!metal_graph_decode_hash_prefetch_requested() ||
+        !g || !g->ssd_streaming || !model || !weights ||
+        token < 0 || (uint32_t)token >= DS4_N_VOCAB) {
+        return;
+    }
+
+    const uint32_t hash_layers =
+        DS4_N_HASH_LAYER < DS4_N_LAYER ? DS4_N_HASH_LAYER : DS4_N_LAYER;
+    for (uint32_t il = 0; il < hash_layers; il++) {
+        const ds4_layer_weights *layer = &weights->layer[il];
+        if (!layer->ffn_gate_tid2eid || !layer->ffn_gate_exps ||
+            !layer->ffn_up_exps || !layer->ffn_down_exps) {
+            continue;
+        }
+        uint64_t gate_expert_bytes = 0;
+        uint64_t down_expert_bytes = 0;
+        if (!streaming_layer_gate_down_expert_bytes(layer,
+                                                    &gate_expert_bytes,
+                                                    &down_expert_bytes)) {
+            continue;
+        }
+
+        int selected[DS4_MAX_EXPERT_USED];
+        int32_t selected_i32[DS4_MAX_EXPERT_USED];
+        layer_hash_selected_experts(selected, model, layer, token);
+        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
+            selected_i32[i] = (int32_t)selected[i];
+        }
+        const ds4_gpu_stream_expert_table table =
+            graph_stream_expert_table_make(model, layer, il,
+                                           gate_expert_bytes,
+                                           down_expert_bytes);
+        /* A cache reservation can legitimately lose a race with a prior
+         * Decode load.  The normal per-layer exact load remains authoritative
+         * in that case, so a missed speculative opportunity is not an error. */
+        (void)ds4_gpu_stream_expert_layer_prefetch_begin(
+                &table, selected_i32, DS4_N_EXPERT_USED, UINT32_MAX);
+    }
+}
+
 /* Greedy verifier helper.  Speculative decoding only needs the target model's
  * top token after most accepted draft rows; the full vocabulary row is needed
  * once, for the final committed state that normal sampling will continue from.
@@ -31227,6 +31288,8 @@ static bool metal_graph_eval_token_raw_swa_top(
         bool                   force_fast_attention) {
     if (!top_id) return false;
     if (top2) memset(top2, 0, sizeof(*top2));
+
+    metal_graph_decode_prefetch_hash_layers(g, model, weights, token);
 
     const bool fast_attention =
         allow_split_top1 &&
