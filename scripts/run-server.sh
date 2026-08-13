@@ -19,7 +19,11 @@ prefill_full_layer_parallel_pread=${DS4F_SERVER_PREFILL_FULL_LAYER_PARALLEL_PREA
 pread_threads=${DS4F_SERVER_PREAD_THREADS:-6}
 working_set_mib=${DS4F_SERVER_WORKING_SET_MIB:-11776}
 pinned_mib=${DS4F_SERVER_PINNED_MIB:-4096}
-decode_pinned_mib=${DS4F_SERVER_DECODE_PINNED_MIB:-6144}
+# This M4 Mini's measured per-process wired-memory ceiling is just under
+# 4 GiB (606 packed 6.75 MiB experts).  Decode may retain a larger pageable
+# cache, but asking macOS to wire 6 GiB merely causes one predictable failed
+# mlock on every fresh server process.
+decode_pinned_mib=${DS4F_SERVER_DECODE_PINNED_MIB:-4096}
 reserve_mib=${DS4F_SERVER_MEMORY_RESERVE_MIB:-512}
 kv_cache_dir=${DS4F_SERVER_KV_CACHE_DIR:-$project_dir/cache/kv}
 kv_cache_mib=${DS4F_SERVER_KV_CACHE_MIB:-10240}
