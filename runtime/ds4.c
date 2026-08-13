@@ -21179,7 +21179,17 @@ static bool metal_graph_streaming_prefill_cache_seed_enabled(const ds4_gpu_graph
 static bool metal_graph_streaming_expert_hotlist_enabled(const ds4_gpu_graph *g) {
     /* Flash cache residency must come from this prompt/session's actual Router
      * selections, never from the upstream corpus-global fixed ordering. */
-    if (g_ds4_shape.variant == DS4_VARIANT_FLASH) return false;
+    /*
+     * The diagnostic path is deliberately separate from the normal hotlist:
+     * its file is made from the *same prompt's first decode* selected-ID
+     * trace.  It is used only after prefill to measure a no-SSD-miss decode
+     * layer.  Keeping this opt-in avoids letting a corpus-global order leak
+     * into the Flash runtime.
+     */
+    if (g_ds4_shape.variant == DS4_VARIANT_FLASH) {
+        const char *diag = getenv("DS4_METAL_DIAG_POST_PREFILL_EXPERT_HOTLIST");
+        return g && g->ssd_streaming && diag && diag[0];
+    }
     return g &&
            g->ssd_streaming &&
            !g->ssd_streaming_cold &&
@@ -30962,8 +30972,10 @@ static bool metal_graph_seed_streaming_expert_cache_from_hotlist(
     if (preload_count == 0) return true;
     const uint32_t current_count =
         ds4_gpu_stream_expert_cache_current_count();
-    const char *path = glm_graph_env_value("DS4_ROCM_STREAMING_EXPERT_HOTLIST",
-                                           "DS4_METAL_STREAMING_EXPERT_HOTLIST");
+    const char *diag_path = getenv("DS4_METAL_DIAG_POST_PREFILL_EXPERT_HOTLIST");
+    const char *path = (diag_path && diag_path[0]) ? diag_path :
+        glm_graph_env_value("DS4_ROCM_STREAMING_EXPERT_HOTLIST",
+                            "DS4_METAL_STREAMING_EXPERT_HOTLIST");
     const bool from_file = path && path[0];
     const bool refresh_builtin_glm =
         !from_file && g_ds4_shape.variant == DS4_VARIANT_GLM52;
@@ -48415,12 +48427,15 @@ static int generate_glm_metal_argmax(
         return 1;
     }
     const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
+    const bool diag_post_prefill_seed =
+        getenv("DS4_METAL_DIAG_POST_PREFILL_EXPERT_HOTLIST") != NULL;
     if (memory_report) ds4_gpu_print_memory_report("after GLM graph alloc");
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
     bool ok = true;
     const bool seed_before_prefill =
         ssd_streaming &&
+        !diag_post_prefill_seed &&
         !glm_graph_env_present("DS4_ROCM_GLM_DISABLE_STREAMING_SEED_BEFORE_PREFILL",
                                "DS4_METAL_GLM_DISABLE_STREAMING_SEED_BEFORE_PREFILL");
     const double t_prefill0 = now_sec();
@@ -48454,6 +48469,29 @@ static int generate_glm_metal_argmax(
         free(logits);
         glm_graph_free(&g);
         return 1;
+    }
+    if (diag_post_prefill_seed) {
+        /*
+         * Measurement-only: install the first decode token's actual routes
+         * after prefill, where they cannot be evicted by the prompt.  The
+         * following decode profiler therefore observes genuine selected MoE
+         * execution with no selected-expert SSD miss.
+         */
+        ds4_gpu_graph seed_graph;
+        memset(&seed_graph, 0, sizeof(seed_graph));
+        seed_graph.quality = quality;
+        seed_graph.ssd_streaming = ssd_streaming;
+        seed_graph.ssd_streaming_cold = ssd_streaming_cold;
+        seed_graph.streaming_preload_experts = ssd_streaming_preload_experts;
+        ok = metal_graph_seed_streaming_expert_cache_from_hotlist(&seed_graph,
+                                                                  model,
+                                                                  weights);
+        if (!ok) {
+            fprintf(stderr, "ds4: GLM diagnostic post-prefill expert seed failed\n");
+            free(logits);
+            glm_graph_free(&g);
+            return 1;
+        }
     }
 #ifdef DS4_ROCM_BUILD
     /*
