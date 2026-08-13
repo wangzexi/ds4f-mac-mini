@@ -12999,6 +12999,116 @@ static int ds4_gpu_stream_expert_split_ready(void) {
 
 static void ds4_gpu_stream_expert_cache_maybe_decay_route_hotness(void);
 
+enum {
+    DS4_METAL_HEAT_PREDICT_N_CUTOFF = 4,
+};
+
+static const uint32_t g_stream_expert_heat_predict_cutoff[
+        DS4_METAL_HEAT_PREDICT_N_CUTOFF] = { 6u, 12u, 24u, 48u };
+/* This deliberately snapshots rank rather than live heat.  A live score would
+ * learn from the token currently being measured and overstate how useful a
+ * Prefill -> Decode preload would have been. */
+static uint16_t g_stream_expert_heat_predict_rank
+        [DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER]
+        [DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+static uint64_t g_stream_expert_heat_predict_selected
+        [DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static double g_stream_expert_heat_predict_mass
+        [DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static uint64_t g_stream_expert_heat_predict_hits
+        [DS4_METAL_HEAT_PREDICT_N_CUTOFF]
+        [DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static double g_stream_expert_heat_predict_hit_mass
+        [DS4_METAL_HEAT_PREDICT_N_CUTOFF]
+        [DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+static int g_stream_expert_heat_predict_active = 0;
+
+void ds4_gpu_stream_expert_cache_heat_prediction_profile_begin(void) {
+    ds4_gpu_stream_expert_cache_maybe_decay_route_hotness();
+    memset(g_stream_expert_heat_predict_selected, 0,
+           sizeof(g_stream_expert_heat_predict_selected));
+    memset(g_stream_expert_heat_predict_mass, 0,
+           sizeof(g_stream_expert_heat_predict_mass));
+    memset(g_stream_expert_heat_predict_hits, 0,
+           sizeof(g_stream_expert_heat_predict_hits));
+    memset(g_stream_expert_heat_predict_hit_mass, 0,
+           sizeof(g_stream_expert_heat_predict_hit_mass));
+    for (uint32_t layer = 0;
+         layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
+         layer++) {
+        for (uint32_t expert = 0;
+             expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+             expert++) {
+            const float heat = g_stream_expert_cache_route_hotness[layer][expert];
+            uint16_t rank = 0;
+            for (uint32_t other = 0;
+                 other < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+                 other++) {
+                const float other_heat =
+                    g_stream_expert_cache_route_hotness[layer][other];
+                if (other_heat > heat ||
+                    (other_heat == heat && other < expert)) {
+                    rank++;
+                }
+            }
+            g_stream_expert_heat_predict_rank[layer][expert] = rank;
+        }
+    }
+    g_stream_expert_heat_predict_active = 1;
+}
+
+void ds4_gpu_stream_expert_cache_heat_prediction_profile_print(void) {
+    if (!g_stream_expert_heat_predict_active) return;
+    uint64_t selected = 0;
+    double mass = 0.0;
+    uint64_t hits[DS4_METAL_HEAT_PREDICT_N_CUTOFF] = {0};
+    double hit_mass[DS4_METAL_HEAT_PREDICT_N_CUTOFF] = {0};
+    for (uint32_t layer = 0;
+         layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
+         layer++) {
+        selected += g_stream_expert_heat_predict_selected[layer];
+        mass += g_stream_expert_heat_predict_mass[layer];
+        for (uint32_t cutoff = 0;
+             cutoff < DS4_METAL_HEAT_PREDICT_N_CUTOFF;
+             cutoff++) {
+            hits[cutoff] += g_stream_expert_heat_predict_hits[cutoff][layer];
+            hit_mass[cutoff] +=
+                g_stream_expert_heat_predict_hit_mass[cutoff][layer];
+        }
+    }
+    fprintf(stderr, "ds4: decode heat prediction selected=%llu mass=%.6f",
+            (unsigned long long)selected, mass);
+    for (uint32_t cutoff = 0;
+         cutoff < DS4_METAL_HEAT_PREDICT_N_CUTOFF;
+         cutoff++) {
+        fprintf(stderr, " top%u=%.3f%% mass=%.3f%%",
+                g_stream_expert_heat_predict_cutoff[cutoff],
+                selected ? 100.0 * (double)hits[cutoff] / (double)selected : 0.0,
+                mass ? 100.0 * hit_mass[cutoff] / mass : 0.0);
+    }
+    fputc('\n', stderr);
+    for (uint32_t layer = 0;
+         layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
+         layer++) {
+        const uint64_t layer_selected =
+            g_stream_expert_heat_predict_selected[layer];
+        if (layer_selected == 0) continue;
+        fprintf(stderr, "ds4: decode heat prediction layer=%u selected=%llu",
+                layer, (unsigned long long)layer_selected);
+        for (uint32_t cutoff = 0;
+             cutoff < DS4_METAL_HEAT_PREDICT_N_CUTOFF;
+             cutoff++) {
+            fprintf(stderr, " top%u=%.3f%%",
+                    g_stream_expert_heat_predict_cutoff[cutoff],
+                    100.0 *
+                        (double)g_stream_expert_heat_predict_hits[cutoff][layer] /
+                        (double)layer_selected);
+        }
+        fputc('\n', stderr);
+    }
+    g_stream_expert_heat_predict_active = 0;
+}
+
 void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
     memset(g_stream_expert_cache_route_hotness,
            0,
@@ -13136,6 +13246,30 @@ static void ds4_gpu_stream_expert_cache_note_selected_hotness(
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         n_selected == 0) {
         return;
+    }
+    if (g_stream_expert_heat_predict_active) {
+        for (uint32_t i = 0; i < n_selected; i++) {
+            if (selected_ids[i] < 0 ||
+                selected_ids[i] >=
+                    (int32_t)DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+                continue;
+            }
+            const uint32_t expert = (uint32_t)selected_ids[i];
+            const double mass = selected_weights &&
+                    isfinite(selected_weights[i]) && selected_weights[i] > 0.0f ?
+                (double)selected_weights[i] : 1.0;
+            g_stream_expert_heat_predict_selected[layer]++;
+            g_stream_expert_heat_predict_mass[layer] += mass;
+            for (uint32_t cutoff = 0;
+                 cutoff < DS4_METAL_HEAT_PREDICT_N_CUTOFF;
+                 cutoff++) {
+                if (g_stream_expert_heat_predict_rank[layer][expert] <
+                    g_stream_expert_heat_predict_cutoff[cutoff]) {
+                    g_stream_expert_heat_predict_hits[cutoff][layer]++;
+                    g_stream_expert_heat_predict_hit_mass[cutoff][layer] += mass;
+                }
+            }
+        }
     }
     ds4_gpu_stream_expert_cache_maybe_decay_route_hotness();
     for (uint32_t i = 0; i < n_selected; i++) {

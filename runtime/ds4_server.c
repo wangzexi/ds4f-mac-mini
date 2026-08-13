@@ -11892,6 +11892,9 @@ static void generate_job(server *s, server_slot *slot, job *j) {
     if (getenv("DS4_SERVER_EXPERT_PHASE_PROFILE") != NULL) {
         ds4_gpu_print_memory_report("server exact prefill phase");
     }
+    if (getenv("DS4_SERVER_EXPERT_HEAT_PREDICTION_PROFILE") != NULL) {
+        ds4_gpu_stream_expert_cache_heat_prediction_profile_begin();
+    }
     if (cold_store_len == prompt_for_sync->len) {
         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
                                        cold_store_len, "cold")) {
@@ -12678,6 +12681,9 @@ decode_again:
     }
     if (getenv("DS4_SERVER_EXPERT_PHASE_PROFILE") != NULL) {
         ds4_gpu_print_memory_report("server exact decode phase");
+    }
+    if (getenv("DS4_SERVER_EXPERT_HEAT_PREDICTION_PROFILE") != NULL) {
+        ds4_gpu_stream_expert_cache_heat_prediction_profile_print();
     }
     /* The network response is already complete at this point.  Persist the
      * exact post-response frontier before the worker accepts another request,

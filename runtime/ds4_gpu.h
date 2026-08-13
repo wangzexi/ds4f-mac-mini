@@ -226,6 +226,12 @@ void ds4_gpu_stream_expert_cache_note_route_weights(
         const int32_t *selected_ids,
         const float   *selected_weights,
         uint32_t       n_selected);
+/* Diagnostic-only: snapshot the current route-weight heat, then report how
+ * well that immutable snapshot predicted Decode's subsequently selected
+ * experts.  Used to decide whether heat-based Decode preloading can repay its
+ * own SSD reads on the fixed Mini runtime. */
+void ds4_gpu_stream_expert_cache_heat_prediction_profile_begin(void);
+void ds4_gpu_stream_expert_cache_heat_prediction_profile_print(void);
 void ds4_gpu_stream_expert_cache_release_resident(void);
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,
