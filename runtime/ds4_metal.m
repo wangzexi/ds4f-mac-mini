@@ -697,6 +697,7 @@ static float
  * (layer, expert) measures the avoidable read-back directly. */
 static int g_stream_expert_cache_churn_profile_active;
 static int g_stream_expert_cache_decode_lru_policy_active;
+static int g_stream_expert_cache_decode_reuse_heat_policy_active;
 static uint8_t
     g_stream_expert_cache_churn_profile_loaded[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
 static uint8_t
@@ -13388,7 +13389,10 @@ void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(void) {
     const char *policy = getenv("DS4_METAL_STREAMING_EXPERT_DECODE_EVICTION_POLICY");
     g_stream_expert_cache_decode_lru_policy_active =
         policy && strcmp(policy, "lru") == 0;
+    g_stream_expert_cache_decode_reuse_heat_policy_active =
+        policy && strcmp(policy, "reuse-heat") == 0;
     if (policy && policy[0] && !g_stream_expert_cache_decode_lru_policy_active &&
+        !g_stream_expert_cache_decode_reuse_heat_policy_active &&
         strcmp(policy, "heat") != 0) {
         fprintf(stderr,
                 "ds4: unknown Decode expert eviction policy %s; using heat+LRU\n",
@@ -13397,11 +13401,27 @@ void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(void) {
     if (g_stream_expert_cache_decode_lru_policy_active) {
         fprintf(stderr,
                 "ds4: Decode expert eviction policy=lru (Prefill remains heat+LRU)\n");
+    } else if (g_stream_expert_cache_decode_reuse_heat_policy_active) {
+        fprintf(stderr,
+                "ds4: Decode expert eviction policy=reuse-heat (Prefill remains heat+LRU)\n");
     }
 }
 
 void ds4_gpu_stream_expert_cache_decode_eviction_policy_end(void) {
     g_stream_expert_cache_decode_lru_policy_active = 0;
+    g_stream_expert_cache_decode_reuse_heat_policy_active = 0;
+}
+
+static float ds4_gpu_stream_expert_cache_eviction_heat(
+        uint32_t                                      layer,
+        uint32_t                                      expert,
+        const ds4_gpu_stream_expert_cache_entry      *entry) {
+    if (g_stream_expert_cache_decode_lru_policy_active ||
+        (g_stream_expert_cache_decode_reuse_heat_policy_active &&
+         (!entry || entry->use_count < 2))) {
+        return 0.0f;
+    }
+    return g_stream_expert_cache_route_hotness[layer][expert];
 }
 
 static void ds4_gpu_stream_expert_cache_note_tokens(uint32_t layer_index,
@@ -14429,8 +14449,8 @@ static void ds4_gpu_stream_expert_cache_prune_layer(
                 ds4_gpu_stream_expert_cache_is_protected(expert, protect_ids, n_protect)) {
                 continue;
             }
-            const float hotness = g_stream_expert_cache_decode_lru_policy_active ?
-                0.0f : g_stream_expert_cache_route_hotness[layer][expert];
+            const float hotness =
+                ds4_gpu_stream_expert_cache_eviction_heat(layer, expert, e);
             if (hotness < lowest_hotness ||
                 (hotness == lowest_hotness && e->last_used < oldest)) {
                 lowest_hotness = hotness;
@@ -14538,8 +14558,8 @@ retry:
                                                             n_protect)) {
                 continue;
             }
-            const float hotness = g_stream_expert_cache_decode_lru_policy_active ?
-                0.0f : g_stream_expert_cache_route_hotness[layer][expert];
+            const float hotness =
+                ds4_gpu_stream_expert_cache_eviction_heat(layer, expert, e);
             if (hotness < lowest_hotness ||
                 (hotness == lowest_hotness && e->last_used < oldest)) {
                 lowest_hotness = hotness;
@@ -14663,8 +14683,8 @@ retry:
                 continue;
             }
 
-            const float hotness = g_stream_expert_cache_decode_lru_policy_active ?
-                0.0f : g_stream_expert_cache_route_hotness[layer][expert];
+            const float hotness =
+                ds4_gpu_stream_expert_cache_eviction_heat(layer, expert, e);
             const uint64_t last_used = e->last_used;
             if (victim_count < n_needed) {
                 victim_layers[victim_count] = layer;
