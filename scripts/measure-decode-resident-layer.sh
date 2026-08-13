@@ -15,6 +15,7 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 project_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 result_dir=${3:-"$project_dir/results/measurements/decode-resident-layer-${layer}-$(date +%Y%m%d-%H%M%S)"}
 mkdir -p "$result_dir"
+result_dir=$(CDPATH= cd -- "$result_dir" && pwd)
 
 trace="$result_dir/first-decode.selected.bin"
 hotlist="$result_dir/first-decode.exact-hotlist.txt"
