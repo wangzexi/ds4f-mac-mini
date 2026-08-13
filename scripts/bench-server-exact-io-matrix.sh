@@ -22,6 +22,8 @@ threads_csv=${DS4F_BENCH_PREAD_THREADS:-1,2,3,4,6}
 port=${DS4F_BENCH_SERVER_PORT:-18080}
 out_dir=${DS4F_BENCH_OUT_DIR:-"$project_dir/results/benchmarks/server-exact-io-$(date +%Y%m%d-%H%M%S)"}
 record_selected_ids=${DS4F_BENCH_RECORD_SELECTED_IDS:-0}
+record_selected_ids_tagged=${DS4F_BENCH_RECORD_SELECTED_IDS_TAGGED:-0}
+record_selected_ids_sync=${DS4F_BENCH_RECORD_SELECTED_IDS_SYNC:-0}
 if [[ $out_dir != /* ]]; then
     out_dir="$project_dir/$out_dir"
 fi
@@ -58,8 +60,9 @@ trap 'cleanup; exit 129' HUP
 trap 'cleanup; exit 130' INT
 trap 'cleanup; exit 143' TERM
 
-printf 'prompt=%q\ntokens=%s\ncache_experts=%s\nrepeats=%s\nthreads=%s\nport=%s\n' \
+printf 'prompt=%q\ntokens=%s\ncache_experts=%s\nrepeats=%s\nthreads=%s\nport=%s\nrecord_selected_ids=%s\nrecord_selected_ids_tagged=%s\nrecord_selected_ids_sync=%s\n' \
     "$prompt" "$tokens" "$cache_experts" "$repeats" "$threads_csv" "$port" \
+    "$record_selected_ids" "$record_selected_ids_tagged" "$record_selected_ids_sync" \
     > "$out_dir/config.env"
 shasum -a 256 "$server" > "$out_dir/server.sha256"
 stat -f '%N\t%z\t%m\t%i' "$model" "$pack" > "$out_dir/model-pack.stat.tsv"
@@ -111,6 +114,16 @@ for threads in "${threads_list[@]}"; do
             export DS4_MOE_RECORD_SELECTED_IDS="$out_dir/server-pread-${threads}-run-${repeat}.selected-i32le"
         else
             unset DS4_MOE_RECORD_SELECTED_IDS || true
+        fi
+        if [[ $record_selected_ids_tagged != 0 ]]; then
+            export DS4_MOE_RECORD_SELECTED_IDS_TAGGED="$out_dir/server-pread-${threads}-run-${repeat}.selected-tagged-v1.bin"
+        else
+            unset DS4_MOE_RECORD_SELECTED_IDS_TAGGED || true
+        fi
+        if [[ $record_selected_ids_sync != 0 ]]; then
+            export DS4_MOE_RECORD_SELECTED_IDS_SYNC=1
+        else
+            unset DS4_MOE_RECORD_SELECTED_IDS_SYNC || true
         fi
         env \
             DS4F_SERVER_HOST=127.0.0.1 \

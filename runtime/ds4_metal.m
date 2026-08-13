@@ -518,6 +518,9 @@ static uint32_t g_routed_moe_selected_override_n;
 static int g_moe_selected_trace_record_initialized;
 static FILE *g_moe_selected_trace_record_fp;
 static uint64_t g_moe_selected_trace_record_count;
+static int g_moe_selected_trace_tagged_initialized;
+static FILE *g_moe_selected_trace_tagged_fp;
+static uint64_t g_moe_selected_trace_tagged_count;
 static int g_moe_selected_trace_replay_initialized;
 static int32_t *g_moe_selected_trace_replay_ids;
 static uint64_t g_moe_selected_trace_replay_count;
@@ -1566,6 +1569,69 @@ static void ds4_gpu_moe_selected_trace_record_close(void) {
                 g_moe_selected_trace_record_count,
                 path && path[0] ? path : "(unknown)");
     }
+}
+
+/* Diagnostic-only companion to DS4_MOE_RECORD_SELECTED_IDS.  The legacy
+ * trace is deliberately just six int32 values so older replay tooling can
+ * consume it.  That makes a long prefill impossible to locate robustly when
+ * records differ, however: the reader cannot tell whether the difference is
+ * a changed decision or a changed ordering.  This tagged trace keeps a
+ * monotonically increasing sequence number and the real model layer next to
+ * the same six ids.  It is never read by the inference path. */
+typedef struct {
+    uint64_t sequence;
+    uint32_t layer;
+    uint32_t n_selected;
+    int32_t selected_ids[6];
+} ds4_gpu_moe_selected_trace_tagged_record;
+
+static void ds4_gpu_moe_selected_trace_tagged_close(void) {
+    if (g_moe_selected_trace_tagged_fp) {
+        const char *path = getenv("DS4_MOE_RECORD_SELECTED_IDS_TAGGED");
+        fclose(g_moe_selected_trace_tagged_fp);
+        g_moe_selected_trace_tagged_fp = NULL;
+        fprintf(stderr,
+                "ds4: recorded %" PRIu64 " tagged routed-MoE entries to %s\n",
+                g_moe_selected_trace_tagged_count,
+                path && path[0] ? path : "(unknown)");
+    }
+}
+
+static int ds4_gpu_moe_selected_trace_tagged_record(
+        uint32_t       layer,
+        const int32_t  selected_ids[6],
+        uint32_t       n_selected) {
+    const char *path = getenv("DS4_MOE_RECORD_SELECTED_IDS_TAGGED");
+    if (!path || !path[0]) return 1;
+    if (n_selected != 6) return 0;
+
+    if (!g_moe_selected_trace_tagged_initialized) {
+        g_moe_selected_trace_tagged_initialized = 1;
+        g_moe_selected_trace_tagged_fp = fopen(path, "wb");
+        if (!g_moe_selected_trace_tagged_fp) {
+            fprintf(stderr, "ds4: failed to open tagged selected-id trace %s\n", path);
+            return 0;
+        }
+        setvbuf(g_moe_selected_trace_tagged_fp, NULL, _IOFBF, 1u << 20);
+        atexit(ds4_gpu_moe_selected_trace_tagged_close);
+    }
+
+    const ds4_gpu_moe_selected_trace_tagged_record record = {
+        .sequence = g_moe_selected_trace_tagged_count,
+        .layer = layer,
+        .n_selected = n_selected,
+        .selected_ids = {
+            selected_ids[0], selected_ids[1], selected_ids[2],
+            selected_ids[3], selected_ids[4], selected_ids[5],
+        },
+    };
+    if (fwrite(&record, sizeof(record), 1, g_moe_selected_trace_tagged_fp) != 1 ||
+        fflush(g_moe_selected_trace_tagged_fp) != 0) {
+        fprintf(stderr, "ds4: failed to write tagged selected-id trace %s\n", path);
+        return 0;
+    }
+    g_moe_selected_trace_tagged_count++;
+    return 1;
 }
 
 static int ds4_gpu_moe_selected_trace_record(
@@ -38906,6 +38972,10 @@ int ds4_gpu_routed_moe_one_tensor(
                         (validator_all_cached != 0 ? "validator-hit" : "validator-miss"));
                 } else {
                     g_routed_moe_selected_override_n = 0;
+                    const bool selected_trace_sync =
+                        getenv("DS4_MOE_RECORD_SELECTED_IDS_SYNC") != NULL &&
+                        (getenv("DS4_MOE_RECORD_SELECTED_IDS") != NULL ||
+                         getenv("DS4_MOE_RECORD_SELECTED_IDS_TAGGED") != NULL);
                     if (g_batch_cb != nil) {
                         double selected_boundary_t0 =
                             selected_timing ? ds4_gpu_now_ms() : 0.0;
@@ -38942,6 +39012,14 @@ int ds4_gpu_routed_moe_one_tensor(
                             }
                         }
                     } else {
+                        /* Normally this branch has no open batch to wait for.
+                         * The explicit diagnostic switch also drains any
+                         * pending owned command buffers before its CPU read;
+                         * this is intentionally off in normal inference. */
+                        if (selected_trace_sync && ds4_gpu_synchronize() == 0) {
+                            if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one synchronous selected-id drain failed\n");
+                            return 0;
+                        }
                         double selected_copy_t0 =
                             selected_timing ? ds4_gpu_now_ms() : 0.0;
                         if (ds4_gpu_tensor_read(selected,
@@ -38991,6 +39069,9 @@ int ds4_gpu_routed_moe_one_tensor(
                         n_expert,
                         1);
                 if (!ds4_gpu_moe_selected_trace_record(selected_ids, n_expert) ||
+                    !ds4_gpu_moe_selected_trace_tagged_record(layer_index,
+                                                               selected_ids,
+                                                               n_expert) ||
                     !ds4_gpu_moe_selected_hotlist_record(layer_index,
                                                          selected_ids,
                                                          n_expert,
