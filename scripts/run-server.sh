@@ -45,10 +45,11 @@ allow_shared_expert_sidecar=${DS4F_SERVER_ALLOW_SHARED_EXPERT_SIDECAR:-0}
 # itself: a repeat with the heat baseline diverged at the same second chunk.
 decode_eviction_policy=${DS4F_SERVER_DECODE_EVICTION_POLICY:-lru}
 # Decode on the fixed M4 Mini is usually a 4--5 resident / 1--2 missing
-# expert mix.  Splitting even one miss overlaps its SSD read with the already
-# resident work.  On the 1K-prefix exact A/B this averaged 1.95 tok/s versus
-# 1.90 tok/s at the historical threshold of three, with the same greedy trace.
-decode_split_min_misses=${DS4F_SERVER_DECODE_SPLIT_MIN_MISSES:-1}
+# expert mix.  With L2-after-L0 release, an interleaved 512-token/32-token
+# A/B sweep found two misses the repeatable optimum: 2.42 token/s median,
+# versus 2.40 for splitting a single miss and 2.38--2.41 for thresholds 3--6.
+# All variants had the identical greedy trace.
+decode_split_min_misses=${DS4F_SERVER_DECODE_SPLIT_MIN_MISSES:-2}
 
 if [ ! -x "$project_dir/ds4f-server" ]; then
     echo "missing ds4f-server; run: make server" >&2

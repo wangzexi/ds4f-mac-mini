@@ -35,6 +35,8 @@ DS4F_SERVER_PREFILL_FULL_LAYER_PARALLEL_PREAD
 DS4F_SERVER_KEEP_HASH_LAYER0
 DS4F_SERVER_PREFILL_RELEASE_HASH_LAYER0_AFTER
 DS4F_SERVER_PREAD_THREADS
+DS4F_SERVER_DECODE_EVICTION_POLICY
+DS4F_SERVER_DECODE_SPLIT_MIN_MISSES
 DS4F_SERVER_WORKING_SET_MIB
 DS4F_SERVER_PINNED_MIB
 DS4F_SERVER_DECODE_PINNED_MIB
@@ -54,6 +56,11 @@ hash-routed 层已经完整运行，随后在进入 learned stack 前归还 L0 �
 512-token 精确测试的 22,231 条 Prefill 选路、两轮 32-token greedy 轨迹和输出哈希
 都与全程保留 L0 一致；Prefill 从约 89 秒降至 49–52 秒，Decode 从约 1.89 提升到
 2.43–2.46 token/s。
+
+Decode 保持全局 `lru`。在每层同时有命中和 miss 时，默认至少有 **2** 个 miss 才
+拆开提交：先让 GPU 计算命中专家，同时读取其余专家。L2-after-L0 的 512-token 前缀、
+32-token 输出交错三次 A/B 中，阈值 2 的中位数为 2.42 token/s；阈值 1 为 2.40，
+阈值 3–6 为 2.38–2.41。所有配置的 greedy token trace 相同。
 
 默认还会在 `cache/kv/` 保留最多 10240MiB（10GiB）的磁盘 KV 前缀缓存。
 每次成功 response 已经发送给客户端后，server 同步保存当前完整 token frontier
