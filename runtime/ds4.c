@@ -43605,6 +43605,9 @@ static bool glm_graph_encode_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD,
                                       il,
                                       pos0);
+        metal_graph_debug_dump_batch_f32_row("glm_prefill_ffn_norm",
+                                             g->batch_ffn_norm, DS4_N_EMBD,
+                                             il, pos0, n_tokens);
     }
     if (!ok) return false;
 
@@ -43770,6 +43773,15 @@ static bool glm_graph_encode_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EXPERT_USED,
                                       il,
                                       pos0);
+        metal_graph_debug_dump_batch_f32_row("glm_prefill_router_logits",
+                                             g->batch_router_logits, DS4_N_EXPERT,
+                                             il, pos0, n_tokens);
+        metal_graph_debug_dump_batch_i32_row("glm_prefill_router_selected",
+                                             g->batch_router_selected, DS4_N_EXPERT_USED,
+                                             il, pos0, n_tokens);
+        metal_graph_debug_dump_batch_f32_row("glm_prefill_router_weights",
+                                             g->batch_router_weights, DS4_N_EXPERT_USED,
+                                             il, pos0, n_tokens);
     }
     if (ok) ok = glm_graph_profile_router_selection_batch(g,
                                                           l,
@@ -43951,6 +43963,9 @@ static bool glm_graph_encode_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD,
                                       il,
                                       pos0);
+        metal_graph_debug_dump_batch_f32_row("glm_prefill_routed_out",
+                                             g->batch_ffn_out, DS4_N_EMBD,
+                                             il, pos0, n_tokens);
     }
     if (ok && !shared_done) DS4_GLM_ENCODE_FFN_BATCH_SHARED();
 #undef DS4_GLM_ENCODE_FFN_BATCH_SHARED
@@ -43960,6 +43975,9 @@ static bool glm_graph_encode_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD,
                                       il,
                                       pos0);
+        metal_graph_debug_dump_batch_f32_row("glm_prefill_shared_out",
+                                             g->batch_attn_out, DS4_N_EMBD,
+                                             il, pos0, n_tokens);
     }
     if (ok && !glm_graph_disable_add3_residual()) {
         ok = ds4_gpu_add3_tensor(next,
@@ -43991,6 +44009,9 @@ static bool glm_graph_encode_ffn_batch(
                                       (uint64_t)n_tokens * DS4_N_EMBD,
                                       il,
                                       pos0);
+        metal_graph_debug_dump_batch_f32_row("glm_prefill_hidden_out",
+                                             next, DS4_N_EMBD,
+                                             il, pos0, n_tokens);
     }
     return ok;
 }
@@ -45108,6 +45129,12 @@ static bool glm_graph_forward_tokens(
                                                           &layer_stage_t0);
         }
 
+        if (ok) {
+            metal_graph_debug_dump_batch_f32_row("glm_prefill_hidden_in",
+                                                 cur, DS4_N_EMBD,
+                                                 il, pos0, n_tokens);
+        }
+
         if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->batch_attn_norm,
                                                          cur,
                                                          model->map,
@@ -45344,6 +45371,11 @@ static bool glm_graph_forward_tokens(
                                         cur,
                                         g->batch_attn_out,
                                         (uint32_t)residual_elems) != 0;
+        if (ok) {
+            metal_graph_debug_dump_batch_f32_row("glm_prefill_after_attn",
+                                                 g->batch_after_attn, DS4_N_EMBD,
+                                                 il, pos0, n_tokens);
+        }
         DS4_GLM_PROFILE_PREFILL_STAGE("glm_attn", "attn_output");
         if (ok) ok = glm_graph_encode_ffn_batch(g,
                                                 model,
