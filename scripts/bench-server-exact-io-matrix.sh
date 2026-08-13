@@ -21,6 +21,7 @@ repeats=${DS4F_BENCH_REPEATS:-2}
 threads_csv=${DS4F_BENCH_PREAD_THREADS:-1,2,3,4,6}
 port=${DS4F_BENCH_SERVER_PORT:-18080}
 out_dir=${DS4F_BENCH_OUT_DIR:-"$project_dir/results/benchmarks/server-exact-io-$(date +%Y%m%d-%H%M%S)"}
+record_selected_ids=${DS4F_BENCH_RECORD_SELECTED_IDS:-0}
 
 if [[ ! -x "$server" || ! -r "$model" || ! -r "$pack" ]]; then
     echo "missing fixed Mini server, model, or packed experts" >&2
@@ -97,7 +98,11 @@ for threads in "${threads_list[@]}"; do
         kv_dir="$tmp_dir/kv-${threads}-${repeat}"
         mkdir -p "$kv_dir"
 
-        env \
+        record_env=()
+        if [[ $record_selected_ids != 0 ]]; then
+            record_env=(DS4_MOE_RECORD_SELECTED_IDS="$out_dir/server-pread-${threads}-run-${repeat}.selected-i32le")
+        fi
+        env "${record_env[@]}" \
             DS4F_SERVER_HOST=127.0.0.1 \
             DS4F_SERVER_PORT="$port" \
             DS4F_SERVER_CACHE_EXPERTS="$cache_experts" \
