@@ -13,6 +13,7 @@ context=${DS4F_SERVER_CONTEXT:-32768}
 tokens=${DS4F_SERVER_TOKENS:-4096}
 cache_experts=${DS4F_SERVER_CACHE_EXPERTS:-1800}
 prefill_full_layer_parallel_pread=${DS4F_SERVER_PREFILL_FULL_LAYER_PARALLEL_PREAD:-1}
+keep_hash_layer0=${DS4F_SERVER_KEEP_HASH_LAYER0:-1}
 # Flash Decode selects at most six routed experts per transformer layer.  On
 # this Mini, a fresh 32-token exact A/B found five readers marginally faster
 # than six (the sixth only contends for the same SSD); both remain exact.
@@ -84,12 +85,20 @@ case "$decode_split_min_misses" in
         ;;
 esac
 
+case "$keep_hash_layer0" in
+    0|1) ;;
+    *)
+        echo "DS4F_SERVER_KEEP_HASH_LAYER0 must be 0 or 1" >&2
+        exit 2
+        ;;
+esac
+
 cd "$runtime_dir"
 exec env \
     DS4_METAL_STREAMING_EXPERT_PACK_PATH="$pack" \
     DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER=1 \
     DS4_METAL_PREFILL_STAGE_ALIAS=1 \
-    DS4_METAL_KEEP_HASH_LAYER0=1 \
+    DS4_METAL_KEEP_HASH_LAYER0="$keep_hash_layer0" \
     DS4_METAL_PREFILL_FULL_LAYER_PARALLEL_PREAD="$prefill_full_layer_parallel_pread" \
     DS4_METAL_STREAMING_EXPERT_PREAD_THREADS="$pread_threads" \
     DS4_METAL_STREAMING_EXPERT_PREAD_POOL=1 \
