@@ -15,7 +15,7 @@ GPU = re.compile(r"gpu busy total=([0-9.]+) ms command_buffers=(\d+)")
 PREFILL = re.compile(r"prompt done ([0-9.]+)s")
 DECODE = re.compile(r"decoding chunk=[0-9.]+ t/s avg=([0-9.]+) t/s ([0-9.]+)s")
 TOTAL = re.compile(r"finish=[^ ]+ ([0-9.]+)s")
-PHASE_MARK = re.compile(r"memory report \((server exact (?:prefill|decode) phase)\)")
+PHASE_MARK = re.compile(r"Metal memory (server exact (?:prefill|decode) phase):")
 TIMING_DELTA = re.compile(
     r"streaming expert timing delta .*?load_calls=(\d+).*?load_pread_avg=([0-9.]+) ms"
     r".*?cache_all_resident=(\d+) cache_all_missing=(\d+) cache_mixed=(\d+)"
