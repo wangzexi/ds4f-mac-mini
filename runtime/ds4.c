@@ -30520,6 +30520,12 @@ static bool metal_graph_encode_layer_batch(
     return ok;
 }
 
+static void metal_graph_decode_prefetch_hash_layers(
+        const ds4_gpu_graph *g,
+        const ds4_model     *model,
+        const ds4_weights   *weights,
+        int                  token);
+
 static bool metal_graph_eval_token_raw_swa_streaming(
         ds4_gpu_graph *g,
         const ds4_model       *model,
@@ -30543,6 +30549,11 @@ static bool metal_graph_eval_token_raw_swa_streaming(
     const uint32_t raw_row = pos % g->raw_cap;
     const uint32_t n_raw = metal_graph_raw_span_for_batch(g, pos, 1);
     metal_graph_dspark_capture_begin(g);
+
+    /* The streaming Decode entry point is used by the fixed Mini server,
+     * including its layer-batched static-map path.  Start the exact L0/L1/L2
+     * token-id routes here, before the first command buffer is encoded. */
+    metal_graph_decode_prefetch_hash_layers(g, model, weights, token);
 
     const bool static_decode_map = metal_graph_stream_decode_static_map_enabled();
     const bool static_map_state_cache =
