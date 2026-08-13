@@ -50,7 +50,10 @@ cleanup() {
     fi
     rm -rf "$tmp_dir"
 }
-trap cleanup EXIT INT TERM
+# A benchmark is usually driven over SSH.  Treat a dropped controller
+# connection exactly like an interrupt so its private server cannot outlive
+# the measurement and block the production server's restart.
+trap cleanup EXIT HUP INT TERM
 
 printf 'prompt=%q\ntokens=%s\ncache_experts=%s\nrepeats=%s\nthreads=%s\nport=%s\n' \
     "$prompt" "$tokens" "$cache_experts" "$repeats" "$threads_csv" "$port" \
