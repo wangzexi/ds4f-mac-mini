@@ -13,10 +13,10 @@ context=${DS4F_SERVER_CONTEXT:-32768}
 tokens=${DS4F_SERVER_TOKENS:-4096}
 cache_experts=${DS4F_SERVER_CACHE_EXPERTS:-1800}
 prefill_full_layer_parallel_pread=${DS4F_SERVER_PREFILL_FULL_LAYER_PARALLEL_PREAD:-1}
-# Flash Decode selects at most six routed experts per transformer layer.  Six
-# persistent readers fully cover that fixed I/O fan-out; the generic runtime
-# default of nine only creates three permanently idle workers on this Mini.
-pread_threads=${DS4F_SERVER_PREAD_THREADS:-6}
+# Flash Decode selects at most six routed experts per transformer layer.  On
+# this Mini, a fresh 32-token exact A/B found five readers marginally faster
+# than six (the sixth only contends for the same SSD); both remain exact.
+pread_threads=${DS4F_SERVER_PREAD_THREADS:-5}
 working_set_mib=${DS4F_SERVER_WORKING_SET_MIB:-11776}
 pinned_mib=${DS4F_SERVER_PINNED_MIB:-4096}
 # This M4 Mini's measured per-process wired-memory ceiling is just under

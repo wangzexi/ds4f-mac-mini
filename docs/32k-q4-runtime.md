@@ -237,6 +237,23 @@ hash 专属缓存换来有效收益。全局离线 LRU 在 711 个可换槽下�
 failure。因此它不是可行的缓存优化；保留更多专家必须以可回收的全局缓存方式进行，
 不能硬分区。
 
+### Mini 的锁页与 SSD 并发实测
+
+`mlock` 只决定专家缓存中哪一部分强制留在物理统一内存；它不决定总缓存容量。
+本机以 6.75 MiB/专家的 packed slab 实测稳定上限为 606 槽 / 3.99 GiB。Decode
+仍保留 967 槽 / 6.37 GiB 总缓存，超出前述 606 槽的 361 槽为可分页候选，不会被
+丢弃。正式 server 因而把 Prefill 和 Decode 的锁页目标都固定为 4 GiB，避免每个新
+进程徒劳尝试 6 GiB 并产生一次可预知的失败；第一次真实 HTTP 请求已经验证为零
+`mlock` failure。
+
+在同一模型、空 KV、`你好` → 32 个 exact greedy token 的四次完整 HTTP 样本中，
+5/6 个 persistent `pread` readers 的 token-ID trace 与响应 SHA-256 全部一致，且均
+无锁页失败。Decode 期间固定读取 18.92 GiB；5 readers 的累计 `pread` 时间为
+9.64/9.79 s，6 readers 为 9.88/9.83 s，GPU busy 分别为 4.60/4.70 与 4.61/4.74 s。
+第六条 reader 没有吞吐收益，略有 SSD 竞争，故正式默认值为 5；运行时仍可通过
+`DS4F_SERVER_PREAD_THREADS=1..6` 覆盖。基准脚本也会在 SSH HUP/INT/TERM 时主动
+清理其私有 server，避免测试进程残留占住生产端口。
+
 ## 预填充 workspace 复用
 
 预填充是 layer-major：同一批 token 完成某层 attention 后才进入该层 FFN。因此 attention-only 和 FFN-only 中间 tensor 生命周期不重叠。`DS4_METAL_PREFILL_STAGE_ALIAS=1` 会释放独立 FFN batch buffer，并让它们成为已结束 attention buffer 的不重叠 view；KV、跨阶段 HC、权重和计算公式均不改变。
