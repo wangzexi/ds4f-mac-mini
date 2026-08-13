@@ -192,6 +192,21 @@ trace 与响应字节一致，且 Decode expert load 由 1,192 降到 1,184；�
 `DS4_METAL_PREFILL_TAIL_EXPERT_HANDOFF[_COMPACT]` 继续不进入生产；后续优先研究
 Decode 阶段的全局 cache 命中，而不是 Prompt→Decode 交接。
 
+2026-08-13 又以真实 HTTP server、`你好` → 32 个 exact greedy token、6 个
+`pread` readers 做了两项 Decode 边界诊断。先在 Prefill 完成时冻结每层按 router
+权重累计的热度排名，然后只统计后续 Decode 的实际选择（预测本身不再更新）：top-6 /
+12 / 24 / 48 分别只覆盖 23.7 / 34.5 / 43.0 / 48.9% 的所选专家，按 router mass
+计也只有 27.5 / 38.9 / 47.1 / 52.8%。在 L0 已占 256 槽的 967 槽总预算下，把这些
+不够确定的候选提前塞满 Decode cache 会先消耗数 GiB SSD 读取，不能合理预期回本，故
+没有实现为 preload 策略。
+
+同一夹具还关闭了当前的 selected-expert early-load（CPU router 一得出 six experts
+便启动 `pread`，等待推迟到 MoE 使用权重时）作两次 A/B：开启为 1.800 t/s、17.883 s
+Decode，关闭为 1.800 t/s、17.770 s，完整 token-ID trace 与最终响应哈希跨组一致。
+两者总 load 仍为 1,192 次 / 18.92 GiB，差别只在部分命中层的提交时机。因此这条
+流水线暂不值得继续重写；下一次 I/O 优化必须能减少实际 miss 或形成新的重叠区间，
+而不是仅移动同一笔读盘的启动时间。
+
 尾部交接也没有改变“低权重 miss 补零”的结论。保留 6 个尾部专家、600 槽、
 `你好` 16-token 对照中，0/10/15/20% 的 generation 为
 1.82/1.81/1.80/1.81 t/s；10% 与 exact 的全部 token ID 一致，15% 与 20%
