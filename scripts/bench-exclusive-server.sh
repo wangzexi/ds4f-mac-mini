@@ -92,8 +92,11 @@ case "$bench_kind" in
             "$DS4F_BENCH_PROMPT" \
             "${DS4F_BENCH_OUT_DIR:-$project_dir/results/measurements/decode-resident-token-$(date +%Y%m%d-%H%M%S)}"
         ;;
+    session-continuity)
+        "$script_dir/bench-server-session-continuity.sh"
+        ;;
     *)
-        echo "unknown DS4F_BENCH_KIND: $bench_kind (expected io-matrix or resident-token)" >&2
+        echo "unknown DS4F_BENCH_KIND: $bench_kind (expected io-matrix, resident-token, or session-continuity)" >&2
         exit 2
         ;;
 esac
