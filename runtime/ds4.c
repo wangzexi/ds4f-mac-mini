@@ -61388,6 +61388,21 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
     ds4_session_dspark_capture_note_checkpoint(s);
     s->graph.mtp_n_raw = 0;
     session_greedy_splitkv_reset(s);
+    if (getenv("DS4_METAL_DIAG_POST_PREFILL_EXPERT_HOTLIST") != NULL) {
+        /* Server sessions use the non-GLM Flash graph.  As for the GLM
+         * diagnostic path above, install the trace-derived first-Decode
+         * experts only after the complete prompt has had its turn to use the
+         * cache.  This is timing instrumentation, never a production hint. */
+        ds4_gpu_stream_expert_layer_prefetch_cancel_all();
+        if (!metal_graph_seed_streaming_expert_cache_from_hotlist(
+                &s->graph, &e->model, &e->weights)) {
+            snprintf(err, errlen,
+                     "%s diagnostic post-prefill expert seed failed", backend_name);
+            return 1;
+        }
+        fprintf(stderr,
+                "ds4: server diagnostic post-prefill exact expert seed installed\n");
+    }
     return 0;
     }
 #endif
