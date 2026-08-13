@@ -49718,6 +49718,10 @@ struct ds4_session {
     ds4_gpu_graph graph;
     ds4_glm_gpu_graph glm_graph;
     bool glm_graph_ready;
+    /* Diagnostic-only first Decode seed.  The exact expert list must be
+     * installed after Prefill, otherwise the layer-major Prefill cache policy
+     * legitimately evicts it before the measured Decode token. */
+    bool glm_diag_post_prefill_seed_pending;
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state (--glm-mtp, greedy only). */
     int glm_mtp_draft;
@@ -59324,7 +59328,10 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             s->glm_graph.tp_in = e->tp.in_views;
         }
 #endif
-        if (e->ssd_streaming &&
+        const bool diag_post_prefill_seed =
+            getenv("DS4_METAL_DIAG_POST_PREFILL_EXPERT_HOTLIST") != NULL;
+        s->glm_diag_post_prefill_seed_pending = diag_post_prefill_seed;
+        if (e->ssd_streaming && !diag_post_prefill_seed &&
             !glm_graph_env_present("DS4_ROCM_GLM_DISABLE_STREAMING_SEED_BEFORE_PREFILL",
                                    "DS4_METAL_GLM_DISABLE_STREAMING_SEED_BEFORE_PREFILL")) {
             ds4_gpu_graph seed_graph;
@@ -62276,6 +62283,28 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             if (errlen) snprintf(err, errlen, "GLM Metal context reached (%u)",
                                  s->glm_graph.ctx_size);
             return 1;
+        }
+        if (s->glm_diag_post_prefill_seed_pending) {
+            /* The hotlist was recorded from this prompt's genuine first
+             * Decode route.  Installing it here measures arithmetic without
+             * selected-expert SSD misses; it has no production code path. */
+            ds4_gpu_stream_expert_layer_prefetch_cancel_all();
+            ds4_gpu_graph seed_graph;
+            memset(&seed_graph, 0, sizeof(seed_graph));
+            seed_graph.quality = e->quality;
+            seed_graph.ssd_streaming = e->ssd_streaming;
+            seed_graph.ssd_streaming_cold = e->ssd_streaming_cold;
+            seed_graph.streaming_preload_experts =
+                e->ssd_streaming_preload_experts;
+            if (!metal_graph_seed_streaming_expert_cache_from_hotlist(
+                    &seed_graph, &e->model, &e->weights)) {
+                if (errlen) snprintf(err, errlen,
+                                     "GLM diagnostic post-prefill expert seed failed");
+                return 1;
+            }
+            s->glm_diag_post_prefill_seed_pending = false;
+            fprintf(stderr,
+                    "ds4: GLM server diagnostic post-prefill exact expert seed installed\n");
         }
         const uint32_t pos = (uint32_t)s->checkpoint.len;
         const bool updates_dense =
