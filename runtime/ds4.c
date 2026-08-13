@@ -48481,6 +48481,10 @@ static int generate_glm_metal_argmax(
          * following decode profiler therefore observes genuine selected MoE
          * execution with no selected-expert SSD miss.
          */
+        /* Decode-style short prefill may still own a speculative read buffer.
+         * It has no semantic value once prefill is complete, but it consumes
+         * the cache budget until explicitly cancelled. */
+        ds4_gpu_stream_expert_layer_prefetch_cancel_all();
         ds4_gpu_graph seed_graph;
         memset(&seed_graph, 0, sizeof(seed_graph));
         seed_graph.quality = quality;
@@ -48490,6 +48494,10 @@ static int generate_glm_metal_argmax(
         ok = metal_graph_seed_streaming_expert_cache_from_hotlist(&seed_graph,
                                                                   model,
                                                                   weights);
+        if (ok) {
+            fprintf(stderr,
+                    "ds4: GLM diagnostic post-prefill exact expert seed installed\n");
+        }
         if (!ok) {
             fprintf(stderr, "ds4: GLM diagnostic post-prefill expert seed failed\n");
             free(logits);
