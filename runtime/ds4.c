@@ -48748,6 +48748,25 @@ static int generate_metal_graph_raw_swa(
         metal_graph_free(&g);
         return 1;
     }
+    if (getenv("DS4_METAL_DIAG_POST_PREFILL_EXPERT_HOTLIST") != NULL) {
+        /*
+         * Flash's real path reaches decode here (not via the GLM helper
+         * above).  The trace-derived routes are installed only after prompt
+         * prefill, so the measured first decode executes its actual six
+         * experts with no selected-expert SSD miss.
+         */
+        ds4_gpu_stream_expert_layer_prefetch_cancel_all();
+        if (!metal_graph_seed_streaming_expert_cache_from_hotlist(&g,
+                                                                   model,
+                                                                   weights)) {
+            fprintf(stderr, "ds4: Flash diagnostic post-prefill expert seed failed\n");
+            free(logits);
+            metal_graph_free(&g);
+            return 1;
+        }
+        fprintf(stderr,
+                "ds4: Flash diagnostic post-prefill exact expert seed installed\n");
+    }
     const char *dump_prefill_logits = getenv("DS4_METAL_DUMP_PREFILL_LOGITS");
     if (dump_prefill_logits && dump_prefill_logits[0]) {
         if (!write_f32_binary_file(dump_prefill_logits, logits, DS4_N_VOCAB)) {
