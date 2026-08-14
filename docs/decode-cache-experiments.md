@@ -317,3 +317,11 @@ be used.  This isolates a remaining correctness fault in the raw address
 kernel/path itself, not merely an overlap or Prefill handoff race.  The whole
 raw-address route remains disabled in production; only the ordinary selected
 `MTLBuffer` bindings are exact.
+
+The smaller compact-address variant was also forced through the same
+no-split condition.  It writes only the six current expert addresses for each
+layer, rather than a 256-entry cache table, yet its fresh 32-token request
+already diverged at token 4 and produced the same first-response SHA
+`c2fb3881…`.  Thus the failure is not stale full-table membership; no
+GPU-address expert kernel is admissible until its numerical discrepancy is
+explained at the kernel/ABI level.
