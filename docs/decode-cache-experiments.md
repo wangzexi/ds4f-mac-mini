@@ -82,6 +82,16 @@ two interleaved exact trials measured baseline second turns of 16.226 s and
 All token IDs and reply SHA-256 values matched.  This is the fixed short-turn
 production policy.
 
+It is not an artifact of the eight-token fixture.  A more mature single
+conversation was also run in alternating order: `你好` -> 32-token answer ->
+the same ten-token suffix -> 29-token answer.  Each full trace and reply hash
+was identical with and without protection.  The unprotected second turns took
+16.627 s and 16.347 s (mean 16.487 s), while the protected turns took 16.301 s
+and 16.084 s (mean 16.192 s): a repeatable 1.8% improvement.  Protection
+reduced total misses from 6,960 to 6,860 and logical expert reads from
+43.84 GiB to 43.18 GiB.  It therefore remains enabled for the intended
+single-session short-continuation regime, not merely for the smallest demo.
+
 It is intentionally all-layer rather than a hand-picked high-overlap subset.
 On an isolated same-session sweep, protecting L0--L42 took 15.966 s; beginning
 only at L3 took 16.201 s, and beginning only at L12 took 16.213 s.  Although
