@@ -96,6 +96,22 @@ short-session runs were 15.897 s for the existing one-generation policy and
 That difference is noise rather than a gain, so the larger victim restriction
 is rejected.
 
+Protecting only the largest exact Router weights from the immediately previous
+token is also worse.  A test-only policy kept the top 6 (the production
+control), 5, or 4 of each layer's six prior selected experts.  The same live
+continuation produced the accepted complete token trace and response hash in
+all cases, but reducing the protected set increased misses and read volume:
+
+| protected experts per prior layer | second turn | total misses | logical expert read |
+| ---: | ---: | ---: | ---: |
+| 6 | 16.022 s | 5,046 | 31.23 GiB |
+| 5 | 16.089 s | 5,075 | 31.42 GiB |
+| 4 | 16.165 s | 5,093 | 31.54 GiB |
+
+The low-weight members still carry useful route continuity at this cache size;
+all six remain protected.  The exact-weight ranking code was test-only and is
+not retained.
+
 Hard per-layer quotas are also not promising.  Replaying the 2,279-selection
 trace with the same 967-entry capacity yields a 70.7% second-Decode hit rate
 for both global LRU and a 22/23-entry-per-layer partition.  A six-entry
