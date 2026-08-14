@@ -66,6 +66,22 @@ slower.  There is no repeatable gain for a smaller window, so the production
 one-token value remains fixed and the A/B-only environment override was not
 retained.
 
+One zero-memory policy did clear the repeatability bar.  For short continued
+Prefills only, the cache protects the prior Decode token's six selected experts
+for each layer until that layer receives its next exact Router result; it then
+replaces that layer's protected set.  This is a cache-victim restriction only:
+the Router, selected IDs, weights, reads for true misses, and Metal kernels are
+unchanged.  It deliberately remains off for long Prefills, whose plain-LRU
+working set needs the entire pool as possible victims.
+
+On the same eight-token answer -> ten-token suffix -> 30-token response,
+two interleaved exact trials measured baseline second turns of 16.226 s and
+16.125 s (mean 16.175 s), versus 15.795 s and 15.798 s with the protection
+(mean 15.797 s): a 2.3% improvement.  The protected run had 77 fewer misses,
+0.51 GiB less logical expert read, and 282 ms less selected-slot bind time.
+All token IDs and reply SHA-256 values matched.  This is the fixed short-turn
+production policy.
+
 Hard per-layer quotas are also not promising.  Replaying the 2,279-selection
 trace with the same 967-entry capacity yields a 70.7% second-Decode hit rate
 for both global LRU and a 22/23-entry-per-layer partition.  A six-entry
