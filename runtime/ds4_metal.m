@@ -716,11 +716,21 @@ static uint8_t
     g_stream_expert_cache_churn_profile_loaded[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
 static uint8_t
     g_stream_expert_cache_churn_profile_one_shot_pending[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+/* The exact Decode distance from one invocation of a layer to the next is
+ * 43 layers x 6 selected experts.  Retain a diagnostic-only age class for a
+ * one-shot eviction, so a later re-read can distinguish "lost before the
+ * same layer got another Router result" from ordinary longer-term churn. */
+static uint8_t
+    g_stream_expert_cache_churn_profile_one_shot_pending_age_class[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
 static uint64_t g_stream_expert_cache_churn_profile_loads;
 static uint64_t g_stream_expert_cache_churn_profile_evictions;
 static uint64_t g_stream_expert_cache_churn_profile_one_shot_evictions;
 static uint64_t g_stream_expert_cache_churn_profile_one_shot_quick_evictions;
+static uint64_t g_stream_expert_cache_churn_profile_one_shot_within_token_evictions;
+static uint64_t g_stream_expert_cache_churn_profile_one_shot_within_two_tokens_evictions;
 static uint64_t g_stream_expert_cache_churn_profile_one_shot_reloads;
+static uint64_t g_stream_expert_cache_churn_profile_one_shot_within_token_reloads;
+static uint64_t g_stream_expert_cache_churn_profile_one_shot_within_two_tokens_reloads;
 static uint64_t g_stream_expert_cache_churn_profile_one_shot_reload_bytes;
 static uint64_t
     g_stream_expert_cache_churn_profile_layer_one_shot_evictions[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
@@ -13452,6 +13462,9 @@ void ds4_gpu_stream_expert_cache_churn_profile_begin_decode(void) {
     memset(g_stream_expert_cache_churn_profile_one_shot_pending,
            0,
            sizeof(g_stream_expert_cache_churn_profile_one_shot_pending));
+    memset(g_stream_expert_cache_churn_profile_one_shot_pending_age_class,
+           0,
+           sizeof(g_stream_expert_cache_churn_profile_one_shot_pending_age_class));
     memset(g_stream_expert_cache_churn_profile_layer_one_shot_evictions,
            0,
            sizeof(g_stream_expert_cache_churn_profile_layer_one_shot_evictions));
@@ -13462,7 +13475,11 @@ void ds4_gpu_stream_expert_cache_churn_profile_begin_decode(void) {
     g_stream_expert_cache_churn_profile_evictions = 0;
     g_stream_expert_cache_churn_profile_one_shot_evictions = 0;
     g_stream_expert_cache_churn_profile_one_shot_quick_evictions = 0;
+    g_stream_expert_cache_churn_profile_one_shot_within_token_evictions = 0;
+    g_stream_expert_cache_churn_profile_one_shot_within_two_tokens_evictions = 0;
     g_stream_expert_cache_churn_profile_one_shot_reloads = 0;
+    g_stream_expert_cache_churn_profile_one_shot_within_token_reloads = 0;
+    g_stream_expert_cache_churn_profile_one_shot_within_two_tokens_reloads = 0;
     g_stream_expert_cache_churn_profile_one_shot_reload_bytes = 0;
 }
 
@@ -13477,14 +13494,18 @@ void ds4_gpu_stream_expert_cache_churn_profile_print_decode(void) {
         (double)g_stream_expert_cache_churn_profile_one_shot_reloads /
             (double)g_stream_expert_cache_churn_profile_one_shot_evictions : 0.0;
     fprintf(stderr,
-            "ds4: decode cache churn loads=%llu evictions=%llu one_shot_evictions=%llu (%.3f of loads, quick<=6-lookups=%llu) one_shot_reloads=%llu (%.3f of one-shot) logical_reread=%.2f GiB\n",
+            "ds4: decode cache churn loads=%llu evictions=%llu one_shot_evictions=%llu (%.3f of loads, quick<=6-lookups=%llu, <=1-token=%llu, <=2-tokens=%llu) one_shot_reloads=%llu (%.3f of one-shot, <=1-token=%llu, <=2-tokens=%llu) logical_reread=%.2f GiB\n",
             (unsigned long long)g_stream_expert_cache_churn_profile_loads,
             (unsigned long long)g_stream_expert_cache_churn_profile_evictions,
             (unsigned long long)g_stream_expert_cache_churn_profile_one_shot_evictions,
             one_shot_fraction,
             (unsigned long long)g_stream_expert_cache_churn_profile_one_shot_quick_evictions,
+            (unsigned long long)g_stream_expert_cache_churn_profile_one_shot_within_token_evictions,
+            (unsigned long long)g_stream_expert_cache_churn_profile_one_shot_within_two_tokens_evictions,
             (unsigned long long)g_stream_expert_cache_churn_profile_one_shot_reloads,
             reload_fraction,
+            (unsigned long long)g_stream_expert_cache_churn_profile_one_shot_within_token_reloads,
+            (unsigned long long)g_stream_expert_cache_churn_profile_one_shot_within_two_tokens_reloads,
             ds4_gpu_gib(g_stream_expert_cache_churn_profile_one_shot_reload_bytes));
     for (uint32_t layer = 0;
          layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
@@ -14387,11 +14408,21 @@ static void ds4_gpu_stream_expert_cache_clear_entry_internal(
         if (count_eviction) {
             g_stream_expert_cache_churn_profile_evictions++;
             if (e->use_count <= 1) {
+                const uint64_t age = g_stream_expert_cache_clock >= e->last_used ?
+                    g_stream_expert_cache_clock - e->last_used : UINT64_MAX;
                 g_stream_expert_cache_churn_profile_one_shot_evictions++;
                 g_stream_expert_cache_churn_profile_layer_one_shot_evictions[layer]++;
-                if (g_stream_expert_cache_clock >= e->last_used &&
-                    g_stream_expert_cache_clock - e->last_used <= 6) {
+                if (age <= 6u) {
                     g_stream_expert_cache_churn_profile_one_shot_quick_evictions++;
+                }
+                if (age <= 43u * 6u) {
+                    g_stream_expert_cache_churn_profile_one_shot_within_token_evictions++;
+                    g_stream_expert_cache_churn_profile_one_shot_pending_age_class[layer][expert] = 1;
+                } else if (age <= 2u * 43u * 6u) {
+                    g_stream_expert_cache_churn_profile_one_shot_within_two_tokens_evictions++;
+                    g_stream_expert_cache_churn_profile_one_shot_pending_age_class[layer][expert] = 2;
+                } else {
+                    g_stream_expert_cache_churn_profile_one_shot_pending_age_class[layer][expert] = 3;
                 }
                 g_stream_expert_cache_churn_profile_one_shot_pending[layer][expert] = 1;
             }
@@ -15490,7 +15521,13 @@ ds4_gpu_stream_expert_cache_install_loaded(
             g_stream_expert_cache_churn_profile_one_shot_reloads++;
             g_stream_expert_cache_churn_profile_layer_one_shot_reloads[layer]++;
             g_stream_expert_cache_churn_profile_one_shot_reload_bytes += logical_bytes;
+            if (g_stream_expert_cache_churn_profile_one_shot_pending_age_class[layer][expert] == 1) {
+                g_stream_expert_cache_churn_profile_one_shot_within_token_reloads++;
+            } else if (g_stream_expert_cache_churn_profile_one_shot_pending_age_class[layer][expert] == 2) {
+                g_stream_expert_cache_churn_profile_one_shot_within_two_tokens_reloads++;
+            }
             g_stream_expert_cache_churn_profile_one_shot_pending[layer][expert] = 0;
+            g_stream_expert_cache_churn_profile_one_shot_pending_age_class[layer][expert] = 0;
         }
         g_stream_expert_cache_churn_profile_loaded[layer][expert] = 1;
         g_stream_expert_cache_churn_profile_loads++;
