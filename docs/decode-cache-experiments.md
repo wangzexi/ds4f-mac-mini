@@ -367,3 +367,28 @@ confirms that eliminating individual Metal binding calls cannot pay for the
 selected-expert SSD reads on this device.  The implementation remains an
 isolated correctness experiment; production continues to use direct selected
 `MTLBuffer` slots.
+
+## Rejected Decode readahead-range coalescing
+
+The Decode readahead path was tested with a worktree-only change that collects
+the already-selected early-load tasks and merges overlapping or directly
+adjacent `F_RDADVISE` ranges. It does not change Router IDs, cache admission
+or eviction, `pread` tasks, destination buffers, or Metal kernels.
+
+Two sequential two-repeat runs and a second interleaved A/B run all passed the
+complete live-session token trace and response SHA-256 gate. For the fixed
+`你好` -> eight-token answer -> 30-token continuation fixture:
+
+| implementation | second-turn mean | readahead calls | logical expert reads |
+| --- | ---: | ---: | ---: |
+| production, two repeats | 15.9997 s | 4,737 | 1,867 |
+| coalesced, two repeats | 15.8336 s | 4,670 | 1,867 |
+| interleaved production, two runs | 16.0018 s | 4,737 | 1,867 |
+| interleaved coalesced, two runs | 15.9452 s | 4,670 | 1,867 |
+
+The apparent 0.35% interleaved improvement is not supported by the profiler:
+the coalesced version reduced advisory calls by only 67 (1.4%), did not
+reduce real SSD reads, and its measured readahead time was slightly higher in
+both interleaved runs. It therefore does not move the bottleneck and is not
+merged into production. The experiment remains available in
+`/private/tmp/ds4f-decode-readahead-coalesce` on the Mini for reproducibility.
