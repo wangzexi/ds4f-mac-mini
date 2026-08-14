@@ -38310,7 +38310,6 @@ int ds4_gpu_routed_moe_one_tensor(
         bool use_stream_expert_cache = false;
         bool use_stream_expert_split_candidate = false;
         bool use_stream_expert_split_deferred = false;
-        bool use_stream_expert_direct_split = false;
         bool stream_expert_split_completed = false;
         uint32_t stream_expert_resident_mask = 0;
         uint32_t stream_expert_missing_mask = 0;
@@ -39081,7 +39080,9 @@ int ds4_gpu_routed_moe_one_tensor(
                 use_stream_expert_cache &&
                 use_iq2_selected_slots &&
                 !use_stream_compact_addr &&
-                stream_split_ready;
+                stream_split_ready &&
+                g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline != nil &&
+                g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline != nil;
             const bool use_stream_hit_validator =
                 use_stream_expert_cache &&
                 use_iq2_selected_slots &&
@@ -39400,22 +39401,9 @@ int ds4_gpu_routed_moe_one_tensor(
                     ds4_gpu_stream_expert_masked_addr_requested() &&
                     g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline != nil &&
                     g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline != nil;
-                /*
-                 * The raw gpuAddress table is numerically unsafe on this M4
-                 * (and stays disabled by default).  Keep the same resident /
-                 * missing overlap, but bind ordinary MTLBuffers to a masked
-                 * selected-slot kernel.  Thus Metal owns resource residency
-                 * while the CPU reads the missing slots.
-                 */
-                use_stream_expert_direct_split =
-                    use_stream_expert_split_candidate &&
-                    getenv("DS4_METAL_ENABLE_STREAMING_EXPERT_DIRECT_SPLIT") != NULL &&
-                    g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_masked_pipeline != nil &&
-                    direct_down_sum;
                 use_stream_expert_split_deferred =
                     use_stream_expert_split_candidate &&
-                    (use_stream_expert_masked_addr_table ||
-                     use_stream_expert_direct_split) &&
+                    use_stream_expert_masked_addr_table &&
                     stream_expert_resident_mask != 0 &&
                     stream_expert_missing_mask != 0 &&
                     ds4_gpu_stream_expert_split_worthwhile(stream_expert_resident_mask,
@@ -39555,7 +39543,6 @@ int ds4_gpu_routed_moe_one_tensor(
                     (use_iq2_selected_slots ? "iq2/q2" :
                     (use_mxfp4_selected_slots ? "mxfp4/mxfp4" : "q4/q4"));
                 const char *selected_view_mode =
-                    use_stream_expert_direct_split && use_stream_expert_split_deferred ? "stream-direct-split" :
                     use_stream_expert_split_deferred ? "stream-split" :
                     use_stream_expert_masked_addr_table ? "stream-addr-mask" :
                     use_stream_compact_addr_table ? "stream-compact-addr" :
@@ -39982,204 +39969,7 @@ int ds4_gpu_routed_moe_one_tensor(
                 .write_clamped = 0,
                 .clamp_value = clamp,
             };
-            if (use_stream_expert_direct_split && use_stream_expert_split_deferred) {
-                const bool stream_split_profile =
-                    getenv("DS4_METAL_STREAMING_EXPERT_SPLIT_PROFILE") != NULL;
-                const bool stream_split_timing =
-                    stream_split_profile ||
-                    ds4_gpu_stream_expert_timing_summary_enabled();
-                double stream_split_t0 =
-                    stream_split_timing ? ds4_gpu_now_ms() : 0.0;
-                ds4_gpu_stream_expert_split_args resident_pair_args = {
-                    .active_mask = stream_expert_resident_mask,
-                    .accumulate = 0u,
-                };
-                ok = ds4_gpu_stream_expert_cache_mark_entries_inflight(
-                             stream_slot_entries,
-                             n_expert,
-                             stream_expert_resident_mask) &&
-                     ds4_gpu_encode_mul_mv_slots6_pair_swiglu_masked(
-                             cb,
-                             g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_masked_pipeline,
-                             &gate_args,
-                             &act_args,
-                             &resident_pair_args,
-                             gate_slot_bufs,
-                             gate_slot_offsets,
-                             up_slot_bufs,
-                             up_slot_offsets,
-                             xbuf,
-                             ds4_gpu_tensor_offset(x),
-                             gatebuf,
-                             ds4_gpu_tensor_offset(gate),
-                             upbuf,
-                             ds4_gpu_tensor_offset(up),
-                             midbuf,
-                             ds4_gpu_tensor_offset(mid),
-                             weightsbuf,
-                             ds4_gpu_tensor_offset(weights),
-                             gate_smem,
-                             2,
-                             false);
-                if (ok) {
-                    ok = ds4_gpu_flush_commands();
-                    if (ok) {
-                        cb = ds4_gpu_command_buffer(&owned);
-                        if (!cb) ok = 0;
-                    }
-                }
-                const double stream_split_resident_ms =
-                    stream_split_timing ? ds4_gpu_now_ms() - stream_split_t0 : 0.0;
-                if (stream_split_timing) stream_split_t0 = ds4_gpu_now_ms();
-                const double stream_split_missing_start_ms = stream_split_t0;
-                double stream_split_missing_load_ms = 0.0;
-                double stream_split_missing_slot_ms = 0.0;
-                double stream_split_missing_prune_ms = 0.0;
-                double stream_split_missing_wait_ms = 0.0;
-                if (ok) {
-                    ok = ds4_gpu_stream_expert_cache_load_selected_missing(
-                            model_map,
-                            model_size,
-                            layer_index,
-                            selected_ids,
-                            n_total_expert,
-                            n_expert,
-                            stream_gate_abs_offsets,
-                            stream_up_abs_offsets,
-                            stream_down_abs_offsets,
-                            gate_expert_bytes,
-                            down_expert_bytes,
-                            stream_expert_missing_mask,
-                            stream_slot_entries);
-                    if (stream_split_timing) {
-                        const double now_ms = ds4_gpu_now_ms();
-                        stream_split_missing_load_ms = now_ms - stream_split_t0;
-                        stream_split_t0 = now_ms;
-                    }
-                    if (ok) {
-                        for (uint32_t i = 0; i < n_expert; i++) {
-                            if ((stream_expert_missing_mask & (1u << i)) == 0) continue;
-                            ds4_gpu_stream_expert_cache_entry *entry =
-                                stream_slot_entries[i];
-                            if (!entry) {
-                                ok = 0;
-                                break;
-                            }
-                            gate_slot_bufs[i] = entry->gate_buffer;
-                            gate_slot_offsets[i] = entry->gate_inner;
-                            up_slot_bufs[i] = entry->up_buffer;
-                            up_slot_offsets[i] = entry->up_inner;
-                            down_slot_bufs[i] = entry->down_buffer;
-                            down_slot_offsets[i] = entry->down_inner;
-                        }
-                    }
-                }
-                if (stream_split_timing) {
-                    const double now_ms = ds4_gpu_now_ms();
-                    stream_split_missing_slot_ms = now_ms - stream_split_t0;
-                    stream_split_t0 = now_ms;
-                }
-                if (ok) {
-                    ds4_gpu_stream_expert_cache_prune_layer(layer_index,
-                                                            n_total_expert,
-                                                            n_expert,
-                                                            selected_ids,
-                                                            n_expert);
-                    ds4_gpu_stream_expert_cache_prune_global(layer_index,
-                                                             selected_ids,
-                                                             n_expert);
-                    if (stream_split_timing) {
-                        const double now_ms = ds4_gpu_now_ms();
-                        stream_split_missing_prune_ms = now_ms - stream_split_t0;
-                        stream_split_t0 = now_ms;
-                    }
-                    ok = ds4_gpu_stream_expert_cache_mark_entries_inflight(
-                            stream_slot_entries, n_expert, 0);
-                }
-                if (ok) {
-                    /* The first command buffer owns the resident writes to
-                     * shared gate/up/mid scratch.  It may overlap the CPU
-                     * pread above, but must finish before missing slots run. */
-                    ok = ds4_gpu_wait_pending_command_buffers(
-                            "direct streaming expert split resident");
-                    if (stream_split_timing) {
-                        const double now_ms = ds4_gpu_now_ms();
-                        stream_split_missing_wait_ms = now_ms - stream_split_t0;
-                        stream_split_t0 = now_ms;
-                    }
-                }
-                const double stream_split_missing_ms =
-                    stream_split_timing ?
-                        ds4_gpu_now_ms() - stream_split_missing_start_ms : 0.0;
-                ds4_gpu_stream_expert_split_args missing_pair_args = {
-                    .active_mask = stream_expert_missing_mask,
-                    .accumulate = 0u,
-                };
-                if (ok) {
-                    ok = ds4_gpu_encode_mul_mv_slots6_pair_swiglu_masked(
-                            cb,
-                            g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_masked_pipeline,
-                            &gate_args,
-                            &act_args,
-                            &missing_pair_args,
-                            gate_slot_bufs,
-                            gate_slot_offsets,
-                            up_slot_bufs,
-                            up_slot_offsets,
-                            xbuf,
-                            ds4_gpu_tensor_offset(x),
-                            gatebuf,
-                            ds4_gpu_tensor_offset(gate),
-                            upbuf,
-                            ds4_gpu_tensor_offset(up),
-                            midbuf,
-                            ds4_gpu_tensor_offset(mid),
-                            weightsbuf,
-                            ds4_gpu_tensor_offset(weights),
-                            gate_smem,
-                            2,
-                            false);
-                }
-                if (ok) {
-                    ok = ds4_gpu_encode_mul_mv_slots6_sum6(
-                            cb,
-                            slots_sum6_pipeline,
-                            &down_args,
-                            down_slot_bufs,
-                            down_slot_offsets,
-                            midbuf,
-                            ds4_gpu_tensor_offset(mid),
-                            outbuf,
-                            ds4_gpu_tensor_offset(out),
-                            down_smem,
-                            2);
-                }
-                stream_expert_split_completed = ok;
-                if (stream_split_timing) {
-                    ds4_gpu_stream_expert_timing_note_split(
-                            stream_expert_resident_mask,
-                            stream_expert_missing_mask,
-                            stream_split_resident_ms,
-                            stream_split_missing_ms);
-                    ds4_gpu_stream_expert_timing_note_split_missing_detail(
-                            stream_split_missing_load_ms,
-                            stream_split_missing_slot_ms,
-                            stream_split_missing_prune_ms,
-                            0.0,
-                            stream_split_missing_wait_ms);
-                }
-                if (stream_split_profile) {
-                    fprintf(stderr,
-                            "ds4: Metal direct streaming expert split layer=%u "
-                            "resident=0x%02x missing=0x%02x resident_submit=%.3f ms "
-                            "missing_bind=%.3f ms\\n",
-                            layer_index,
-                            stream_expert_resident_mask,
-                            stream_expert_missing_mask,
-                            stream_split_resident_ms,
-                            stream_split_missing_ms);
-                }
-            } else if (use_stream_expert_addr_table) {
+            if (use_stream_expert_addr_table) {
                 if (use_stream_expert_masked_addr_table) {
                     if (use_stream_expert_split_deferred) {
                         const bool stream_split_profile =
