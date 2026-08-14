@@ -30741,13 +30741,6 @@ static bool metal_graph_prefill_decode_streaming_range(
     if (start == 0) {
         ds4_gpu_stream_expert_cache_reset_route_hotness();
     }
-    const bool transient_prefill_admission =
-        start != 0 &&
-        DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4 &&
-        DS4_MODEL_VARIANT == DS4_VARIANT_FLASH;
-    if (transient_prefill_admission) {
-        ds4_gpu_stream_expert_cache_begin_transient_prefill_admission();
-    }
 
     const bool profile =
         glm_graph_env_present("DS4_ROCM_GRAPH_PREFILL_PROFILE",
@@ -30768,9 +30761,6 @@ static bool metal_graph_prefill_decode_streaming_range(
     for (uint32_t i = 0; i < n_tokens; i++) {
         if (cancel && cancel(cancel_ud)) {
             if (cancelled) *cancelled = true;
-            if (transient_prefill_admission) {
-                ds4_gpu_stream_expert_cache_end_transient_prefill_admission();
-            }
             return true;
         }
         const uint32_t pos = start + i;
@@ -30788,9 +30778,6 @@ static bool metal_graph_prefill_decode_streaming_range(
             if (ds4_gpu_synchronize() == 0) {
                 fprintf(stderr, "ds4: Metal synchronize after decode-style streaming prefill failure also failed\n");
             }
-            if (transient_prefill_admission) {
-                ds4_gpu_stream_expert_cache_end_transient_prefill_admission();
-            }
             return false;
         }
 
@@ -30802,9 +30789,6 @@ static bool metal_graph_prefill_decode_streaming_range(
         }
         if (cancel && cancel(cancel_ud)) {
             if (cancelled) *cancelled = true;
-            if (transient_prefill_admission) {
-                ds4_gpu_stream_expert_cache_end_transient_prefill_admission();
-            }
             return true;
         }
         if (show_progress) {
@@ -30815,10 +30799,6 @@ static bool metal_graph_prefill_decode_streaming_range(
         }
     }
     if (show_progress) fputc('\n', stderr);
-
-    if (transient_prefill_admission) {
-        ds4_gpu_stream_expert_cache_end_transient_prefill_admission();
-    }
 
     if (profile) {
         const double t1 = now_sec();

@@ -238,11 +238,6 @@ void ds4_gpu_stream_expert_cache_churn_profile_print_decode(void);
  * changes cache ownership, routing, or eviction. */
 void ds4_gpu_stream_expert_cache_residency_profile_begin_prefill(void);
 void ds4_gpu_stream_expert_cache_residency_profile_print_prefill(void);
-/* Fixed Flash-0731 Mini only: a continued small Prefill can use a tiny
- * transient expert tier.  First-seen pairs stay transient; a second sighting
- * promotes through the ordinary global Decode cache path. */
-void ds4_gpu_stream_expert_cache_begin_transient_prefill_admission(void);
-void ds4_gpu_stream_expert_cache_end_transient_prefill_admission(void);
 /* Decode-only eviction for the fixed Mini: the exact uncached Prefill row
  * count chooses either a one-token probation window or plain LRU.  All other
  * phases remain unchanged. */
