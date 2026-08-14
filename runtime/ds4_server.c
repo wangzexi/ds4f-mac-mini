@@ -8697,7 +8697,7 @@ static void server_memory_plan_begin_prefill(
      * regular memory plan and release behavior.
      */
     const bool retain_decode_cache =
-        plan->prefill.prefill_tokens <= s->memory_small_prefill_rows &&
+        plan->prefill.prefill_tokens <= DS4_SERVER_SMALL_PREFILL_MAX_ROWS &&
         plan->decode_experts >= plan->prefill_experts &&
         plan->decode_experts - plan->prefill_experts <= 8u;
     const uint32_t prefill_experts = retain_decode_cache ?
