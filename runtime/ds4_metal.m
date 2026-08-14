@@ -11994,7 +11994,12 @@ static int ds4_gpu_stream_expert_pack_source(
                     "because same-experts mode is explicitly enabled\n");
         }
 #if defined(F_NOCACHE)
-        if (fcntl(fd, F_NOCACHE, 1) != 0) {
+        /* The normal Mini path owns expert residency explicitly.  Keep the
+         * OS page cache out of that accounting, but allow one controlled
+         * benchmark to test whether its spare pageable memory helps Decode
+         * rereads.  This is never the production default. */
+        if (getenv("DS4_METAL_STREAMING_EXPERT_ALLOW_OS_CACHE") == NULL &&
+            fcntl(fd, F_NOCACHE, 1) != 0) {
             fprintf(stderr,
                     "ds4: cannot enable F_NOCACHE for packed experts: %s\n",
                     strerror(errno));
@@ -12005,8 +12010,9 @@ static int ds4_gpu_stream_expert_pack_source(
         g_stream_expert_pack_fd = fd;
         g_stream_expert_pack_data_offset = header_data_offset;
         g_stream_expert_pack_size = (uint64_t)st.st_size;
-        fprintf(stderr, "ds4: packed expert sidecar enabled: %s (%.2f GiB)\n",
-                path, ds4_gpu_gib(g_stream_expert_pack_size));
+        fprintf(stderr, "ds4: packed expert sidecar enabled: %s (%.2f GiB, os_cache=%s)\n",
+                path, ds4_gpu_gib(g_stream_expert_pack_size),
+                getenv("DS4_METAL_STREAMING_EXPERT_ALLOW_OS_CACHE") ? "allowed" : "disabled");
     }
 
     if (g_stream_expert_pack_fd < 0) return 0;
