@@ -50,6 +50,12 @@ decode_eviction_policy=${DS4F_SERVER_DECODE_EVICTION_POLICY:-lru}
 # versus 2.40 for splitting a single miss and 2.38--2.41 for thresholds 3--6.
 # All variants had the identical greedy trace.
 decode_split_min_misses=${DS4F_SERVER_DECODE_SPLIT_MIN_MISSES:-2}
+# The Metal GPU-address table is fast in isolation, but it made the fixed
+# Flash runtime's answer depend on whether selected-expert buffers survived a
+# previous request.  Keep it off until the resource-lifetime bug is fixed.
+# The normal selected-slot cache remains enabled, so this does not discard the
+# Mini's Decode expert residency or its SSD-read savings.
+disable_streaming_expert_addr_table=${DS4F_SERVER_DISABLE_STREAMING_EXPERT_ADDR_TABLE:-1}
 
 if [ ! -x "$project_dir/ds4f-server" ]; then
     echo "missing ds4f-server; run: make server" >&2
@@ -90,6 +96,19 @@ case "$decode_split_min_misses" in
         ;;
     *)
         echo "DS4F_SERVER_DECODE_SPLIT_MIN_MISSES must be an integer 1..6" >&2
+        exit 2
+        ;;
+esac
+
+case "$disable_streaming_expert_addr_table" in
+    0)
+        unset DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE
+        ;;
+    1)
+        export DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE=1
+        ;;
+    *)
+        echo "DS4F_SERVER_DISABLE_STREAMING_EXPERT_ADDR_TABLE must be 0 or 1" >&2
         exit 2
         ;;
 esac
