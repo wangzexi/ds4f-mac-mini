@@ -89,6 +89,13 @@ the early hash layers have little direct adjacent-token set overlap, excluding
 them makes the global cache evolve less favorably.  The complete 43-layer
 protection set is therefore retained.
 
+Keeping two historical route generations was also tried in isolation.  It is
+still exact and zero-buffer, but can protect as many as 516 entries: the paired
+short-session runs were 15.897 s for the existing one-generation policy and
+15.945 s for two generations, with identical token IDs and response hashes.
+That difference is noise rather than a gain, so the larger victim restriction
+is rejected.
+
 Hard per-layer quotas are also not promising.  Replaying the 2,279-selection
 trace with the same 967-entry capacity yields a 70.7% second-Decode hit rate
 for both global LRU and a 22/23-entry-per-layer partition.  A six-entry
