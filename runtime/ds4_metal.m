@@ -704,10 +704,11 @@ static int g_stream_expert_cache_decode_lru_policy_active;
  * gets one short chance to be selected again before it competes with the
  * mature cache. */
 static int g_stream_expert_cache_decode_probation_lru_policy_active;
-/* A Decode-only A/B keeps the prior token's selected six experts protected
- * until that same layer receives the next exact Router answer.  This is an
- * exact cache-admission experiment: it changes neither the six IDs nor any
- * Metal operation, and needs no additional buffers. */
+/* On a short continued Prefill, keep the prior token's selected six experts
+ * protected until that same layer receives the next exact Router answer.  This
+ * changes neither the six IDs nor any Metal operation, and needs no additional
+ * buffers.  Long Prefills retain plain LRU: their broader working set needs
+ * the whole cache as a victim pool. */
 static int g_stream_expert_cache_previous_route_protection_active;
 static uint8_t
     g_stream_expert_cache_previous_route_protected[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
@@ -13568,7 +13569,7 @@ void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(
     g_stream_expert_cache_decode_probation_lru_policy_active =
         !g_stream_expert_cache_decode_lru_policy_active;
     g_stream_expert_cache_previous_route_protection_active =
-        getenv("DS4_METAL_ENABLE_DECODE_PREVIOUS_ROUTE_PROTECT") != NULL;
+        !g_stream_expert_cache_decode_lru_policy_active;
     memset(g_stream_expert_cache_previous_route_protected,
            0,
            sizeof(g_stream_expert_cache_previous_route_protected));
