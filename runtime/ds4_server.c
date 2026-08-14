@@ -11970,7 +11970,8 @@ static void generate_job(server *s, server_slot *slot, job *j) {
          * the cache, its heat, or the eviction policy. */
         ds4_gpu_stream_expert_cache_churn_profile_begin_decode();
     }
-    ds4_gpu_stream_expert_cache_decode_eviction_policy_begin();
+    ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(
+            memory_plan.valid ? memory_plan.prefill.prefill_tokens : 0);
     if (cold_store_len == prompt_for_sync->len) {
         if (kv_cache_store_live_prefix(s, slot, prompt_for_sync,
                                        cold_store_len, "cold")) {

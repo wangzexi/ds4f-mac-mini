@@ -40,11 +40,12 @@ kv_cache_min_tokens=${DS4F_SERVER_KV_CACHE_MIN_TOKENS:-1}
 prefill_measurements=${DS4F_SERVER_PREFILL_MEASUREMENTS:-$project_dir/cache/prefill-measurements.tsv}
 preload_static_decode=${DS4F_SERVER_PRELOAD_STATIC_DECODE_TRUNK:-1}
 allow_shared_expert_sidecar=${DS4F_SERVER_ALLOW_SHARED_EXPERT_SIDECAR:-0}
-# A newly read routed expert should survive until the next visit to its own
-# layer.  On the fixed 43-layer/6-expert Flash path that is one Decode token
-# (258 lookups).  Exact 64-token runs averaged 2.266 token/s, versus 2.239
-# for plain LRU; retaining two token cycles was slower (2.253 token/s).
-decode_eviction_policy=${DS4F_SERVER_DECODE_EVICTION_POLICY:-probation-lru}
+# The fixed Mini has two measured Decode regimes: short continued Prefills
+# favor one-token probation, while a 562-token Prefill followed by 32 Decode
+# tokens favors LRU (1.99 versus 1.91 token/s).  `adaptive` selects solely
+# from this exact uncached Prefill row count; an explicit policy remains an
+# A/B override.
+decode_eviction_policy=${DS4F_SERVER_DECODE_EVICTION_POLICY:-adaptive}
 # Decode on the fixed M4 Mini is usually a 4--5 resident / 1--2 missing
 # expert mix.  With L2-after-L0 release, an interleaved 512-token/32-token
 # A/B sweep found two misses the repeatable optimum: 2.42 token/s median,
@@ -84,10 +85,10 @@ case "$allow_shared_expert_sidecar" in
 esac
 
 case "$decode_eviction_policy" in
-    lru|heat|reuse-heat|probation-lru)
+    adaptive|lru|heat|reuse-heat|probation-lru)
         ;;
     *)
-        echo "DS4F_SERVER_DECODE_EVICTION_POLICY must be lru, heat, reuse-heat, or probation-lru" >&2
+        echo "DS4F_SERVER_DECODE_EVICTION_POLICY must be adaptive, lru, heat, reuse-heat, or probation-lru" >&2
         exit 2
         ;;
 esac

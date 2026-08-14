@@ -13456,8 +13456,25 @@ void ds4_gpu_stream_expert_cache_churn_profile_print_decode(void) {
     }
 }
 
-void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(void) {
-    const char *policy = getenv("DS4_METAL_STREAMING_EXPERT_DECODE_EVICTION_POLICY");
+void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(
+        uint32_t prefill_rows) {
+    const char *requested =
+        getenv("DS4_METAL_STREAMING_EXPERT_DECODE_EVICTION_POLICY");
+    const char *policy = requested;
+    /*
+     * This runtime is only for the fixed M4/16GB Flash-0731 target.  Exact
+     * 64-token short-chat A/Bs favor one-token probation, while the same
+     * 562-token Prefill / 32-token Decode trajectory favors plain LRU:
+     * retaining the old prompt's freshly read experts caused 3.82 GiB of
+     * logical rereads versus 2.85 GiB with LRU.  The uncached row count is
+     * the precise phase boundary already used by the memory planner.
+     */
+    if (requested && strcmp(requested, "adaptive") == 0) {
+        policy = prefill_rows <= 18u ? "probation-lru" : "lru";
+        fprintf(stderr,
+                "ds4: Decode expert eviction policy=adaptive rows=%u -> %s\n",
+                prefill_rows, policy);
+    }
     g_stream_expert_cache_decode_lru_policy_active =
         policy && strcmp(policy, "lru") == 0;
     g_stream_expert_cache_decode_reuse_heat_policy_active =
@@ -13478,7 +13495,8 @@ void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(void) {
     } else if (g_stream_expert_cache_decode_reuse_heat_policy_active) {
         fprintf(stderr,
                 "ds4: Decode expert eviction policy=reuse-heat (Prefill remains heat+LRU)\n");
-    } else if (g_stream_expert_cache_decode_probation_lru_policy_active) {
+    } else if (g_stream_expert_cache_decode_probation_lru_policy_active &&
+               !(requested && strcmp(requested, "adaptive") == 0)) {
         fprintf(stderr,
                 "ds4: Decode expert eviction policy=probation-lru (Prefill remains heat+LRU)\n");
     }

@@ -33,8 +33,8 @@ restore() {
     # restored production server.  In particular, decode ablations preserve
     # dispatch timing by intentionally retaining stale buffers, so allowing
     # DS4_GLM_DECODE_ABLATE to survive this exec would make production answer
-    # garbage.  Production uses one-token Decode probation, split threshold
-    # 2, and no diagnostic routing/Metal profiling state.
+    # garbage.  Production uses adaptive Decode eviction, split threshold 2,
+    # and no diagnostic routing/Metal profiling state.
     nohup env \
         -u DS4_GLM_DECODE_ABLATE \
         -u DS4_METAL_DECODE_STAGE_PROFILE \
@@ -69,7 +69,7 @@ restore() {
         -u DS4F_SERVER_PREAD_THREADS \
         -u DS4F_SERVER_PINNED_MIB \
         -u DS4F_SERVER_DECODE_PINNED_MIB \
-        DS4F_SERVER_DECODE_EVICTION_POLICY=probation-lru \
+        DS4F_SERVER_DECODE_EVICTION_POLICY=adaptive \
         DS4F_SERVER_DECODE_SPLIT_MIN_MISSES=2 \
         "$script_dir/run-server.sh" >"$restore_log" 2>&1 < /dev/null &
 }
