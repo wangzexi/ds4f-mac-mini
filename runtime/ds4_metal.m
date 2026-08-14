@@ -12047,6 +12047,7 @@ static void ds4_gpu_stream_expert_sort_pread_tasks(
         ds4_gpu_stream_expert_pread_task *tasks,
         uint32_t                          n_tasks) {
     if (!tasks || n_tasks < 2 ||
+        n_tasks > DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED ||
         !ds4_gpu_stream_expert_sort_pread_tasks_requested()) {
         return;
     }
