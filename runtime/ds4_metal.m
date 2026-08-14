@@ -13073,8 +13073,7 @@ static void ds4_gpu_stream_expert_evict_dontneed_range(
 }
 
 static int ds4_gpu_stream_expert_split_requested(void) {
-    return g_ssd_streaming_mode &&
-           getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_SPLIT") == NULL;
+    return g_ssd_streaming_mode;
 }
 
 static uint32_t ds4_gpu_stream_expert_split_min_decode_tokens(void) {
