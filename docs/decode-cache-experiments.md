@@ -81,3 +81,19 @@ without overwriting the global Decode LRU.  Reusing global slots and restoring
 them afterwards would itself evict the retained data and invalidate the
 experiment.  The future implementation must preserve the exact token trace
 and compare repeated live-session timings against the present baseline.
+
+### Rejected implementation attempt
+
+An initial six-slot implementation was tested on 2026-08-14.  It redirected
+first-sighting short-Prefill reads into separate Metal buffers and used the
+ordinary global path on a second sighting.  It did reduce the observed suffix
+displacement from 377 to 235 entries, but this is not an acceptable result:
+its generated continuation diverged from the accepted baseline at output token
+two.  Repeating the modified implementation only reproduced the same wrong
+trace, which proves neither mathematical nor resource-lifetime correctness.
+
+The implementation was reverted immediately and the production numerical gate
+was rerun.  Any future version needs an explicit command-buffer ownership fence
+for every transient expert buffer (including the per-layer address binding),
+followed by a baseline token/hash comparison.  No performance figure from this
+rejected path should be used for decisions.
