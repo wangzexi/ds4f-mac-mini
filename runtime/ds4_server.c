@@ -10152,6 +10152,20 @@ static int live_text_prefix_prompt(server *s, server_slot *slot,
     build_prompt_from_exact_prefix_and_text_suffix(
         s->engine, live_tokens, req->prompt_text + live_text_len,
         effective_prompt);
+    const char *diag = getenv("DS4_MINI_LIVE_PREFIX_DIAG");
+    if (diag && diag[0] && strcmp(diag, "0") != 0) {
+        int common = 0;
+        while (common < effective_prompt->len && common < req->prompt.len &&
+               effective_prompt->v[common] == req->prompt.v[common]) {
+            common++;
+        }
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: live-prefix diagnostic live=%d effective=%d canonical=%d common=%d next_effective=%d next_canonical=%d",
+                   live_tokens->len, effective_prompt->len, req->prompt.len,
+                   common,
+                   common < effective_prompt->len ? effective_prompt->v[common] : -1,
+                   common < req->prompt.len ? req->prompt.v[common] : -1);
+    }
     free(live_text);
     return live_tokens->len;
 }
