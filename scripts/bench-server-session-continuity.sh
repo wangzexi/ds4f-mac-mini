@@ -14,6 +14,7 @@ repeats=${DS4F_BENCH_REPEATS:-2}
 first_tokens=${DS4F_BENCH_FIRST_TOKENS:-8}
 second_tokens=${DS4F_BENCH_SECOND_TOKENS:-32}
 fresh_control=${DS4F_BENCH_FRESH_CONTROL:-1}
+kv_cache_min_tokens=${DS4F_BENCH_KV_CACHE_MIN_TOKENS:-1}
 out_dir=${DS4F_BENCH_OUT_DIR:-"$project_dir/results/benchmarks/session-continuity-$(date +%Y%m%d-%H%M%S)"}
 
 if [[ $out_dir != /* ]]; then out_dir="$project_dir/$out_dir"; fi
@@ -24,6 +25,10 @@ if [[ ! -x $server ]] || [[ ! $repeats =~ ^[1-9][0-9]*$ ]] ||
 fi
 if [[ $fresh_control != 0 && $fresh_control != 1 ]]; then
     echo "fresh_control must be 0 or 1" >&2
+    exit 2
+fi
+if [[ ! $kv_cache_min_tokens =~ ^[1-9][0-9]*$ ]]; then
+    echo "kv_cache_min_tokens must be a positive integer" >&2
     exit 2
 fi
 if pgrep -x ds4f-server >/dev/null 2>&1; then
@@ -78,7 +83,7 @@ for ((repeat = 1; repeat <= repeats; repeat++)); do
         DS4F_SERVER_PORT="$port" \
         DS4F_SERVER_KV_CACHE_DIR="$kv_dir" \
         DS4F_SERVER_KV_CACHE_MIB=64 \
-        DS4F_SERVER_KV_CACHE_MIN_TOKENS=1 \
+        DS4F_SERVER_KV_CACHE_MIN_TOKENS="$kv_cache_min_tokens" \
         DS4_METAL_STREAMING_EXPERT_PREAD_PROFILE=1 \
         DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY=1 \
         DS4_METAL_STREAMING_EXPERT_LAYER_STATS=1 \
@@ -190,7 +195,7 @@ PY
             DS4F_SERVER_PORT="$port" \
             DS4F_SERVER_KV_CACHE_DIR="$control_kv" \
             DS4F_SERVER_KV_CACHE_MIB=64 \
-            DS4F_SERVER_KV_CACHE_MIN_TOKENS=1 \
+            DS4F_SERVER_KV_CACHE_MIN_TOKENS="$kv_cache_min_tokens" \
             DS4_METAL_STREAMING_EXPERT_PREAD_PROFILE=1 \
             DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY=1 \
             DS4_METAL_STREAMING_EXPERT_LAYER_STATS=1 \
