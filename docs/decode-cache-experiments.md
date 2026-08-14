@@ -92,6 +92,16 @@ reduced total misses from 6,960 to 6,860 and logical expert reads from
 43.84 GiB to 43.18 GiB.  It therefore remains enabled for the intended
 single-session short-continuation regime, not merely for the smallest demo.
 
+The same conclusion holds through a third real continuation.  Two alternating
+three-turn fixtures generated 16 tokens per turn; the second and third user
+messages used the actual prior assistant outputs, preserving the live KV
+frontier.  All four runs had the identical 48-token trace and the same three
+response SHA-256 values.  Protection deterministically reduced the whole
+three-turn trajectory from 6,950 misses / 43.78 GiB logical reads to 6,840 /
+43.05 GiB.  Across the two orderings, total request time fell from 32.901 s to
+32.698 s (0.6%); the third response, where cache continuity matters most, fell
+from 10.774 s to 10.642 s (1.2%).
+
 It is intentionally all-layer rather than a hand-picked high-overlap subset.
 On an isolated same-session sweep, protecting L0--L42 took 15.966 s; beginning
 only at L3 took 16.201 s, and beginning only at L12 took 16.213 s.  Although
