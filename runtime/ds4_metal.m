@@ -39386,9 +39386,17 @@ int ds4_gpu_routed_moe_one_tensor(
                     use_stream_expert_masked_addr_table = false;
                     use_stream_compact_addr_table = true;
                 }
+                /* Diagnostic only: the normal address-table path reads the
+                 * Router's GPU-resident selected-ID tensor directly.  Let an
+                 * exact trace replay force the already-read host IDs through
+                 * a dedicated shared buffer, so an address-path mismatch can
+                 * distinguish bad expert addresses from selected-ID lifetime
+                 * or layout trouble.  Production keeps this off. */
+                const bool stream_addr_host_ids =
+                    getenv("DS4_METAL_STREAMING_EXPERT_ADDR_USE_HOST_IDS") != NULL;
                 if (use_stream_expert_addr_table &&
                     !use_stream_compact_addr_table &&
-                    selected_exec_ids_from_host) {
+                    (selected_exec_ids_from_host || stream_addr_host_ids)) {
                     if (!ds4_gpu_stream_selected_ids_prepare(layer_index,
                                                              selected_ids,
                                                              n_expert,
