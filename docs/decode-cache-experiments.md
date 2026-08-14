@@ -139,5 +139,7 @@ layers split into resident and missing stages.  But its second Metal command
 submission and the required ownership fence consume the same budget that the
 SSD read is meant to hide.  It is therefore rejected and remains out of the
 runtime.  The next viable Decode direction is not another split threshold; it
-is reducing the Router-ID readback and selected-buffer binding boundary itself
-without reintroducing the unsafe GPU-address-table lifetime behaviour.
+is reducing the selected-slot loading and binding boundary itself without
+reintroducing the unsafe GPU-address-table lifetime behaviour.  The production
+Flash path already uses its exact CPU Router before this boundary, so it has no
+GPU Router-ID readback to remove.
