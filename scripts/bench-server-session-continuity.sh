@@ -3,7 +3,10 @@
 # one continuing chat.  The second request carries the first answer back in
 # the canonical chat transcript, so the server can reuse its in-memory / disk
 # KV prefix while the benchmark records whether Decode's expert cache survives
-# the intervening Prefill phase.
+# the intervening Prefill phase.  Repeated live-session traces are the exact
+# gate.  A separately-started text replay is only a diagnostic: re-tokenizing
+# assistant text inside a chat template can change BPE boundaries, even when
+# its visible text is identical to the preceding live response.
 set -euo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -13,7 +16,7 @@ port=${DS4F_BENCH_SERVER_PORT:-18081}
 repeats=${DS4F_BENCH_REPEATS:-2}
 first_tokens=${DS4F_BENCH_FIRST_TOKENS:-8}
 second_tokens=${DS4F_BENCH_SECOND_TOKENS:-32}
-fresh_control=${DS4F_BENCH_FRESH_CONTROL:-1}
+text_replay_control=${DS4F_BENCH_FRESH_CONTROL:-0}
 kv_cache_min_tokens=${DS4F_BENCH_KV_CACHE_MIN_TOKENS:-1}
 out_dir=${DS4F_BENCH_OUT_DIR:-"$project_dir/results/benchmarks/session-continuity-$(date +%Y%m%d-%H%M%S)"}
 
@@ -23,8 +26,8 @@ if [[ ! -x $server ]] || [[ ! $repeats =~ ^[1-9][0-9]*$ ]] ||
     echo "server, repeats, first_tokens, and second_tokens are invalid" >&2
     exit 2
 fi
-if [[ $fresh_control != 0 && $fresh_control != 1 ]]; then
-    echo "fresh_control must be 0 or 1" >&2
+if [[ $text_replay_control != 0 && $text_replay_control != 1 ]]; then
+    echo "DS4F_BENCH_FRESH_CONTROL must be 0 or 1" >&2
     exit 2
 fi
 if [[ ! $kv_cache_min_tokens =~ ^[1-9][0-9]*$ ]]; then
@@ -186,9 +189,9 @@ PY
     wait "$server_pid" || true
     server_pid=
 
-    if [[ $fresh_control == 1 ]]; then
-        control_log="$out_dir/server-fresh-control-run-$repeat.log"
-        control_kv="$tmp_dir/kv-control-$repeat"
+    if [[ $text_replay_control == 1 ]]; then
+        control_log="$out_dir/server-text-replay-control-run-$repeat.log"
+        control_kv="$tmp_dir/kv-text-replay-control-$repeat"
         mkdir -p "$control_kv"
         env \
             DS4F_SERVER_HOST=127.0.0.1 \
@@ -223,22 +226,20 @@ text = json.load(open(sys.argv[1], encoding='utf-8'))['choices'][0]['message']['
 print(hashlib.sha256(text.encode()).hexdigest())
 PY
 )
-        if [[ $control_tokens != "$actual_second" || $control_trace != "${traces[1]}" ||
-                $control_hash != "$second_hash" ]]; then
-            echo "fresh-control exact regression in repeat $repeat" >&2
-            exit 1
-        fi
-        printf 'repeat=%s control_tokens=%s control_seconds=%s control_tps=%s control_trace=%s control_sha256=%s\n' \
+        # This is intentionally not compared with the live continuation.  It
+        # reconstructs the visible assistant text, then tokenizes it again;
+        # chat delimiters may make that a different token sequence.
+        printf 'repeat=%s text_replay_tokens=%s text_replay_seconds=%s text_replay_tps=%s text_replay_trace=%s text_replay_sha256=%s\n' \
             "$repeat" "$control_tokens" "$control_seconds" \
             "$(python3 - "$control_tokens" "$control_seconds" <<'PY'
 import sys
 print(f'{int(sys.argv[1])/float(sys.argv[2]):.4f}')
 PY
-)" "$control_trace" "$control_hash" >>"$out_dir/fresh-control.tsv"
+)" "$control_trace" "$control_hash" >>"$out_dir/text-replay-control.tsv"
         kill -TERM "$server_pid"
         wait "$server_pid" || true
         server_pid=
     fi
 done
 
-echo "exact session continuity benchmark passed: $out_dir"
+echo "live-session repeat exact gate passed: $out_dir"
