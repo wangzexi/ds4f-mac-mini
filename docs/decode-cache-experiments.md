@@ -82,6 +82,13 @@ two interleaved exact trials measured baseline second turns of 16.226 s and
 All token IDs and reply SHA-256 values matched.  This is the fixed short-turn
 production policy.
 
+It is intentionally all-layer rather than a hand-picked high-overlap subset.
+On an isolated same-session sweep, protecting L0--L42 took 15.966 s; beginning
+only at L3 took 16.201 s, and beginning only at L12 took 16.213 s.  Although
+the early hash layers have little direct adjacent-token set overlap, excluding
+them makes the global cache evolve less favorably.  The complete 43-layer
+protection set is therefore retained.
+
 Hard per-layer quotas are also not promising.  Replaying the 2,279-selection
 trace with the same 967-entry capacity yields a 70.7% second-Decode hit rate
 for both global LRU and a 22/23-entry-per-layer partition.  A six-entry
