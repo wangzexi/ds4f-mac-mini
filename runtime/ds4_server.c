@@ -8522,6 +8522,7 @@ typedef struct {
     uint32_t decode_experts;
     uint32_t decode_pinned_experts;
     uint64_t prefill_workspace_bytes;
+    uint64_t prefill_reserve_bytes;
     uint64_t footprint_before_prefill;
     ds4_request_memory_profile prefill;
     ds4_request_memory_profile decode;
@@ -8549,26 +8550,30 @@ static uint64_t server_add_sat_u64(uint64_t a, uint64_t b) {
 
 #define DS4_SERVER_SMALL_PREFILL_MAX_ROWS 18u
 #define DS4_SERVER_SMALL_PREFILL_RESIDENT_BYTES (48ull * 1024ull * 1024ull)
+#define DS4_SERVER_FULL_LAYER_PREFILL_MIN_ROWS 64u
+#define DS4_SERVER_DOUBLE_LAYER_EXPERTS 512u
+#define DS4_SERVER_DOUBLE_LAYER_PREFILL_RESERVE_BYTES (256ull * 1024ull * 1024ull)
 
-static uint64_t server_plan_base_bytes(
-        const server                     *s,
+static uint64_t server_plan_base_bytes_with_reserve(
         const ds4_request_memory_profile *profile,
-        uint64_t                          phase_workspace_bytes) {
-    if (!s || !profile) return UINT64_MAX;
+        uint64_t                          phase_workspace_bytes,
+        uint64_t                          reserve_bytes) {
+    if (!profile) return UINT64_MAX;
     uint64_t base = server_add_sat_u64(profile->resident_model_bytes,
                                        profile->kv_bytes);
     base = server_add_sat_u64(base, profile->fixed_graph_bytes);
     base = server_add_sat_u64(base, phase_workspace_bytes);
-    return server_add_sat_u64(base, s->memory_reserve_bytes);
+    return server_add_sat_u64(base, reserve_bytes);
 }
 
-static uint32_t server_plan_expert_budget(
+static uint32_t server_plan_expert_budget_with_reserve(
         const server                      *s,
         const ds4_request_memory_profile  *profile,
-        uint64_t                           phase_workspace_bytes) {
+        uint64_t                           phase_workspace_bytes,
+        uint64_t                           reserve_bytes) {
     if (!s || !profile || profile->per_expert_bytes == 0) return 0;
-    const uint64_t base = server_plan_base_bytes(
-            s, profile, phase_workspace_bytes);
+    const uint64_t base = server_plan_base_bytes_with_reserve(
+            profile, phase_workspace_bytes, reserve_bytes);
     uint64_t experts = s->memory_working_set_bytes > base ?
         (s->memory_working_set_bytes - base) / profile->per_expert_bytes : 0;
     if (experts > profile->configured_cache_experts) {
@@ -8576,6 +8581,15 @@ static uint32_t server_plan_expert_budget(
     }
     if (experts > UINT32_MAX) experts = UINT32_MAX;
     return (uint32_t)experts;
+}
+
+static uint32_t server_plan_expert_budget(
+        const server                      *s,
+        const ds4_request_memory_profile  *profile,
+        uint64_t                           phase_workspace_bytes) {
+    if (!s) return 0;
+    return server_plan_expert_budget_with_reserve(
+            s, profile, phase_workspace_bytes, s->memory_reserve_bytes);
 }
 
 static uint32_t server_plan_pinned_expert_budget(
@@ -8654,10 +8668,34 @@ static server_request_memory_plan server_build_request_memory_plan(
         plan.prefill_workspace_bytes = workspace_owner_bytes != 0 ?
             workspace_owner_bytes : plan.prefill.graph_bytes;
     }
+    plan.prefill_reserve_bytes = s->memory_reserve_bytes;
     plan.prefill_experts = server_plan_expert_budget(
             s,
             &plan.prefill,
             plan.prefill_workspace_bytes);
+    /*
+     * Fixed M4/16GB + Flash-0731 policy: a batched Prefill has a known
+     * whole-expert-layer path.  It becomes a real SSD/GPU pipeline only when
+     * two complete 256-expert layers fit at once.  The normal 512 MiB reserve
+     * leaves a 1.9K-token prompt at 502 slots and forces alternating layers.
+     * During this phase alone, lend 256 MiB of that reserve if it crosses the
+     * 512-slot boundary.  Decode always returns to the ordinary 512 MiB plan.
+     */
+    if (plan.prefill.prefill_tokens >= DS4_SERVER_FULL_LAYER_PREFILL_MIN_ROWS &&
+        plan.prefill_experts < DS4_SERVER_DOUBLE_LAYER_EXPERTS &&
+        s->memory_reserve_bytes > DS4_SERVER_DOUBLE_LAYER_PREFILL_RESERVE_BYTES) {
+        const uint32_t double_layer_experts =
+            server_plan_expert_budget_with_reserve(
+                    s,
+                    &plan.prefill,
+                    plan.prefill_workspace_bytes,
+                    DS4_SERVER_DOUBLE_LAYER_PREFILL_RESERVE_BYTES);
+        if (double_layer_experts >= DS4_SERVER_DOUBLE_LAYER_EXPERTS) {
+            plan.prefill_reserve_bytes =
+                DS4_SERVER_DOUBLE_LAYER_PREFILL_RESERVE_BYTES;
+            plan.prefill_experts = double_layer_experts;
+        }
+    }
     plan.prefill_pinned_experts = server_plan_pinned_expert_budget(
             &plan.prefill,
             plan.prefill_experts,
@@ -8713,12 +8751,12 @@ static void server_memory_plan_begin_prefill(
     plan->footprint_before_prefill = s->memory_calibration ?
         ds4_engine_task_phys_footprint(s->engine) : 0;
     pthread_mutex_unlock(&s->inference_mu);
-    const uint64_t base = server_plan_base_bytes(
-            s,
+    const uint64_t base = server_plan_base_bytes_with_reserve(
             &plan->prefill,
-            plan->prefill_workspace_bytes);
+            plan->prefill_workspace_bytes,
+            plan->prefill_reserve_bytes);
     server_log(DS4_LOG_PREFILL,
-               "ds4-server: memory plan prefill uncached=%d prompt=%d output=%d ctx=%d rows=%u static_trunk=%s base=%.2f GiB fixed_graph=%.2f MiB workspace=%.2f GiB logical_graph=%.2f MiB cache=%u/%.2f GiB pinned_target=%u/%.2f GiB locked_now=%u workspace_reacquired=%.2f GiB",
+               "ds4-server: memory plan prefill uncached=%d prompt=%d output=%d ctx=%d rows=%u static_trunk=%s base=%.2f GiB reserve=%.2f MiB fixed_graph=%.2f MiB workspace=%.2f GiB logical_graph=%.2f MiB cache=%u/%.2f GiB pinned_target=%u/%.2f GiB locked_now=%u workspace_reacquired=%.2f GiB",
                plan->uncached_tokens,
                plan->prompt_tokens,
                plan->output_tokens,
@@ -8727,6 +8765,7 @@ static void server_memory_plan_begin_prefill(
                plan->prefill.resident_model_bytes ==
                        plan->prefill.decode_resident_model_bytes ? "reuse" : "stream",
                (double)base / 1073741824.0,
+               (double)plan->prefill_reserve_bytes / 1048576.0,
                (double)plan->prefill.fixed_graph_bytes / 1048576.0,
                (double)plan->prefill_workspace_bytes / 1073741824.0,
                (double)plan->prefill.graph_bytes / 1048576.0,
