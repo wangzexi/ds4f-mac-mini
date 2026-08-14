@@ -348,3 +348,22 @@ already diverged at token 4 and produced the same first-response SHA
 `c2fb3881…`.  Thus the failure is not stale full-table membership; no
 GPU-address expert kernel is admissible until its numerical discrepancy is
 explained at the kernel/ABI level.
+
+### Argument-buffer repair of GPU-address access
+
+The numerical fault was subsequently isolated to the raw `uint64_t`-to-pointer
+Metal path rather than expert-cache ownership.  A compact replacement uses a
+real Metal argument buffer containing only the six selected expert pointers
+per layer; all six backing `MTLBuffer`s remain declared with `useResource`.
+Both the ordinary argument-encoder fill and the Tier-2 direct `gpuAddress`
+fill passed the complete two-turn live-session token traces and reply hashes.
+
+That repair does not improve the fixed Mini's end-to-end Decode time.  In an
+interleaved two-run live A/B (`你好` -> eight-token answer -> ten-token suffix
+-> 30-token answer), ordinary selected-slot binding averaged 15.923 s and the
+numerically exact direct argument-buffer version averaged 15.983 s.  The
+0.4% regression is within SSD variation and in the wrong direction.  It
+confirms that eliminating individual Metal binding calls cannot pay for the
+selected-expert SSD reads on this device.  The implementation remains an
+isolated correctness experiment; production continues to use direct selected
+`MTLBuffer` slots.
