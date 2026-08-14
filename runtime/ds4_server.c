@@ -8676,6 +8676,15 @@ static void server_memory_plan_begin_prefill(
         server_request_memory_plan       *plan) {
     if (!s || !slot || !plan || !plan->valid) return;
     pthread_mutex_lock(&s->inference_mu);
+    const char *clear_experts =
+        getenv("DS4_SERVER_DIAG_CLEAR_EXPERT_CACHE_BEFORE_PREFILL");
+    if (clear_experts && clear_experts[0] && strcmp(clear_experts, "0") != 0) {
+        /* Diagnostic only: distinguish a stale cross-request selected-expert
+         * cache from KV-prefix or prompt-path numerical differences. */
+        (void)ds4_engine_resize_streaming_expert_cache(s->engine, 0, 0, true);
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: diagnostic cleared selected-expert cache before Prefill");
+    }
     uint32_t applied = ds4_engine_resize_streaming_expert_cache(
             s->engine,
             plan->prefill_experts,
