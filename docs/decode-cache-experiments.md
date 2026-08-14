@@ -429,3 +429,27 @@ warming. The data supports reducing cache pollution, but the existing
 probation and heat-policy experiments above show that broad protection costs
 more than it saves; the short-continuation prior-route protection remains the
 accepted targeted policy.
+
+## Rejected Decode score-only eviction
+
+The proposed single-score policy was implemented in an isolated worktree. It
+disabled LRU, probation, and prior-route protection, using only the decayed
+cumulative Router contribution (`route_hotness`) to choose the lowest-score
+victim. GPU in-flight/resource-lifetime protection remained enabled for
+correctness; equal scores used a deterministic layer/expert tie-break rather
+than recency.
+
+An interleaved `score-only -> production -> score-only -> production` run on
+the fixed live-session fixture passed the complete token-trace and reply-SHA
+gate in every trial:
+
+| policy | second-turn mean | rate | logical expert input |
+| --- | ---: | ---: | ---: |
+| score-only | 16.253 s | 1.846 tok/s | 31.83 GiB |
+| production | 16.078 s | 1.866 tok/s | 31.23 GiB |
+
+Score-only was about 1.1% slower and missed the 2 tok/s target. It also
+increased logical expert reads by about 0.6 GiB. The policy is therefore not
+merged; the experiment branch retains it for future comparison. The result
+confirms that a decayed contribution score alone does not adequately predict
+near-future reuse.
