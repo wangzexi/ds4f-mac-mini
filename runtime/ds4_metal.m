@@ -12477,92 +12477,6 @@ static int ds4_gpu_stream_expert_pread_tasks(
     return ok;
 }
 
-/* Diagnostic only.  A continuation-only numerical fork could be caused by
- * stale selected-expert bytes, or by how otherwise-correct bytes are bound to
- * a Metal kernel.  Verify a bounded number of cache hits against their packed
- * sidecar source to distinguish those two cases without changing inference.
- * VERIFY_HIT_BYTES is the number of hits to compare; VERIFY_HIT_SKIP skips
- * earlier hits so a test can target the second request of one live session. */
-static void ds4_gpu_stream_expert_cache_verify_hit_bytes(
-        uint32_t                                    layer,
-        uint32_t                                    expert,
-        const ds4_gpu_stream_expert_cache_entry    *e) {
-    static int initialized;
-    static uint64_t remaining;
-    static uint64_t skip;
-    if (!initialized) {
-        initialized = 1;
-        const char *count_env = getenv("DS4_METAL_STREAMING_EXPERT_VERIFY_HIT_BYTES");
-        const char *skip_env = getenv("DS4_METAL_STREAMING_EXPERT_VERIFY_HIT_SKIP");
-        if (count_env && count_env[0]) {
-            char *end = NULL;
-            remaining = strtoull(count_env, &end, 10);
-            if (end == count_env || *end != '\0') remaining = 0;
-        }
-        if (skip_env && skip_env[0]) {
-            char *end = NULL;
-            skip = strtoull(skip_env, &end, 10);
-            if (end == skip_env || *end != '\0') skip = 0;
-        }
-    }
-    if (remaining == 0 || !e || !e->gate_buffer ||
-        e->gate_buffer != e->up_buffer || e->gate_buffer != e->down_buffer ||
-        e->up_inner != e->gate_inner + e->gate_expert_bytes ||
-        e->down_inner != e->up_inner + e->gate_expert_bytes) {
-        return;
-    }
-    if (skip != 0) {
-        skip--;
-        return;
-    }
-
-    int fd = -1;
-    uint64_t offset = 0;
-    if (!ds4_gpu_stream_expert_pack_source(e->model_size,
-                                           layer,
-                                           expert,
-                                           e->gate_expert_bytes,
-                                           e->down_expert_bytes,
-                                           &fd,
-                                           &offset) ||
-        e->logical_bytes == 0 || e->logical_bytes > SIZE_MAX) {
-        return;
-    }
-    remaining--;
-    uint8_t *reference = malloc((size_t)e->logical_bytes);
-    const uint8_t *actual = (const uint8_t *)[e->gate_buffer contents] + e->gate_inner;
-    if (!reference || !actual) {
-        free(reference);
-        fprintf(stderr, "ds4: expert hit-byte verifier allocation/access failed layer=%u expert=%u\n",
-                layer, expert);
-        return;
-    }
-    size_t done = 0;
-    while (done < (size_t)e->logical_bytes) {
-        const size_t want = (size_t)e->logical_bytes - done;
-        ssize_t got;
-        do {
-            got = pread(fd, reference + done, want, (off_t)(offset + done));
-        } while (got < 0 && errno == EINTR);
-        if (got <= 0) break;
-        done += (size_t)got;
-    }
-    if (done != (size_t)e->logical_bytes) {
-        fprintf(stderr, "ds4: expert hit-byte verifier read failed layer=%u expert=%u\n",
-                layer, expert);
-    } else if (memcmp(actual, reference, (size_t)e->logical_bytes) != 0) {
-        size_t first = 0;
-        while (first < (size_t)e->logical_bytes && actual[first] == reference[first]) first++;
-        fprintf(stderr,
-                "ds4: expert hit-byte verifier MISMATCH layer=%u expert=%u byte=%zu actual=%02x expected=%02x\n",
-                layer, expert, first, actual[first], reference[first]);
-    } else {
-        fprintf(stderr, "ds4: expert hit-byte verifier pass layer=%u expert=%u bytes=%.2f MiB\n",
-                layer, expert, ds4_gpu_mib(e->logical_bytes));
-    }
-    free(reference);
-}
-
 static void ds4_gpu_stream_expert_cache_warn_mlock_failure(
         uint64_t failed_len,
         int      err) {
@@ -14051,43 +13965,6 @@ static int ds4_gpu_stream_expert_cache_addr_buffers(
            g_stream_expert_cache_down_addr_buffers[layer];
 }
 
-/* An address table is mutable cache metadata: loading or evicting an expert
- * edits it in place.  A Metal command buffer, however, can outlive the CPU
- * code that prepares a later layer or token.  This opt-in path gives one MoE
- * dispatch immutable table bytes, retained until its command buffer finishes.
- * It is intentionally a full table copy (only 9 KiB for 384 experts) so the
- * selected-id kernel keeps its normal expert-id indexing semantics. */
-static int ds4_gpu_stream_expert_cache_addr_buffers_snapshot(
-        uint32_t       layer,
-        id<MTLBuffer> *gate,
-        id<MTLBuffer> *up,
-        id<MTLBuffer> *down) {
-    id<MTLBuffer> source_gate = nil;
-    id<MTLBuffer> source_up = nil;
-    id<MTLBuffer> source_down = nil;
-    if (!ds4_gpu_stream_expert_cache_addr_buffers(layer,
-                                                   &source_gate,
-                                                   &source_up,
-                                                   &source_down)) {
-        return 0;
-    }
-    const NSUInteger bytes =
-        (NSUInteger)DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * sizeof(uint64_t);
-    id<MTLBuffer> sources[3] = { source_gate, source_up, source_down };
-    id<MTLBuffer> snapshots[3] = { nil, nil, nil };
-    for (uint32_t i = 0; i < 3; i++) {
-        snapshots[i] = ds4_gpu_new_transient_buffer(
-                bytes, "ds4_stream_expert_addr_snapshot");
-        if (!snapshots[i]) return 0;
-        memcpy([snapshots[i] contents], [sources[i] contents], bytes);
-        [snapshots[i] didModifyRange:NSMakeRange(0, bytes)];
-    }
-    if (gate) *gate = snapshots[0];
-    if (up) *up = snapshots[1];
-    if (down) *down = snapshots[2];
-    return 1;
-}
-
 static void ds4_gpu_stream_full_expert_addr_clear_layer(uint32_t layer) {
     if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return;
     ds4_gpu_stream_expert_cache_entry *e = &g_stream_full_expert_addr_entry[layer];
@@ -15398,24 +15275,6 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_peek(
         return NULL;
     }
 
-    /* Diagnostic for the address-table lifetime hypothesis.  The selected
-     * slot cache owns immutable payload bytes, but the GPU address table is
-     * mutable and shared by every use of one layer.  Re-publish an entry's
-     * three addresses immediately before the caller encodes its MoE kernel.
-     * This is deliberately opt-in until the continuity gate proves whether
-     * the table, rather than the cached payload, is the fault boundary. */
-    if (getenv("DS4_METAL_REFRESH_STREAMING_EXPERT_ADDR_ON_HIT") != NULL &&
-        !ds4_gpu_stream_expert_cache_set_addr_slot_raw(layer,
-                                                        expert,
-                                                        e->gate_buffer,
-                                                        e->gate_inner,
-                                                        e->up_buffer,
-                                                        e->up_inner,
-                                                        e->down_buffer,
-                                                        e->down_inner)) {
-        return NULL;
-    }
-    ds4_gpu_stream_expert_cache_verify_hit_bytes(layer, expert, e);
     e->last_used = ++g_stream_expert_cache_clock;
     e->use_count++;
     g_stream_expert_cache_hits++;
@@ -39520,16 +39379,6 @@ int ds4_gpu_routed_moe_one_tensor(
                         if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 33239);
                         return 0;
                     }
-                }
-                if (use_stream_expert_addr_table &&
-                    !use_stream_compact_addr_table &&
-                    getenv("DS4_METAL_SNAPSHOT_STREAMING_EXPERT_ADDR_TABLE") != NULL &&
-                    !ds4_gpu_stream_expert_cache_addr_buffers_snapshot(
-                            layer_index,
-                            &stream_gate_addr_buf,
-                            &stream_up_addr_buf,
-                            &stream_down_addr_buf)) {
-                    return 0;
                 }
             }
             if (selected_timing) {
