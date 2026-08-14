@@ -8550,7 +8550,6 @@ static uint64_t server_add_sat_u64(uint64_t a, uint64_t b) {
 
 #define DS4_SERVER_SMALL_PREFILL_MAX_ROWS 18u
 #define DS4_SERVER_SMALL_PREFILL_RESIDENT_BYTES (48ull * 1024ull * 1024ull)
-#define DS4_SERVER_CONTINUED_DECODE_PREFILL_MAX_ROWS 64u
 #define DS4_SERVER_FULL_LAYER_PREFILL_MIN_ROWS 64u
 #define DS4_SERVER_DOUBLE_LAYER_EXPERTS 512u
 #define DS4_SERVER_DOUBLE_LAYER_PREFILL_RESERVE_BYTES (256ull * 1024ull * 1024ull)
@@ -8654,13 +8653,9 @@ static server_request_memory_plan server_build_request_memory_plan(
     plan.planned_context_tokens = planned_ctx;
     const uint64_t workspace_owner_bytes = slot && slot->session ?
         ds4_session_prefill_workspace_owner_bytes(slot->session) : 0;
-    const bool continued_decode_prefill =
-        uncached > 0 && cached_tokens > 0 &&
-        active_prefill <= DS4_SERVER_CONTINUED_DECODE_PREFILL_MAX_ROWS;
     if (uncached == 0) {
         plan.prefill_workspace_bytes = 0;
-    } else if (active_prefill <= DS4_SERVER_SMALL_PREFILL_MAX_ROWS ||
-               continued_decode_prefill) {
+    } else if (active_prefill <= DS4_SERVER_SMALL_PREFILL_MAX_ROWS) {
         plan.prefill_workspace_bytes =
             workspace_owner_bytes != 0 &&
             workspace_owner_bytes < DS4_SERVER_SMALL_PREFILL_RESIDENT_BYTES ?
@@ -8738,8 +8733,7 @@ static void server_memory_plan_begin_prefill(
      * Prefills retain the normal memory plan and release behavior.
      */
     const bool retain_decode_cache =
-        plan->prefill.prefill_tokens <=
-            DS4_SERVER_CONTINUED_DECODE_PREFILL_MAX_ROWS &&
+        plan->prefill.prefill_tokens <= DS4_SERVER_SMALL_PREFILL_MAX_ROWS &&
         plan->decode_experts >= plan->prefill_experts &&
         plan->decode_experts - plan->prefill_experts <= 8u;
     const uint32_t prefill_experts = retain_decode_cache ?
@@ -8758,8 +8752,7 @@ static void server_memory_plan_begin_prefill(
      * purgeable preserves the prior Decode experts instead of forcing their
      * eviction just to reactivate unused scratch. */
     const bool small_continued_decode_prefill =
-        plan->prefill.prefill_tokens <=
-            DS4_SERVER_CONTINUED_DECODE_PREFILL_MAX_ROWS &&
+        plan->prefill.prefill_tokens <= DS4_SERVER_SMALL_PREFILL_MAX_ROWS &&
         plan->uncached_tokens > 0 && plan->cached_tokens > 0;
     uint64_t reacquired = small_continued_decode_prefill ? 0 :
         ds4_session_prepare_prefill_workspace(slot->session);
