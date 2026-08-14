@@ -14051,6 +14051,43 @@ static int ds4_gpu_stream_expert_cache_addr_buffers(
            g_stream_expert_cache_down_addr_buffers[layer];
 }
 
+/* An address table is mutable cache metadata: loading or evicting an expert
+ * edits it in place.  A Metal command buffer, however, can outlive the CPU
+ * code that prepares a later layer or token.  This opt-in path gives one MoE
+ * dispatch immutable table bytes, retained until its command buffer finishes.
+ * It is intentionally a full table copy (only 9 KiB for 384 experts) so the
+ * selected-id kernel keeps its normal expert-id indexing semantics. */
+static int ds4_gpu_stream_expert_cache_addr_buffers_snapshot(
+        uint32_t       layer,
+        id<MTLBuffer> *gate,
+        id<MTLBuffer> *up,
+        id<MTLBuffer> *down) {
+    id<MTLBuffer> source_gate = nil;
+    id<MTLBuffer> source_up = nil;
+    id<MTLBuffer> source_down = nil;
+    if (!ds4_gpu_stream_expert_cache_addr_buffers(layer,
+                                                   &source_gate,
+                                                   &source_up,
+                                                   &source_down)) {
+        return 0;
+    }
+    const NSUInteger bytes =
+        (NSUInteger)DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * sizeof(uint64_t);
+    id<MTLBuffer> sources[3] = { source_gate, source_up, source_down };
+    id<MTLBuffer> snapshots[3] = { nil, nil, nil };
+    for (uint32_t i = 0; i < 3; i++) {
+        snapshots[i] = ds4_gpu_new_transient_buffer(
+                bytes, "ds4_stream_expert_addr_snapshot");
+        if (!snapshots[i]) return 0;
+        memcpy([snapshots[i] contents], [sources[i] contents], bytes);
+        [snapshots[i] didModifyRange:NSMakeRange(0, bytes)];
+    }
+    if (gate) *gate = snapshots[0];
+    if (up) *up = snapshots[1];
+    if (down) *down = snapshots[2];
+    return 1;
+}
+
 static void ds4_gpu_stream_full_expert_addr_clear_layer(uint32_t layer) {
     if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return;
     ds4_gpu_stream_expert_cache_entry *e = &g_stream_full_expert_addr_entry[layer];
@@ -39483,6 +39520,16 @@ int ds4_gpu_routed_moe_one_tensor(
                         if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 33239);
                         return 0;
                     }
+                }
+                if (use_stream_expert_addr_table &&
+                    !use_stream_compact_addr_table &&
+                    getenv("DS4_METAL_SNAPSHOT_STREAMING_EXPERT_ADDR_TABLE") != NULL &&
+                    !ds4_gpu_stream_expert_cache_addr_buffers_snapshot(
+                            layer_index,
+                            &stream_gate_addr_buf,
+                            &stream_up_addr_buf,
+                            &stream_down_addr_buf)) {
+                    return 0;
                 }
             }
             if (selected_timing) {
