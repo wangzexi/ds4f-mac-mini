@@ -40172,7 +40172,7 @@ int ds4_gpu_routed_moe_one_tensor(
                     fprintf(stderr,
                             "ds4: Metal direct streaming expert split layer=%u "
                             "resident=0x%02x missing=0x%02x resident_submit=%.3f ms "
-                            "missing_bind=%.3f ms\n",
+                            "missing_bind=%.3f ms\\n",
                             layer_index,
                             stream_expert_resident_mask,
                             stream_expert_missing_mask,
