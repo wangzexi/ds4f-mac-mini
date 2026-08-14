@@ -42,10 +42,9 @@ preload_static_decode=${DS4F_SERVER_PRELOAD_STATIC_DECODE_TRUNK:-1}
 allow_shared_expert_sidecar=${DS4F_SERVER_ALLOW_SHARED_EXPERT_SIDECAR:-0}
 # The fixed Mini has two measured Decode regimes: short continued Prefills
 # favor one-token probation, while a 562-token Prefill followed by 32 Decode
-# tokens favors LRU (1.99 versus 1.91 token/s).  `adaptive` selects solely
-# from this exact uncached Prefill row count; an explicit policy remains an
-# A/B override.
-decode_eviction_policy=${DS4F_SERVER_DECODE_EVICTION_POLICY:-adaptive}
+# tokens favors plain LRU.  The runtime selects solely from this exact
+# uncached Prefill row count; this fixed-model server exposes no policy
+# override.
 # Decode on the fixed M4 Mini is usually a 4--5 resident / 1--2 missing
 # expert mix.  With L2-after-L0 release, an interleaved 512-token/32-token
 # A/B sweep found two misses the repeatable optimum: 2.42 token/s median,
@@ -80,15 +79,6 @@ case "$allow_shared_expert_sidecar" in
         ;;
     *)
         echo "DS4F_SERVER_ALLOW_SHARED_EXPERT_SIDECAR must be 0 or 1" >&2
-        exit 2
-        ;;
-esac
-
-case "$decode_eviction_policy" in
-    adaptive|lru|heat|reuse-heat|probation-lru)
-        ;;
-    *)
-        echo "DS4F_SERVER_DECODE_EVICTION_POLICY must be adaptive, lru, heat, reuse-heat, or probation-lru" >&2
         exit 2
         ;;
 esac
@@ -142,7 +132,6 @@ exec env \
     DS4_METAL_STREAMING_EXPERT_PREAD_THREADS="$pread_threads" \
     DS4_METAL_STREAMING_EXPERT_PREAD_POOL=1 \
     DS4_METAL_STREAMING_EXPERT_SORT_PREAD_TASKS=1 \
-    DS4_METAL_STREAMING_EXPERT_DECODE_EVICTION_POLICY="$decode_eviction_policy" \
     DS4_METAL_STREAMING_EXPERT_SPLIT_MIN_MISSES="$decode_split_min_misses" \
     DS4_METAL_PREFILL_MEASUREMENTS_PATH="$prefill_measurements" \
     DS4_SERVER_PRELOAD_STATIC_DECODE_TRUNK="$preload_static_decode" \

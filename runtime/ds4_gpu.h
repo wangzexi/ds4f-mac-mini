@@ -233,10 +233,9 @@ void ds4_gpu_stream_expert_cache_note_route_weights(
  * they do not change expert residency, route heat, or eviction policy. */
 void ds4_gpu_stream_expert_cache_churn_profile_begin_decode(void);
 void ds4_gpu_stream_expert_cache_churn_profile_print_decode(void);
-/* Decode-only eviction A/B.  `...=lru` disables route-heat ranking after
- * Prefill; `...=reuse-heat` applies it only after a second cache hit.  The
- * fixed Mini's `adaptive` policy uses the exact uncached Prefill row count.
- * All other phases remain unchanged. */
+/* Decode-only eviction for the fixed Mini: the exact uncached Prefill row
+ * count chooses either a one-token probation window or plain LRU.  All other
+ * phases remain unchanged. */
 void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(
         uint32_t prefill_rows);
 void ds4_gpu_stream_expert_cache_decode_eviction_policy_end(void);
