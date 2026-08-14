@@ -8747,7 +8747,15 @@ static void server_memory_plan_begin_prefill(
             true);
     uint32_t locked =
         ds4_engine_streaming_expert_cache_locked_count(s->engine);
-    uint64_t reacquired = ds4_session_prepare_prefill_workspace(slot->session);
+    /* A short continued Flash suffix takes the exact Decode-style path and
+     * never reads a layer-major batch buffer.  Leaving that 4K workspace
+     * purgeable preserves the prior Decode experts instead of forcing their
+     * eviction just to reactivate unused scratch. */
+    const bool small_continued_decode_prefill =
+        plan->prefill.prefill_tokens <= DS4_SERVER_SMALL_PREFILL_MAX_ROWS &&
+        plan->uncached_tokens > 0 && plan->cached_tokens > 0;
+    uint64_t reacquired = small_continued_decode_prefill ? 0 :
+        ds4_session_prepare_prefill_workspace(slot->session);
     plan->footprint_before_prefill = s->memory_calibration ?
         ds4_engine_task_phys_footprint(s->engine) : 0;
     pthread_mutex_unlock(&s->inference_mu);
@@ -8781,6 +8789,10 @@ static void server_memory_plan_begin_prefill(
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: retained Decode expert cache for small continued Prefill (planned=%u retained=%u)",
                    plan->prefill_experts, prefill_experts);
+    }
+    if (small_continued_decode_prefill) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: small continued Flash Prefill uses exact Decode graph; batch workspace stays purgeable");
     }
 }
 

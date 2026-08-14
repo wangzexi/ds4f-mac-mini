@@ -30697,7 +30697,12 @@ static bool metal_graph_use_streaming_decode_prefill_range(
     if (g && g->ssd_streaming &&
         DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK4 &&
         DS4_MODEL_VARIANT == DS4_VARIANT_FLASH) {
-        return false;
+        /* A continued small suffix is independent token work.  It can use
+         * the exact Decode graph and leave the large layer-major workspace
+         * purgeable, preserving the live Decode expert cache.  Cold Flash
+         * Prefill remains layer-major. */
+        return start != 0 && metal_graph_use_streaming_decode_prefill(
+                g, weights, n_tokens);
     }
     /*
      * Short streamed prefill is latency-sensitive.  Use the decode-style path
