@@ -97,3 +97,47 @@ was rerun.  Any future version needs an explicit command-buffer ownership fence
 for every transient expert buffer (including the per-layer address binding),
 followed by a baseline token/hash comparison.  No performance figure from this
 rejected path should be used for decisions.
+
+## Rejected Decode resident/miss overlap
+
+The normal exact Decode path must read the Router's six selected IDs back to
+the CPU, bind their cached Metal buffers, and synchronously load any misses.
+On a 562-token prompt followed by 32 generated tokens, that path left the GPU
+busy for only about 3.96 seconds of the 16.12-second Decode phase.  This made
+an exact overlap experiment worthwhile: submit the already-resident selected
+experts first, read the missing experts while that command buffer runs, then
+submit the missing subset and the single final down-projection.
+
+The experiment used ordinary selected-slot `MTLBuffer` bindings rather than
+the raw GPU address table.  The latter has an independently confirmed
+cross-request resource-lifetime regression and remains disabled.  The direct
+slot version was run only from an isolated worktree; it did not modify the
+production binary.
+
+Every trial below produced the accepted 32-token trace
+`17839,4597,3500,...,21458,223` and response SHA-256
+`4188a0ba1fb8b823fe8512ca0527c6800ae3d41ae4e6d6ffea4f362564b24fb9`.
+
+| 562-token prompt + 32 Decode tokens, five `pread` workers | request time | result |
+| --- | ---: | --- |
+| production, repeat 1 | 71.307 s | exact baseline |
+| production, repeat 2 | 71.082 s | exact baseline |
+| direct overlap, split at one miss, repeat 1 | 71.040 s | exact |
+| direct overlap, split at one miss, repeat 2 | 71.240 s | exact |
+
+The means are 71.195 s and 71.140 s respectively: a 55 ms (0.08%) difference,
+well inside run-to-run variation.  A first sweep also measured thresholds 1,
+3, and 4 at 70.927 s, 70.958 s, and 71.268 s; it confirms that a threshold of
+four loses useful overlap, but cannot establish a meaningful win for one or
+three.  The short live continuation is worse: `你好` -> 8-token answer ->
+10-token suffix -> 30-token answer took 16.284 s in production and 16.919 s
+with direct overlap, despite both complete token traces and response hashes
+matching.
+
+The direct version did execute its intended work: 777 of 1,376 long Decode
+layers split into resident and missing stages.  But its second Metal command
+submission and the required ownership fence consume the same budget that the
+SSD read is meant to hide.  It is therefore rejected and remains out of the
+runtime.  The next viable Decode direction is not another split threshold; it
+is reducing the Router-ID readback and selected-buffer binding boundary itself
+without reintroducing the unsafe GPU-address-table lifetime behaviour.
