@@ -124,7 +124,6 @@ static id<MTLComputePipelineState> g_moe_mul_mv_group8_q4_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_group24_q4_k_id_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_group24_q4_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_pipeline;
-static id<MTLComputePipelineState> g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_masked_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_slots6_q2_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_slots6_q4_k_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_slots6_q4_k_sum6_pipeline;
@@ -6954,27 +6953,6 @@ int ds4_gpu_init(void) {
         }
 
         error = nil;
-        fn = [library newFunctionWithName:@"kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_masked_f32"
-                           constantValues:moe_mv_id_constants
-                                    error:&error];
-        if (!fn) {
-            fprintf(stderr, "ds4: Metal kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_masked_f32 function not found: %s\n",
-                    [[error localizedDescription] UTF8String]);
-            g_queue = nil;
-            g_device = nil;
-            return 0;
-        }
-        g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_masked_pipeline =
-            [g_device newComputePipelineStateWithFunction:fn error:&error];
-        if (!g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_masked_pipeline) {
-            fprintf(stderr, "ds4: Metal kernel_mul_mv_slots6_iq2_xxs_pair_swiglu_masked_f32 pipeline failed: %s\n",
-                    [[error localizedDescription] UTF8String]);
-            g_queue = nil;
-            g_device = nil;
-            return 0;
-        }
-
-        error = nil;
         fn = [library newFunctionWithName:@"kernel_mul_mv_slots6_q2_K_sum6_f32"
                            constantValues:moe_mv_id_constants
                                     error:&error];
@@ -9574,7 +9552,6 @@ void ds4_gpu_cleanup(void) {
         g_moe_mul_mv_group24_q4_k_id_pipeline = nil;
         g_moe_mul_mv_group24_q4_k_sum6_pipeline = nil;
         g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_pipeline = nil;
-        g_moe_mul_mv_slots6_iq2_xxs_pair_swiglu_masked_pipeline = nil;
         g_moe_mul_mv_slots6_q2_k_sum6_pipeline = nil;
         g_moe_mul_mv_slots6_q4_k_pair_swiglu_pipeline = nil;
         g_moe_mul_mv_slots6_q4_k_sum6_pipeline = nil;
@@ -30799,69 +30776,6 @@ static int ds4_gpu_encode_mul_mv_slots6_pair_swiglu(
     [enc setBuffer:dst_b   offset:dst_b_off   atIndex:16];
     [enc setBuffer:dst_mid offset:dst_mid_off atIndex:17];
     [enc setBuffer:weights offset:weights_off atIndex:18];
-    if (threadgroup_bytes != 0) {
-        [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
-    }
-    [enc dispatchThreadgroups:MTLSizeMake(row_groups, 1, pairs)
-         threadsPerThreadgroup:MTLSizeMake(32, nsg, 1)];
-    ds4_gpu_end_compute_encoder(cb, enc);
-    return 1;
-}
-
-static int ds4_gpu_encode_mul_mv_slots6_pair_swiglu_masked(
-        id<MTLCommandBuffer>        cb,
-        id<MTLComputePipelineState> pipeline,
-        const ds4_gpu_mul_mv_id_args *args,
-        const ds4_gpu_dsv4_moe_swiglu_weight_args *act,
-        const ds4_gpu_stream_expert_split_args *split,
-        __unsafe_unretained id<MTLBuffer> src0_a[6],
-        const NSUInteger            src0_a_off[6],
-        __unsafe_unretained id<MTLBuffer> src0_b[6],
-        const NSUInteger            src0_b_off[6],
-        id<MTLBuffer>               src1,
-        NSUInteger                  src1_off,
-        id<MTLBuffer>               dst_a,
-        NSUInteger                  dst_a_off,
-        id<MTLBuffer>               dst_b,
-        NSUInteger                  dst_b_off,
-        id<MTLBuffer>               dst_mid,
-        NSUInteger                  dst_mid_off,
-        id<MTLBuffer>               weights,
-        NSUInteger                  weights_off,
-        NSUInteger                  threadgroup_bytes,
-        NSUInteger                  nsg,
-        bool                        rows_per_group_is_nr0) {
-    if (!cb || !pipeline || !args || !act || !split || !src0_a || !src0_a_off ||
-        !src0_b || !src0_b_off || !src1 || !dst_a || !dst_b || !dst_mid ||
-        !weights || args->ne00 <= 0 || args->ne01 <= 0 || args->nei0 != 6 ||
-        args->nei1 <= 0) {
-        return 0;
-    }
-    for (uint32_t i = 0; i < 6; i++) {
-        if ((split->active_mask & (1u << i)) != 0 &&
-            (!src0_a[i] || !src0_b[i])) return 0;
-    }
-    const NSUInteger nr0 = (NSUInteger)args->nr0;
-    const NSUInteger rows_per_group = rows_per_group_is_nr0 ? nr0 : nr0 * nsg;
-    const NSUInteger row_groups =
-        ((NSUInteger)args->ne01 + rows_per_group - 1u) / rows_per_group;
-    const NSUInteger pairs = (NSUInteger)args->nei0 * (NSUInteger)args->nei1;
-    id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
-    [enc setComputePipelineState:pipeline];
-    [enc setBytes:args length:sizeof(*args) atIndex:0];
-    [enc setBytes:act length:sizeof(*act) atIndex:1];
-    [enc setBytes:split length:sizeof(*split) atIndex:2];
-    for (uint32_t i = 0; i < 6; i++) {
-        [enc setBuffer:src0_a[i] offset:src0_a_off[i] atIndex:3 + i];
-    }
-    for (uint32_t i = 0; i < 6; i++) {
-        [enc setBuffer:src0_b[i] offset:src0_b_off[i] atIndex:9 + i];
-    }
-    [enc setBuffer:src1 offset:src1_off atIndex:15];
-    [enc setBuffer:dst_a offset:dst_a_off atIndex:16];
-    [enc setBuffer:dst_b offset:dst_b_off atIndex:17];
-    [enc setBuffer:dst_mid offset:dst_mid_off atIndex:18];
-    [enc setBuffer:weights offset:weights_off atIndex:19];
     if (threadgroup_bytes != 0) {
         [enc setThreadgroupMemoryLength:threadgroup_bytes atIndex:0];
     }
