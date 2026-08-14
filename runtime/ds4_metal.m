@@ -718,6 +718,13 @@ static uint64_t
     g_stream_expert_cache_churn_profile_layer_one_shot_evictions[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint64_t
     g_stream_expert_cache_churn_profile_layer_one_shot_reloads[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+/* Prefill-only cache residency profile.  This deliberately stores only a
+ * compact membership snapshot: it is a diagnostic and must not perturb the
+ * fixed Mini's exact selected-expert cache. */
+static int g_stream_expert_cache_residency_profile_active;
+static uint8_t
+    g_stream_expert_cache_residency_profile_before[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+static uint32_t g_stream_expert_cache_residency_profile_before_entries;
 static id<MTLBuffer> g_stream_expert_cache_gate_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_cache_up_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static id<MTLBuffer> g_stream_expert_cache_down_addr_buffers[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
@@ -13485,6 +13492,59 @@ void ds4_gpu_stream_expert_cache_churn_profile_print_decode(void) {
                 (unsigned long long)evictions,
                 (unsigned long long)reloads);
     }
+}
+
+void ds4_gpu_stream_expert_cache_residency_profile_begin_prefill(void) {
+    memset(g_stream_expert_cache_residency_profile_before,
+           0,
+           sizeof(g_stream_expert_cache_residency_profile_before));
+    uint32_t entries = 0;
+    for (uint32_t layer = 0;
+         layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
+         layer++) {
+        for (uint32_t expert = 0;
+             expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+             expert++) {
+            if (g_stream_expert_cache[layer][expert].valid) {
+                g_stream_expert_cache_residency_profile_before[layer][expert] = 1;
+                if (entries != UINT32_MAX) entries++;
+            }
+        }
+    }
+    g_stream_expert_cache_residency_profile_before_entries = entries;
+    g_stream_expert_cache_residency_profile_active = 1;
+}
+
+void ds4_gpu_stream_expert_cache_residency_profile_print_prefill(void) {
+    if (!g_stream_expert_cache_residency_profile_active) return;
+    uint32_t after = 0;
+    uint32_t survivors = 0;
+    for (uint32_t layer = 0;
+         layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
+         layer++) {
+        for (uint32_t expert = 0;
+             expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
+             expert++) {
+            if (!g_stream_expert_cache[layer][expert].valid) continue;
+            if (after != UINT32_MAX) after++;
+            if (g_stream_expert_cache_residency_profile_before[layer][expert] &&
+                survivors != UINT32_MAX) {
+                survivors++;
+            }
+        }
+    }
+    const uint32_t evicted =
+        g_stream_expert_cache_residency_profile_before_entries > survivors ?
+        g_stream_expert_cache_residency_profile_before_entries - survivors : 0;
+    const uint32_t added = after > survivors ? after - survivors : 0;
+    fprintf(stderr,
+            "ds4: prefill cache residency before=%u after=%u survivors=%u evicted=%u added=%u\\n",
+            g_stream_expert_cache_residency_profile_before_entries,
+            after,
+            survivors,
+            evicted,
+            added);
+    g_stream_expert_cache_residency_profile_active = 0;
 }
 
 void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(

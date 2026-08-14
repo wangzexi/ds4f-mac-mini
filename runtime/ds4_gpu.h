@@ -233,6 +233,11 @@ void ds4_gpu_stream_expert_cache_note_route_weights(
  * they do not change expert residency, route heat, or eviction policy. */
 void ds4_gpu_stream_expert_cache_churn_profile_begin_decode(void);
 void ds4_gpu_stream_expert_cache_churn_profile_print_decode(void);
+/* Prefill-only residency diagnostic.  It snapshots the existing selected
+ * expert cache, then reports how much a Prefill displaced it.  It never
+ * changes cache ownership, routing, or eviction. */
+void ds4_gpu_stream_expert_cache_residency_profile_begin_prefill(void);
+void ds4_gpu_stream_expert_cache_residency_profile_print_prefill(void);
 /* Decode-only eviction for the fixed Mini: the exact uncached Prefill row
  * count chooses either a one-token probation window or plain LRU.  All other
  * phases remain unchanged. */

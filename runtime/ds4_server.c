@@ -11812,6 +11812,9 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                                          cached,
                                          j->req.max_tokens);
     server_memory_plan_begin_prefill(s, slot, &memory_plan);
+    if (getenv("DS4_METAL_STREAMING_EXPERT_RESIDENCY_PROFILE") != NULL) {
+        ds4_gpu_stream_expert_cache_residency_profile_begin_prefill();
+    }
 
     const double t0 = now_sec();
     uint64_t trace_id = trace_begin(s, j, cached, prompt_tokens, &cache_diag,
@@ -11950,6 +11953,9 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         trace_event(s, trace_id, "prefill failed: %s", err);
         send_prefill_failure_response(s, j, &progress, ctx_span, req_flags, err);
         return;
+    }
+    if (getenv("DS4_METAL_STREAMING_EXPERT_RESIDENCY_PROFILE") != NULL) {
+        ds4_gpu_stream_expert_cache_residency_profile_print_prefill();
     }
     server_memory_plan_finish_prefill(s, slot, &memory_plan);
     free(disk_cache_path);
