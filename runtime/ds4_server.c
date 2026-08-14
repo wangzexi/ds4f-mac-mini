@@ -8685,10 +8685,27 @@ static void server_memory_plan_begin_prefill(
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: diagnostic cleared selected-expert cache before Prefill");
     }
+    /*
+     * A continued one-session chat usually Prefills only a short suffix.
+     * On this fixed Mini that path prices a roughly 50 MiB staging workspace
+     * by reducing the expert target from Decode's 967 entries to 960.  A
+     * resize would discard the entire 6.37 GiB Decode LRU slab for seven
+     * entries.  The seven-entry delta fits inside the measured reserve, so
+     * retain the Decode pool only for this narrow small-suffix case.  Larger
+     * Prefills retain the normal memory plan and release behavior.
+     */
+    const bool retain_decode_cache =
+        plan->prefill.prefill_tokens <= DS4_SERVER_SMALL_PREFILL_MAX_ROWS &&
+        plan->decode_experts >= plan->prefill_experts &&
+        plan->decode_experts - plan->prefill_experts <= 8u;
+    const uint32_t prefill_experts = retain_decode_cache ?
+        plan->decode_experts : plan->prefill_experts;
+    const uint32_t prefill_pinned_experts = retain_decode_cache ?
+        plan->decode_pinned_experts : plan->prefill_pinned_experts;
     uint32_t applied = ds4_engine_resize_streaming_expert_cache(
             s->engine,
-            plan->prefill_experts,
-            plan->prefill_pinned_experts,
+            prefill_experts,
+            prefill_pinned_experts,
             true);
     uint32_t locked =
         ds4_engine_streaming_expert_cache_locked_count(s->engine);
@@ -8716,11 +8733,16 @@ static void server_memory_plan_begin_prefill(
                applied,
                (double)applied * (double)plan->prefill.per_expert_bytes /
                    1073741824.0,
-               plan->prefill_pinned_experts,
-               (double)plan->prefill_pinned_experts *
+               prefill_pinned_experts,
+               (double)prefill_pinned_experts *
                    (double)plan->prefill.per_expert_bytes / 1073741824.0,
                locked,
                (double)reacquired / 1073741824.0);
+    if (retain_decode_cache) {
+        server_log(DS4_LOG_PREFILL,
+                   "ds4-server: retained Decode expert cache for small continued Prefill (planned=%u retained=%u)",
+                   plan->prefill_experts, prefill_experts);
+    }
 }
 
 static void server_memory_plan_finish_prefill(
@@ -10152,20 +10174,6 @@ static int live_text_prefix_prompt(server *s, server_slot *slot,
     build_prompt_from_exact_prefix_and_text_suffix(
         s->engine, live_tokens, req->prompt_text + live_text_len,
         effective_prompt);
-    const char *diag = getenv("DS4_MINI_LIVE_PREFIX_DIAG");
-    if (diag && diag[0] && strcmp(diag, "0") != 0) {
-        int common = 0;
-        while (common < effective_prompt->len && common < req->prompt.len &&
-               effective_prompt->v[common] == req->prompt.v[common]) {
-            common++;
-        }
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: live-prefix diagnostic live=%d effective=%d canonical=%d common=%d next_effective=%d next_canonical=%d",
-                   live_tokens->len, effective_prompt->len, req->prompt.len,
-                   common,
-                   common < effective_prompt->len ? effective_prompt->v[common] : -1,
-                   common < req->prompt.len ? req->prompt.v[common] : -1);
-    }
     free(live_text);
     return live_tokens->len;
 }
