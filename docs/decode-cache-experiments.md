@@ -98,6 +98,18 @@ for every transient expert buffer (including the per-layer address binding),
 followed by a baseline token/hash comparison.  No performance figure from this
 rejected path should be used for decisions.
 
+A follow-up made that ownership explicit without inserting per-layer command
+buffer waits: it gave every one of the 43 routed layers its own six-slot
+transient group.  That removes the cross-layer overwrite hazard, at a lazily
+allocated maximum of 258 slots (about 1.70 GiB).  The live `你好` -> eight-token
+answer -> ten-token suffix -> 30-token answer test was numerically exact: all
+30 second-turn token IDs and the response SHA-256 matched the accepted
+baseline.  It is nevertheless rejected.  The second turn took 17.886 s versus
+the current exact path's 15.968--16.204 s; memory footprint rose from 11.69 to
+13.39 GiB, and total logical expert reads rose from 31.73 to 32.25 GiB.  Thus
+the extra tier creates paging pressure and makes first-sighting loads less
+reusable; it does not buy back enough Decode residency to pay for itself.
+
 ## Rejected Decode resident/miss overlap
 
 The normal exact Decode path must read the Router's six selected IDs back to
