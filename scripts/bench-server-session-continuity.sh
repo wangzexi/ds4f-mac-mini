@@ -13,12 +13,17 @@ port=${DS4F_BENCH_SERVER_PORT:-18081}
 repeats=${DS4F_BENCH_REPEATS:-2}
 first_tokens=${DS4F_BENCH_FIRST_TOKENS:-8}
 second_tokens=${DS4F_BENCH_SECOND_TOKENS:-32}
+fresh_control=${DS4F_BENCH_FRESH_CONTROL:-1}
 out_dir=${DS4F_BENCH_OUT_DIR:-"$project_dir/results/benchmarks/session-continuity-$(date +%Y%m%d-%H%M%S)"}
 
 if [[ $out_dir != /* ]]; then out_dir="$project_dir/$out_dir"; fi
 if [[ ! -x $server ]] || [[ ! $repeats =~ ^[1-9][0-9]*$ ]] ||
    [[ ! $first_tokens =~ ^[1-9][0-9]*$ ]] || [[ ! $second_tokens =~ ^[1-9][0-9]*$ ]]; then
     echo "server, repeats, first_tokens, and second_tokens are invalid" >&2
+    exit 2
+fi
+if [[ $fresh_control != 0 && $fresh_control != 1 ]]; then
+    echo "fresh_control must be 0 or 1" >&2
     exit 2
 fi
 if pgrep -x ds4f-server >/dev/null 2>&1; then
@@ -65,6 +70,7 @@ for ((repeat = 1; repeat <= repeats; repeat++)); do
     log="$out_dir/server-run-$repeat.log"
     first="$out_dir/turn-1-run-$repeat.json"
     second="$out_dir/turn-2-run-$repeat.json"
+    control="$out_dir/turn-2-fresh-control-run-$repeat.json"
     kv_dir="$tmp_dir/kv-$repeat"
     mkdir -p "$kv_dir"
     env \
@@ -174,6 +180,60 @@ PY
     kill -TERM "$server_pid"
     wait "$server_pid" || true
     server_pid=
+
+    if [[ $fresh_control == 1 ]]; then
+        control_log="$out_dir/server-fresh-control-run-$repeat.log"
+        control_kv="$tmp_dir/kv-control-$repeat"
+        mkdir -p "$control_kv"
+        env \
+            DS4F_SERVER_HOST=127.0.0.1 \
+            DS4F_SERVER_PORT="$port" \
+            DS4F_SERVER_KV_CACHE_DIR="$control_kv" \
+            DS4F_SERVER_KV_CACHE_MIB=64 \
+            DS4F_SERVER_KV_CACHE_MIN_TOKENS=1 \
+            DS4_METAL_STREAMING_EXPERT_PREAD_PROFILE=1 \
+            DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY=1 \
+            DS4_METAL_STREAMING_EXPERT_LAYER_STATS=1 \
+            DS4_METAL_STREAMING_EXPERT_LAYER_STATS_DELTA=1 \
+            DS4_SERVER_EXPERT_PHASE_PROFILE=1 \
+            DS4_SERVER_TRACE_TOKEN_IDS=1 \
+            "$script_dir/run-server.sh" >"$control_log" 2>&1 &
+        server_pid=$!
+        wait_for_server "$control_log"
+        control_seconds=$(curl -fsS --connect-timeout 5 --max-time 900 \
+            -H 'Content-Type: application/json' -d @"$second_payload" \
+            -o "$control" -w '%{time_total}' "http://127.0.0.1:$port/v1/chat/completions")
+        control_tokens=$(python3 - "$control" <<'PY'
+import json, sys
+value = json.load(open(sys.argv[1], encoding='utf-8')).get('usage', {}).get('completion_tokens')
+if not isinstance(value, int) or value <= 0:
+    raise SystemExit(f'invalid completion token count: {value!r}')
+print(value)
+PY
+)
+        control_trace=$(sed -n -E 's/.*trace token\[[0-9]+\]=([0-9]+).*/\1/p' "$control_log" | paste -sd, -)
+        control_hash=$(python3 - "$control" <<'PY'
+import hashlib, json, sys
+text = json.load(open(sys.argv[1], encoding='utf-8'))['choices'][0]['message']['content']
+print(hashlib.sha256(text.encode()).hexdigest())
+PY
+)
+        if [[ $control_tokens != "$actual_second" || $control_trace != "${traces[1]}" ||
+                $control_hash != "$second_hash" ]]; then
+            echo "fresh-control exact regression in repeat $repeat" >&2
+            exit 1
+        fi
+        printf 'repeat=%s control_tokens=%s control_seconds=%s control_tps=%s control_trace=%s control_sha256=%s\n' \
+            "$repeat" "$control_tokens" "$control_seconds" \
+            "$(python3 - "$control_tokens" "$control_seconds" <<'PY'
+import sys
+print(f'{int(sys.argv[1])/float(sys.argv[2]):.4f}')
+PY
+)" "$control_trace" "$control_hash" >>"$out_dir/fresh-control.tsv"
+        kill -TERM "$server_pid"
+        wait "$server_pid" || true
+        server_pid=
+    fi
 done
 
 echo "exact session continuity benchmark passed: $out_dir"
