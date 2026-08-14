@@ -12035,6 +12035,35 @@ typedef struct {
     int ok;
 } ds4_gpu_stream_expert_pread_task;
 
+/* Decode normally reads no more than six packed experts.  Router order is
+ * unrelated to their packed-file offsets, so this opt-in experiment submits
+ * the same reads in physical order.  Each task keeps its destination pointer,
+ * therefore ordering cannot affect MoE arithmetic or selected-expert slots. */
+static int ds4_gpu_stream_expert_sort_pread_tasks_requested(void) {
+    return getenv("DS4_METAL_STREAMING_EXPERT_SORT_PREAD_TASKS") != NULL;
+}
+
+static void ds4_gpu_stream_expert_sort_pread_tasks(
+        ds4_gpu_stream_expert_pread_task *tasks,
+        uint32_t                          n_tasks) {
+    if (!tasks || n_tasks < 2 ||
+        !ds4_gpu_stream_expert_sort_pread_tasks_requested()) {
+        return;
+    }
+    for (uint32_t i = 1; i < n_tasks; i++) {
+        const ds4_gpu_stream_expert_pread_task current = tasks[i];
+        uint32_t j = i;
+        while (j > 0 &&
+               (tasks[j - 1].fd > current.fd ||
+                (tasks[j - 1].fd == current.fd &&
+                 tasks[j - 1].offset > current.offset))) {
+            tasks[j] = tasks[j - 1];
+            j--;
+        }
+        tasks[j] = current;
+    }
+}
+
 typedef struct {
     int active;
     const void *model_map;
@@ -12329,6 +12358,7 @@ static int ds4_gpu_stream_expert_pread_pool_begin(
         uint32_t n_tasks,
         uint32_t n_workers) {
     if (n_workers <= 1) return 0;
+    ds4_gpu_stream_expert_sort_pread_tasks(tasks, n_tasks);
     const uint32_t limit = ds4_gpu_stream_expert_pread_thread_limit();
     if (!ds4_gpu_stream_expert_pread_pool_init(limit)) return 0;
 
@@ -12420,6 +12450,8 @@ static int ds4_gpu_stream_expert_pread_tasks(
     if (total_bytes) *total_bytes = 0;
     if (wall_ms) *wall_ms = 0.0;
     if (!tasks || n_tasks == 0) return 1;
+
+    ds4_gpu_stream_expert_sort_pread_tasks(tasks, n_tasks);
 
     const uint32_t n_workers =
         ds4_gpu_stream_expert_pread_thread_count(n_tasks);
