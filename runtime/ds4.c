@@ -21534,34 +21534,12 @@ static bool metal_graph_decode_set_hash_selected_override(
     return ds4_gpu_routed_moe_set_selected_override(selected_i32, DS4_N_EXPERT_USED) != 0;
 }
 
-/* The CPU router knows the exact six ids before Metal resumes.  Keep the
- * async-load type opaque here: its worker implementation lives next to the
- * other selected-id paths below. */
-typedef struct metal_graph_selected_async_load metal_graph_selected_async_load;
-static bool metal_graph_selected_async_load_start_ids(
-        metal_graph_selected_async_load *job,
-        const ds4_model                  *model,
-        const ds4_layer_weights          *layer,
-        uint32_t                          il,
-        uint64_t                          gate_expert_bytes,
-        uint64_t                          down_expert_bytes,
-        const int32_t                     selected_ids[DS4_MAX_EXPERT_USED]);
-
-static bool metal_graph_use_iq2_cpu_router_async_load(
-        const ds4_gpu_graph *g) {
-    return g &&
-           g->ssd_streaming &&
-           getenv("DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER_ASYNC_LOAD") != NULL &&
-           getenv("DS4_METAL_DISABLE_STREAMING_IQ2_CPU_ROUTER_ASYNC_LOAD") == NULL;
-}
-
 static bool metal_graph_decode_cpu_router(
         ds4_gpu_graph          *g,
         const ds4_model        *model,
         const ds4_layer_weights *layer,
         uint32_t                il,
-        uint32_t                token,
-        metal_graph_selected_async_load *async_load) {
+        uint32_t                token) {
     const bool profile =
         getenv("DS4_METAL_PRO_Q4_CPU_ROUTER_PROFILE") != NULL ||
         getenv("DS4_METAL_STREAMING_IQ2_CPU_ROUTER_PROFILE") != NULL;
@@ -21762,19 +21740,9 @@ static bool metal_graph_decode_cpu_router(
                                            il,
                                            gate_expert_bytes,
                                            down_expert_bytes);
-        const bool async_started = async_load &&
-            metal_graph_selected_async_load_start_ids(
-                    async_load,
-                    model,
-                    layer,
-                    il,
-                    gate_expert_bytes,
-                    down_expert_bytes,
-                    selected_i32);
-        if (!async_started &&
-            ds4_gpu_stream_expert_cache_begin_selected_load(
+        if (ds4_gpu_stream_expert_cache_begin_selected_load(
                     &table, selected_i32, DS4_N_EXPERT_USED) == 0) {
-                return false;
+            return false;
         }
         ds4_gpu_stream_expert_cache_note_route_weights(
                 il, selected_i32, weights, DS4_N_EXPERT_USED);
@@ -22089,7 +22057,7 @@ static bool metal_graph_cuda_stream_prefill_batch_selected_load(
 #endif
 }
 
-struct metal_graph_selected_async_load {
+typedef struct metal_graph_selected_async_load {
     bool                      active;
     bool                      ok;
     /* Selected ids remain usable for a synchronous retry if the service
@@ -22103,7 +22071,7 @@ struct metal_graph_selected_async_load {
     uint64_t                  gate_expert_bytes;
     uint64_t                  down_expert_bytes;
     int32_t                   selected_ids[DS4_MAX_EXPERT_USED];
-};
+} metal_graph_selected_async_load;
 
 static pthread_mutex_t g_metal_graph_selected_async_load_mutex =
     PTHREAD_MUTEX_INITIALIZER;
@@ -22121,8 +22089,7 @@ static void metal_graph_selected_async_load_run(
         metal_graph_selected_async_load *job) {
     job->ok = false;
 
-    if ((!job->router_selected && job->event_value != 0) ||
-        !job->model || !job->layer ||
+    if (!job->router_selected || !job->model || !job->layer ||
         DS4_N_EXPERT == 0 || DS4_N_EXPERT > DS4_MAX_EXPERT ||
         DS4_N_EXPERT_USED == 0 || DS4_N_EXPERT_USED > DS4_MAX_EXPERT_USED) {
         return;
@@ -22252,42 +22219,6 @@ static DS4_MAYBE_UNUSED bool metal_graph_selected_async_load_start_tensor(
     job->event_value = event_value;
     job->gate_expert_bytes = gate_expert_bytes;
     job->down_expert_bytes = down_expert_bytes;
-
-    pthread_mutex_lock(&g_metal_graph_selected_async_load_mutex);
-    if (g_metal_graph_selected_async_load_has_job ||
-        g_metal_graph_selected_async_load_done) {
-        pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
-        return false;
-    }
-    g_metal_graph_selected_async_load_job = *job;
-    g_metal_graph_selected_async_load_job.ok = false;
-    g_metal_graph_selected_async_load_has_job = true;
-    pthread_cond_signal(&g_metal_graph_selected_async_load_cond);
-    pthread_mutex_unlock(&g_metal_graph_selected_async_load_mutex);
-    job->active = true;
-    return true;
-}
-
-/* CPU routing has already produced validated ids on the service thread, so
- * there is no GPU event to wait for.  The same worker still owns cache staging
- * and the caller retains the synchronous fallback if staging cannot proceed. */
-static bool metal_graph_selected_async_load_start_ids(
-        metal_graph_selected_async_load *job,
-        const ds4_model                  *model,
-        const ds4_layer_weights          *layer,
-        uint32_t                          il,
-        uint64_t                          gate_expert_bytes,
-        uint64_t                          down_expert_bytes,
-        const int32_t                     selected_ids[DS4_MAX_EXPERT_USED]) {
-    if (!job || !model || !layer || !selected_ids) return false;
-    if (!metal_graph_selected_async_load_ensure_worker()) return false;
-    memset(job, 0, sizeof(*job));
-    job->model = model;
-    job->layer = layer;
-    job->il = il;
-    job->gate_expert_bytes = gate_expert_bytes;
-    job->down_expert_bytes = down_expert_bytes;
-    memcpy(job->selected_ids, selected_ids, sizeof(job->selected_ids));
 
     pthread_mutex_lock(&g_metal_graph_selected_async_load_mutex);
     if (g_metal_graph_selected_async_load_has_job ||
@@ -22712,10 +22643,6 @@ static bool metal_graph_encode_decode_layer_phase(
     const uint32_t tp_head0 = tp_split_attn ? g->tp_rank * tp_heads : 0;
 
     bool ok = true;
-    /* Experimental only: the CPU IQ2 router has exact ids before Metal
-     * resumes, so its SSD staging can overlap this layer's shared expert. */
-    metal_graph_selected_async_load cpu_router_async_load = {0};
-    bool cpu_router_async_load_started = false;
     const bool decode_stage_profile = metal_graph_decode_stage_profile_enabled(il);
     double decode_stage_t0 = decode_stage_profile ? now_sec() : 0.0;
 #define DS4_METAL_PROFILE_DECODE_STAGE(name) do { \
@@ -24076,17 +24003,7 @@ static bool metal_graph_encode_decode_layer_phase(
     const uint64_t down_row_bytes = routed_expert_row_bytes(layer->ffn_down_exps);
     const uint64_t down_expert_bytes DS4_MAYBE_UNUSED = routed_out_dim * down_row_bytes;
     if (ok && metal_graph_decode_cpu_router_applicable(g, layer)) {
-        const bool cpu_router_async_load_enabled =
-            phase == METAL_DECODE_LAYER_FULL &&
-            metal_graph_use_iq2_cpu_router_async_load(g);
-        ok = metal_graph_decode_cpu_router(
-                g,
-                model,
-                layer,
-                il,
-                (uint32_t)token,
-                cpu_router_async_load_enabled ? &cpu_router_async_load : NULL);
-        cpu_router_async_load_started = cpu_router_async_load.active;
+        ok = metal_graph_decode_cpu_router(g, model, layer, il, (uint32_t)token);
     } else {
         if (ok && !metal_graph_tp_ablate("router")) {
         ok = metal_graph_matmul_plain_tensor(metal_graph_router_logits(g), model, layer->ffn_gate_inp,
@@ -24959,31 +24876,6 @@ static bool metal_graph_encode_decode_layer_phase(
     /* Under the TP split the routed experts run after the shared expert so
      * the sum6 kernel can fold the shared partial and write the slab slot
      * directly (no separate local add). */
-    if (ok && cpu_router_async_load_started) {
-        /* Submit the shared-expert work before waiting for the exact selected
-         * experts.  If the service thread cannot safely stage a cache miss,
-         * repeat the same exact load on this thread. */
-        const bool flush_ok = ds4_gpu_flush_commands() != 0;
-        bool finish_ok = metal_graph_selected_async_load_finish(
-                &cpu_router_async_load);
-        if (!finish_ok && cpu_router_async_load.ids_ok) {
-            const ds4_gpu_stream_expert_table retry_table =
-                graph_stream_expert_table_make(model,
-                                               layer,
-                                               il,
-                                               gate_expert_bytes,
-                                               down_expert_bytes);
-            finish_ok =
-                ds4_gpu_stream_expert_cache_begin_selected_load(
-                        &retry_table,
-                        cpu_router_async_load.selected_ids,
-                        DS4_N_EXPERT_USED) != 0 &&
-                ds4_gpu_routed_moe_set_selected_override(
-                        cpu_router_async_load.selected_ids,
-                        DS4_N_EXPERT_USED) != 0;
-        }
-        ok = flush_ok && finish_ok;
-    }
     const bool tp_fold_ffn = tp_split_shared &&
                              !keep_ffn_out &&
                              !metal_graph_directional_steering_ffn_enabled(g);
