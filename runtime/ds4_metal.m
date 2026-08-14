@@ -12477,6 +12477,92 @@ static int ds4_gpu_stream_expert_pread_tasks(
     return ok;
 }
 
+/* Diagnostic only.  A continuation-only numerical fork could be caused by
+ * stale selected-expert bytes, or by how otherwise-correct bytes are bound to
+ * a Metal kernel.  Verify a bounded number of cache hits against their packed
+ * sidecar source to distinguish those two cases without changing inference.
+ * VERIFY_HIT_BYTES is the number of hits to compare; VERIFY_HIT_SKIP skips
+ * earlier hits so a test can target the second request of one live session. */
+static void ds4_gpu_stream_expert_cache_verify_hit_bytes(
+        uint32_t                                    layer,
+        uint32_t                                    expert,
+        const ds4_gpu_stream_expert_cache_entry    *e) {
+    static int initialized;
+    static uint64_t remaining;
+    static uint64_t skip;
+    if (!initialized) {
+        initialized = 1;
+        const char *count_env = getenv("DS4_METAL_STREAMING_EXPERT_VERIFY_HIT_BYTES");
+        const char *skip_env = getenv("DS4_METAL_STREAMING_EXPERT_VERIFY_HIT_SKIP");
+        if (count_env && count_env[0]) {
+            char *end = NULL;
+            remaining = strtoull(count_env, &end, 10);
+            if (end == count_env || *end != '\0') remaining = 0;
+        }
+        if (skip_env && skip_env[0]) {
+            char *end = NULL;
+            skip = strtoull(skip_env, &end, 10);
+            if (end == skip_env || *end != '\0') skip = 0;
+        }
+    }
+    if (remaining == 0 || !e || !e->gate_buffer ||
+        e->gate_buffer != e->up_buffer || e->gate_buffer != e->down_buffer ||
+        e->up_inner != e->gate_inner + e->gate_expert_bytes ||
+        e->down_inner != e->up_inner + e->gate_expert_bytes) {
+        return;
+    }
+    if (skip != 0) {
+        skip--;
+        return;
+    }
+
+    int fd = -1;
+    uint64_t offset = 0;
+    if (!ds4_gpu_stream_expert_pack_source(e->model_size,
+                                           layer,
+                                           expert,
+                                           e->gate_expert_bytes,
+                                           e->down_expert_bytes,
+                                           &fd,
+                                           &offset) ||
+        e->logical_bytes == 0 || e->logical_bytes > SIZE_MAX) {
+        return;
+    }
+    remaining--;
+    uint8_t *reference = malloc((size_t)e->logical_bytes);
+    const uint8_t *actual = (const uint8_t *)[e->gate_buffer contents] + e->gate_inner;
+    if (!reference || !actual) {
+        free(reference);
+        fprintf(stderr, "ds4: expert hit-byte verifier allocation/access failed layer=%u expert=%u\n",
+                layer, expert);
+        return;
+    }
+    size_t done = 0;
+    while (done < (size_t)e->logical_bytes) {
+        const size_t want = (size_t)e->logical_bytes - done;
+        ssize_t got;
+        do {
+            got = pread(fd, reference + done, want, (off_t)(offset + done));
+        } while (got < 0 && errno == EINTR);
+        if (got <= 0) break;
+        done += (size_t)got;
+    }
+    if (done != (size_t)e->logical_bytes) {
+        fprintf(stderr, "ds4: expert hit-byte verifier read failed layer=%u expert=%u\n",
+                layer, expert);
+    } else if (memcmp(actual, reference, (size_t)e->logical_bytes) != 0) {
+        size_t first = 0;
+        while (first < (size_t)e->logical_bytes && actual[first] == reference[first]) first++;
+        fprintf(stderr,
+                "ds4: expert hit-byte verifier MISMATCH layer=%u expert=%u byte=%zu actual=%02x expected=%02x\n",
+                layer, expert, first, actual[first], reference[first]);
+    } else {
+        fprintf(stderr, "ds4: expert hit-byte verifier pass layer=%u expert=%u bytes=%.2f MiB\n",
+                layer, expert, ds4_gpu_mib(e->logical_bytes));
+    }
+    free(reference);
+}
+
 static void ds4_gpu_stream_expert_cache_warn_mlock_failure(
         uint64_t failed_len,
         int      err) {
@@ -15275,6 +15361,7 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_peek(
         return NULL;
     }
 
+    ds4_gpu_stream_expert_cache_verify_hit_bytes(layer, expert, e);
     e->last_used = ++g_stream_expert_cache_clock;
     e->use_count++;
     g_stream_expert_cache_hits++;
