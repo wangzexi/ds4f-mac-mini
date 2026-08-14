@@ -245,10 +245,6 @@ void ds4_gpu_stream_expert_cache_decode_eviction_policy_end(void);
 void ds4_gpu_stream_expert_cache_heat_prediction_profile_begin(void);
 void ds4_gpu_stream_expert_cache_heat_prediction_profile_print(void);
 void ds4_gpu_stream_expert_cache_release_resident(void);
-/* Drop only GPU-address indirection tables.  Resident expert payloads and
- * eviction state stay intact; this is useful for isolating request-boundary
- * address visibility from ordinary selected-expert reuse. */
-void ds4_gpu_stream_expert_cache_clear_address_tables(void);
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes);

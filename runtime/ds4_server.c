@@ -8684,17 +8684,6 @@ static void server_memory_plan_begin_prefill(
         (void)ds4_engine_resize_streaming_expert_cache(s->engine, 0, 0, true);
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: diagnostic cleared selected-expert cache before Prefill");
-    } else {
-        const char *clear_addresses =
-            getenv("DS4_SERVER_DIAG_CLEAR_EXPERT_ADDRESS_TABLES_BEFORE_PREFILL");
-        if (clear_addresses && clear_addresses[0] &&
-            strcmp(clear_addresses, "0") != 0) {
-#ifdef __APPLE__
-            ds4_gpu_stream_expert_cache_clear_address_tables();
-#endif
-            server_log(DS4_LOG_PREFILL,
-                       "ds4-server: diagnostic cleared expert address tables before Prefill");
-        }
     }
     uint32_t applied = ds4_engine_resize_streaming_expert_cache(
             s->engine,

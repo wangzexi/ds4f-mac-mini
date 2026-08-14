@@ -14370,31 +14370,6 @@ static void ds4_gpu_stream_expert_cache_clear_entry(
                                                      NULL);
 }
 
-static void ds4_gpu_stream_expert_cache_clear_address_tables_impl(void) {
-    for (uint32_t layer = 0;
-         layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
-         layer++) {
-        ds4_gpu_stream_full_expert_addr_clear_layer(layer);
-        id<MTLBuffer> buffers[3] = {
-            g_stream_expert_cache_gate_addr_buffers[layer],
-            g_stream_expert_cache_up_addr_buffers[layer],
-            g_stream_expert_cache_down_addr_buffers[layer],
-        };
-        for (uint32_t i = 0; i < 3; i++) {
-            if (!buffers[i]) continue;
-            const NSUInteger bytes =
-                (NSUInteger)DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT *
-                sizeof(uint64_t);
-            memset([buffers[i] contents], 0, bytes);
-            [buffers[i] didModifyRange:NSMakeRange(0, bytes)];
-        }
-    }
-}
-
-void ds4_gpu_stream_expert_cache_clear_address_tables(void) {
-    ds4_gpu_stream_expert_cache_clear_address_tables_impl();
-}
-
 static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
     ds4_gpu_stream_expert_pending_load_clear();
     g_stream_expert_cache_done_seq = g_stream_expert_cache_cb_seq;
@@ -14406,9 +14381,21 @@ static void ds4_gpu_stream_expert_cache_clear_all(int reset_stats) {
             g_stream_expert_cache[layer][expert].inflight_seq = 0;
             ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
         }
+        ds4_gpu_stream_full_expert_addr_clear_layer(layer);
         g_stream_expert_cache_layer_count[layer] = 0;
+        id<MTLBuffer> buffers[3] = {
+            g_stream_expert_cache_gate_addr_buffers[layer],
+            g_stream_expert_cache_up_addr_buffers[layer],
+            g_stream_expert_cache_down_addr_buffers[layer],
+        };
+        for (uint32_t i = 0; i < 3; i++) {
+            if (!buffers[i]) continue;
+            const NSUInteger bytes =
+                (NSUInteger)DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT * sizeof(uint64_t);
+            memset([buffers[i] contents], 0, bytes);
+            [buffers[i] didModifyRange:NSMakeRange(0, bytes)];
+        }
     }
-    ds4_gpu_stream_expert_cache_clear_address_tables_impl();
     g_stream_expert_cache_bytes = 0;
     g_stream_expert_cache_entry_count = 0;
     /* Slab-backed entries recycle their slots without unlocking them during
