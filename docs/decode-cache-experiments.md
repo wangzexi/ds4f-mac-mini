@@ -156,6 +156,28 @@ the current exact path's 15.968--16.204 s; memory footprint rose from 11.69 to
 the extra tier creates paging pressure and makes first-sighting loads less
 reusable; it does not buy back enough Decode residency to pay for itself.
 
+## Rejected packed-offset read ordering
+
+The packed sidecar puts each complete expert in a contiguous 6.75 MiB region.
+An A/B-only queue sort submitted the already-selected missing experts to the
+five existing `pread` workers in ascending sidecar offset order. It changed
+neither Router IDs, cache admission/eviction, destination buffers, nor the
+number of read tasks. Four interleaved live `你好` -> eight-token answer ->
+ten-token suffix -> 30-token answer trials all passed the complete token trace
+and response SHA-256 gate:
+
+| queue order | second-turn seconds |
+| --- | ---: |
+| normal | 15.959, 16.128, 15.884, 15.797 (mean 15.942) |
+| packed offset | 15.771, 16.002, 15.785, 15.902 (mean 15.865) |
+
+The apparent 77 ms / 0.5% mean difference is inside run-to-run variation: in
+the deliberately reversed final pair normal ordering was faster (15.797 s
+versus 15.902 s). Matching profiler deltas had the same selected routes and
+2,045 expert read tasks. The Mini NVMe's concurrent queue is therefore already
+doing the useful scheduling; the sort and its test-only environment switch are
+not retained.
+
 ## Rejected Decode resident/miss overlap
 
 The normal exact Decode path must read the Router's six selected IDs back to
