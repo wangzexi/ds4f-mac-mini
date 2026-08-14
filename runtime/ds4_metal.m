@@ -15361,6 +15361,23 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_peek(
         return NULL;
     }
 
+    /* Diagnostic for the address-table lifetime hypothesis.  The selected
+     * slot cache owns immutable payload bytes, but the GPU address table is
+     * mutable and shared by every use of one layer.  Re-publish an entry's
+     * three addresses immediately before the caller encodes its MoE kernel.
+     * This is deliberately opt-in until the continuity gate proves whether
+     * the table, rather than the cached payload, is the fault boundary. */
+    if (getenv("DS4_METAL_REFRESH_STREAMING_EXPERT_ADDR_ON_HIT") != NULL &&
+        !ds4_gpu_stream_expert_cache_set_addr_slot_raw(layer,
+                                                        expert,
+                                                        e->gate_buffer,
+                                                        e->gate_inner,
+                                                        e->up_buffer,
+                                                        e->up_inner,
+                                                        e->down_buffer,
+                                                        e->down_inner)) {
+        return NULL;
+    }
     ds4_gpu_stream_expert_cache_verify_hit_bytes(layer, expert, e);
     e->last_used = ++g_stream_expert_cache_clock;
     e->use_count++;
