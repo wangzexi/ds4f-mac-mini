@@ -64,8 +64,6 @@ for threads in "${threads_list[@]}"; do
         /usr/bin/time -lp env \
             DS4F_FAST_CACHE_EXPERTS="$cache_experts" \
             DS4F_FAST_TRACE_IDS=1 \
-            DS4F_SPEED_CACHE_AWARE_MASS_PCT=100 \
-            DS4F_SPEED_CACHE_AWARE_MAX_ENTROPY_PCT=100 \
             DS4_METAL_STREAMING_EXPERT_PACK_PATH="$pack" \
             DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER=1 \
             DS4_METAL_STREAMING_EXPERT_PREAD_THREADS="$threads" \

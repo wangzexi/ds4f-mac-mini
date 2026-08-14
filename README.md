@@ -86,12 +86,8 @@ scripts/run-server.sh
 Run a one-shot exact prompt:
 
 ```sh
-scripts/run-32k.sh exact '你好' 32
+scripts/run-32k.sh '你好' 32
 ```
-
-`balanced` and `turbo` are explicit approximate-decode experiments. Prefill
-stays exact, but routed-expert mass is dropped during decode. They are not the
-default quality baseline.
 
 Run the deterministic token regression:
 

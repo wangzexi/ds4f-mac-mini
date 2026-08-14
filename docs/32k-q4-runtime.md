@@ -73,9 +73,7 @@ cache-aware router 的初步速度档位：
 
 近似只在逐 token decode 生效，prompt prefill 始终 exact。这比从 prompt 开始就裁专家稳定得多：完整 100 题中，70% decode-only 相对 exact 的 NLL 增加 17.72%，top-1 从 85.34% 变为 83.35%，首 token 命中同为 51/100，平均 greedy 前缀从 4.38 变为 4.26；同样 70% 若连 prefill 一起近似，19 题筛选的 NLL 增加 30.83%。30% turbo 的 13 题筛选则让 NLL 增加 138.36%、top-1 从 85.26% 变为 72.12%，因此它即使在若干短决策和算术提示上回答正确，也只能作为显式选择的极速档。
 
-`DS4F_SPEED_CACHE_AWARE_MAX_ENTROPY_PCT` 是实验性的 router 熵保护。80/95% 阈值会让大量层回到 exact，实测只剩 2.17/2.86 t/s；25% mass + 99% 阈值虽有 5.18 t/s，但 10 题 NLL 相比无保护 30% 只改善约 2%，top-1 和 greedy 前缀反而更差。因此三个正式模式把该值设为 100（禁用保护）；代码保留用于后续研究，不把它宣传成现有优化。
-
-设置 `DS4F_SPEED_CACHE_AWARE_PROFILE=1` 会逐层记录 router 的总 mass、实际保留 mass、命中缓存数和保留专家数。它只用于寻找更可靠的自适应 decode 阈值，不改变默认 exact 路径。
+这组近似 router 熵保护试验已结束：80/95% 阈值会让大量层回到 exact，实测只剩 2.17/2.86 t/s；25% mass + 99% 阈值虽有 5.18 t/s，但 10 题 NLL 相比无保护 30% 只改善约 2%，top-1 和 greedy 前缀反而更差。因此该近似路径已从专用运行时删除；日志保留在 `results/`，不再提供可执行开关。
 
 Decode 的 cache-hit/miss split 也以 950 槽 exact 路径重新测过。默认只在至少
 3 个专家未命中时先算 resident 部分、并行读取 miss；把阈值降到 2 或 1 虽保持
@@ -93,9 +91,7 @@ Decode 的 cache-hit/miss split 也以 950 槽 exact 路径重新测过。默认
 基线上单独扫过：0/5/10/15/20/30% 相对层内最大权重的 generation 分别为
 2.04/2.06/2.08/2.08/2.17/2.34 t/s。5% 与 10% 保持完整 greedy trace，
 但收益处于测量噪声范围；15% 与 20% 都在第 6 个 token 分叉，30% 在第 3
-个 token 分叉。因此 `DS4F_SPEED_CACHE_AWARE_DROP_MISS_BELOW_TOP_PCT` 继续
-仅作诊断开关，不形成新的 balanced 档位。瓶颈仍是提高所保留专家的真实命中，
-不是在 miss 时再少算一个专家。
+个 token 分叉。因此这一诊断路径也已从运行时删除。瓶颈仍是提高所保留专家的真实命中，而不是在 miss 时再少算一个专家。
 
 又尝试只在低熵 router 层执行这种舍弃：20% 阈值分别限制在归一化熵不高于
 80% 与 85%，仍都在第 6 个 token 分叉，15%/80% 也同样在第 6 个 token
@@ -274,7 +270,7 @@ env \
   DS4F_FAST_CACHE_EXPERTS=256 \
   DS4_METAL_PREFILL_STAGE_ALIAS=1 \
   DS4_METAL_PREFILL_CHUNK=8192 \
-  scripts/run-32k.sh exact @PROMPT.txt 1
+  scripts/run-32k.sh @PROMPT.txt 1
 ```
 
 1,001-token 对照中，4096 无 alias 与 alias 分别为 24.97/24.83 t/s，输出均为 `你好`，说明 view 复用没有改变该精准回归结果。完整日志位于 `results/benchmarks/prefill-15k-chunk8k-cache256-stage-alias-exact.log`。
@@ -304,11 +300,10 @@ tools/build_expert_pack.py MODEL.gguf IQ2Experts-packed.bin --verify-only
 make ds4f-q4-speed
 ```
 
-32K balanced 启动示例：
+32K exact 启动示例：
 
 ```sh
 env \
-  DS4F_SPEED_CACHE_AWARE_MASS_PCT=70 \
   DS4_METAL_STREAMING_EXPERT_PACK_PATH=models/DeepSeek-V4-Flash-0731-IQ2Experts-packed.bin \
   DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER=1 \
   ./ds4f-q4-speed \
@@ -316,12 +311,10 @@ env \
   '你好' 32
 ```
 
-也可以使用固定三档入口；默认应选 `exact`，`balanced` 与 `turbo` 都是显式近似：
+也可以使用固定模型的 exact 入口：
 
 ```sh
-scripts/run-32k.sh exact '你好' 32
-scripts/run-32k.sh balanced '你好' 32
-scripts/run-32k.sh turbo '你好' 32
+scripts/run-32k.sh '你好' 32
 ```
 
 打包前后 8-token greedy ID 完全一致。64-token、70% mass 对照中，原布局为 3.65 t/s，sidecar 为 3.78 t/s；它减少了系统调用和 readahead 开销，但不是从 3.8 到 5 t/s 的决定性加速。跨过 5 t/s 主要来自“exact prefill + 低 mass decode”，代价由上面的质量数据明确记录。

@@ -22,7 +22,7 @@ resident_trace="$result_dir/resident.selected.bin"
 
 echo "[1/2] Recording the normal first-decode routes..." >&2
 env DS4_MOE_RECORD_SELECTED_IDS="$trace" \
-    "$script_dir/run-32k.sh" exact "$prompt" 2 >"$result_dir/baseline.stdout" 2>"$result_dir/baseline.stderr"
+    "$script_dir/run-32k.sh" "$prompt" 2 >"$result_dir/baseline.stdout" 2>"$result_dir/baseline.stderr"
 python3 "$script_dir/make-decode-diag-hotlist.py" "$trace" "$hotlist" --layers 43 \
     >"$result_dir/seed.stdout" 2>"$result_dir/seed.stderr"
 
@@ -31,7 +31,7 @@ env DS4_METAL_DIAG_POST_PREFILL_EXPERT_HOTLIST="$hotlist" \
     DS4_MOE_RECORD_SELECTED_IDS="$resident_trace" \
     DS4_METAL_GRAPH_TOKEN_PROFILE=1 \
     DS4_METAL_GRAPH_TOKEN_PROFILE_SPLIT=1 \
-    "$script_dir/run-32k.sh" exact "$prompt" 2 >"$result_dir/resident.stdout" 2>"$result_dir/resident.stderr"
+    "$script_dir/run-32k.sh" "$prompt" 2 >"$result_dir/resident.stdout" 2>"$result_dir/resident.stderr"
 
 python3 - "$trace" "$resident_trace" <<'PY'
 import sys

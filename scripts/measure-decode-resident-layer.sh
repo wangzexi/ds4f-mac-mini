@@ -27,7 +27,7 @@ echo "[1/2] Recording genuine routes for the first decode token..." >&2
 env DS4_MOE_RECORD_SELECTED_IDS="$trace" \
     DS4_METAL_DECODE_STAGE_PROFILE=1 \
     DS4_METAL_DECODE_STAGE_PROFILE_LAYER="$layer" \
-    "$script_dir/run-32k.sh" exact "$prompt" 2 >"$baseline.stdout" 2>"$baseline.stderr"
+    "$script_dir/run-32k.sh" "$prompt" 2 >"$baseline.stdout" 2>"$baseline.stderr"
 python3 "$script_dir/make-decode-diag-hotlist.py" "$trace" "$hotlist" --layers 43 \
     >"$result_dir/seed.stdout" 2>"$result_dir/seed.stderr"
 
@@ -39,7 +39,7 @@ env DS4_METAL_DIAG_POST_PREFILL_EXPERT_HOTLIST="$hotlist" \
     DS4_METAL_DECODE_STAGE_PROFILE_LAYER="$layer" \
     DS4_METAL_STREAMING_EXPERT_LAYER_STATS=1 \
     DS4_METAL_STREAMING_EXPERT_TIMING_SUMMARY=1 \
-    "$script_dir/run-32k.sh" exact "$prompt" 2 >"$resident.stdout" 2>"$resident.stderr"
+    "$script_dir/run-32k.sh" "$prompt" 2 >"$resident.stdout" 2>"$resident.stderr"
 
 python3 - "$trace" "$resident_trace" <<'PY'
 import sys
