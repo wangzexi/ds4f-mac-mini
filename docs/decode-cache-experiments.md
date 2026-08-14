@@ -33,6 +33,38 @@ some single-use loads displace an entry that the next generated tokens need
 again.  On this trajectory 1,234 of 2,122 Decode loads were one-shot evictions
 and 413 were later read again (2.72 GiB logical reread).
 
+## One-token versus two-token churn
+
+The diagnostic now additionally classifies a one-shot eviction by its exact
+age in selected-expert lookups.  A complete Decode pass is exactly `43 x 6 =
+258` lookups on this fixed model, so this directly tests the concern that a
+freshly loaded expert is displaced before its own layer can receive the next
+Router result.  The counters are diagnostic-only; they do not change cache
+admission, eviction, Router results, or Metal command submission.
+
+On a fresh `你好` -> 32-token greedy response, the unmodified one-token policy
+recorded 2,619 loads and 1,201 one-shot evictions.  Only 3 were evicted within
+one complete Decode pass, and none of those was later reread.  Within two
+passes there were 550 evictions, of which 107 were later reread.  Total
+one-shot rereads were 306 (2.02 GiB logical reread).  The full 32-token trace
+and response SHA-256 `6d605b1ce3b41d7f2565cbf9d1ecc307a34b69365ef198ff064ee1714dfd1fb2`
+matched the baseline.
+
+That makes a two-token probation the narrowest plausible extension.  It was
+then measured in interleaved A/B order (`258`, `516`, `516`, `258` lookups),
+with the complete trace and response hash required to match in every run:
+
+| probation window | exact request seconds | mean | logical reread |
+| --- | ---: | ---: | ---: |
+| 258 lookups (production one token) | 17.060694, 17.013341 | 17.037018 | 2.02 GiB |
+| 516 lookups (two tokens, test only) | 17.025787, 17.052027 | 17.038907 | 2.07 GiB |
+
+The longer window does not reduce misses or rereads; it protects candidates
+that displace slightly more useful entries.  It is therefore rejected.  The
+diagnostic age buckets are retained for future profiling, but the two-token
+environment switch stays in the isolated experiment branch and is not part of
+the production server.
+
 ## Rejected cache policies
 
 All rows below emitted the same 32-token trace and response hash.
