@@ -50,6 +50,22 @@ probation window; the policy switches to plain LRU above 18 uncached Prefill
 rows.  This is a fixed-target decision from the measured trajectories, not a
 general-purpose tuning knob.
 
+The short-window tenure itself was also swept on the live eight-token answer
+followed by the usual ten-token suffix and 30-token response.  Every row had
+the same complete second-turn token trace and response SHA-256:
+
+| probation tenure (expert lookups) | second-turn time |
+| ---: | ---: |
+| 64 | 16.193 s |
+| 128 | 16.228 s |
+| 192 | 16.472 s |
+| 258 (one full 43 x 6 Decode pass; production) | 16.271 s |
+
+The 64--258 difference is below normal SSD variation, while 192 is plainly
+slower.  There is no repeatable gain for a smaller window, so the production
+one-token value remains fixed and the A/B-only environment override was not
+retained.
+
 Hard per-layer quotas are also not promising.  Replaying the 2,279-selection
 trace with the same 967-entry capacity yields a 70.7% second-Decode hit rate
 for both global LRU and a 22/23-entry-per-layer partition.  A six-entry
