@@ -16,6 +16,7 @@ port=${DS4F_BENCH_SERVER_PORT:-18081}
 repeats=${DS4F_BENCH_REPEATS:-2}
 first_tokens=${DS4F_BENCH_FIRST_TOKENS:-8}
 second_tokens=${DS4F_BENCH_SECOND_TOKENS:-32}
+second_content=${DS4F_BENCH_SECOND_CONTENT:-请继续用一句话说明。}
 text_replay_control=${DS4F_BENCH_FRESH_CONTROL:-0}
 kv_cache_min_tokens=${DS4F_BENCH_KV_CACHE_MIN_TOKENS:-1}
 out_dir=${DS4F_BENCH_OUT_DIR:-"$project_dir/results/benchmarks/session-continuity-$(date +%Y%m%d-%H%M%S)"}
@@ -110,7 +111,7 @@ PY
 )" -o "$first" -w '%{time_total}' "http://127.0.0.1:$port/v1/chat/completions")
 
     second_payload="$tmp_dir/turn-2-$repeat.json"
-    python3 - "$first" "$second_tokens" >"$second_payload" <<'PY'
+    python3 - "$first" "$second_tokens" "$second_content" >"$second_payload" <<'PY'
 import json, sys
 first = json.load(open(sys.argv[1], encoding='utf-8'))
 answer = first['choices'][0]['message']['content']
@@ -119,7 +120,7 @@ print(json.dumps({
     'messages': [
         {'role': 'user', 'content': '你好'},
         {'role': 'assistant', 'content': answer},
-        {'role': 'user', 'content': '请继续用一句话说明。'},
+        {'role': 'user', 'content': sys.argv[3]},
     ],
     'max_tokens': int(sys.argv[2]), 'temperature': 0, 'stream': False,
 }, ensure_ascii=False))
