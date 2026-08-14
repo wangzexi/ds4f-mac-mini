@@ -704,6 +704,13 @@ static int g_stream_expert_cache_decode_lru_policy_active;
  * gets one short chance to be selected again before it competes with the
  * mature cache. */
 static int g_stream_expert_cache_decode_probation_lru_policy_active;
+/* A Decode-only A/B keeps the prior token's selected six experts protected
+ * until that same layer receives the next exact Router answer.  This is an
+ * exact cache-admission experiment: it changes neither the six IDs nor any
+ * Metal operation, and needs no additional buffers. */
+static int g_stream_expert_cache_previous_route_protection_active;
+static uint8_t
+    g_stream_expert_cache_previous_route_protected[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
 static uint8_t
     g_stream_expert_cache_churn_profile_loaded[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
 static uint8_t
@@ -13560,6 +13567,11 @@ void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(
     g_stream_expert_cache_decode_lru_policy_active = prefill_rows > 18u;
     g_stream_expert_cache_decode_probation_lru_policy_active =
         !g_stream_expert_cache_decode_lru_policy_active;
+    g_stream_expert_cache_previous_route_protection_active =
+        getenv("DS4_METAL_ENABLE_DECODE_PREVIOUS_ROUTE_PROTECT") != NULL;
+    memset(g_stream_expert_cache_previous_route_protected,
+           0,
+           sizeof(g_stream_expert_cache_previous_route_protected));
     fprintf(stderr,
             "ds4: Decode expert eviction policy rows=%u -> %s\n",
             prefill_rows,
@@ -13570,6 +13582,31 @@ void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(
 void ds4_gpu_stream_expert_cache_decode_eviction_policy_end(void) {
     g_stream_expert_cache_decode_lru_policy_active = 0;
     g_stream_expert_cache_decode_probation_lru_policy_active = 0;
+    g_stream_expert_cache_previous_route_protection_active = 0;
+    memset(g_stream_expert_cache_previous_route_protected,
+           0,
+           sizeof(g_stream_expert_cache_previous_route_protected));
+}
+
+static void ds4_gpu_stream_expert_cache_note_previous_route(
+        uint32_t       layer,
+        const int32_t *selected_ids,
+        uint32_t       n_selected) {
+    if (!g_stream_expert_cache_previous_route_protection_active ||
+        layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
+        !selected_ids) {
+        return;
+    }
+    memset(g_stream_expert_cache_previous_route_protected[layer],
+           0,
+           sizeof(g_stream_expert_cache_previous_route_protected[layer]));
+    for (uint32_t i = 0; i < n_selected; i++) {
+        if (selected_ids[i] >= 0 &&
+            (uint32_t)selected_ids[i] < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) {
+            g_stream_expert_cache_previous_route_protected[layer]
+                                                        [(uint32_t)selected_ids[i]] = 1;
+        }
+    }
 }
 
 static uint64_t ds4_gpu_stream_expert_cache_probation_lookups(void) {
@@ -14659,6 +14696,12 @@ static int ds4_gpu_stream_expert_cache_entry_protected(
         g_stream_expert_cache_layer_count[0] ==
             DS4_METAL_HASH_LAYER0_EXPERTS &&
         ds4_gpu_stream_expert_cache_keep_hash_layer_zero()) {
+        return 1;
+    }
+    if (g_stream_expert_cache_previous_route_protection_active &&
+        layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER &&
+        expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
+        g_stream_expert_cache_previous_route_protected[layer][expert]) {
         return 1;
     }
     return layer == protect_layer &&
@@ -16516,6 +16559,13 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         return 1;
     }
     if (!g_initialized && !ds4_gpu_init()) return 0;
+
+    /* Replace this layer's prior-token prediction as soon as its Router gives
+     * the exact current six IDs.  The selected-id arguments protect those
+     * current IDs while the normal loader chooses any replacement victims. */
+    ds4_gpu_stream_expert_cache_note_previous_route(layer,
+                                                     selected_ids,
+                                                     n_selected);
 
     /* A short/medium Prefill may be speculatively streaming prompt-local hot
      * experts for this learned layer. Reconcile it at the first real Router
