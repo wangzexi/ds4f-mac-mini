@@ -234,9 +234,8 @@ void ds4_gpu_stream_expert_cache_note_route_weights(
 void ds4_gpu_stream_expert_cache_churn_profile_begin_decode(void);
 void ds4_gpu_stream_expert_cache_churn_profile_print_decode(void);
 /* Decode-only eviction A/B.  `...=lru` disables route-heat ranking after
- * Prefill; `...=reuse-heat` applies it only after a second cache hit; and
- * `...=token-lru` compares recency by Decode-token epoch.  The fixed Mini's
- * `adaptive` policy uses the exact uncached Prefill row count.
+ * Prefill; `...=reuse-heat` applies it only after a second cache hit.  The
+ * fixed Mini's `adaptive` policy uses the exact uncached Prefill row count.
  * All other phases remain unchanged. */
 void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(
         uint32_t prefill_rows);

@@ -631,7 +631,6 @@ typedef struct {
     uint64_t down_expert_bytes;
     uint64_t logical_bytes;
     uint64_t last_used;
-    uint64_t last_decode_token;
     uint64_t use_count;
     NSUInteger gate_inner;
     NSUInteger up_inner;
@@ -702,10 +701,6 @@ static float
 static int g_stream_expert_cache_churn_profile_active;
 static int g_stream_expert_cache_decode_lru_policy_active;
 static int g_stream_expert_cache_decode_reuse_heat_policy_active;
-/* Decode visits layers in a fixed order.  This policy compares the token
- * epoch first, so low-index layers are not aged solely by later layers of
- * the same token. */
-static int g_stream_expert_cache_decode_token_lru_policy_active;
 /* Decode-only probation LRU: a freshly read expert gets one short chance to
  * be selected again before it competes with the mature cache.  This is an
  * experiment for the small unified-memory Mini, where a global cache can
@@ -13484,13 +13479,10 @@ void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(
         policy && strcmp(policy, "lru") == 0;
     g_stream_expert_cache_decode_reuse_heat_policy_active =
         policy && strcmp(policy, "reuse-heat") == 0;
-    g_stream_expert_cache_decode_token_lru_policy_active =
-        policy && strcmp(policy, "token-lru") == 0;
     g_stream_expert_cache_decode_probation_lru_policy_active =
         policy && strcmp(policy, "probation-lru") == 0;
     if (policy && policy[0] && !g_stream_expert_cache_decode_lru_policy_active &&
         !g_stream_expert_cache_decode_reuse_heat_policy_active &&
-        !g_stream_expert_cache_decode_token_lru_policy_active &&
         !g_stream_expert_cache_decode_probation_lru_policy_active &&
         strcmp(policy, "heat") != 0) {
         fprintf(stderr,
@@ -13503,9 +13495,6 @@ void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(
     } else if (g_stream_expert_cache_decode_reuse_heat_policy_active) {
         fprintf(stderr,
                 "ds4: Decode expert eviction policy=reuse-heat (Prefill remains heat+LRU)\n");
-    } else if (g_stream_expert_cache_decode_token_lru_policy_active) {
-        fprintf(stderr,
-                "ds4: Decode expert eviction policy=token-lru (Prefill remains heat+LRU)\n");
     } else if (g_stream_expert_cache_decode_probation_lru_policy_active &&
                !(requested && strcmp(requested, "adaptive") == 0)) {
         fprintf(stderr,
@@ -13516,15 +13505,7 @@ void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(
 void ds4_gpu_stream_expert_cache_decode_eviction_policy_end(void) {
     g_stream_expert_cache_decode_lru_policy_active = 0;
     g_stream_expert_cache_decode_reuse_heat_policy_active = 0;
-    g_stream_expert_cache_decode_token_lru_policy_active = 0;
     g_stream_expert_cache_decode_probation_lru_policy_active = 0;
-}
-
-static uint64_t ds4_gpu_stream_expert_cache_eviction_recency(
-        const ds4_gpu_stream_expert_cache_entry *entry) {
-    if (!entry) return 0;
-    return g_stream_expert_cache_decode_token_lru_policy_active ?
-           entry->last_decode_token : entry->last_used;
 }
 
 static uint64_t ds4_gpu_stream_expert_cache_probation_lookups(void) {
@@ -13562,7 +13543,6 @@ static float ds4_gpu_stream_expert_cache_eviction_heat(
         return FLT_MAX / 4.0f;
     }
     if (g_stream_expert_cache_decode_lru_policy_active ||
-        g_stream_expert_cache_decode_token_lru_policy_active ||
         (g_stream_expert_cache_decode_reuse_heat_policy_active &&
          (!entry || entry->use_count < 2))) {
         return 0.0f;
@@ -14018,7 +13998,6 @@ static void ds4_gpu_stream_full_expert_addr_clear_layer(uint32_t layer) {
     e->down_expert_bytes = 0;
     e->logical_bytes = 0;
     e->last_used = 0;
-    e->last_decode_token = 0;
     e->use_count = 0;
     e->gate_inner = 0;
     e->up_inner = 0;
@@ -14371,7 +14350,6 @@ static void ds4_gpu_stream_expert_cache_clear_entry_internal(
     e->down_expert_bytes = 0;
     e->logical_bytes = 0;
     e->last_used = 0;
-    e->last_decode_token = 0;
     e->use_count = 0;
     e->gate_inner = 0;
     e->up_inner = 0;
@@ -14600,10 +14578,9 @@ static void ds4_gpu_stream_expert_cache_prune_layer(
             const float hotness =
                 ds4_gpu_stream_expert_cache_eviction_heat(layer, expert, e);
             if (hotness < lowest_hotness ||
-                (hotness == lowest_hotness &&
-                 ds4_gpu_stream_expert_cache_eviction_recency(e) < oldest)) {
+                (hotness == lowest_hotness && e->last_used < oldest)) {
                 lowest_hotness = hotness;
-                oldest = ds4_gpu_stream_expert_cache_eviction_recency(e);
+                oldest = e->last_used;
                 victim = expert;
             }
         }
@@ -14710,10 +14687,9 @@ retry:
             const float hotness =
                 ds4_gpu_stream_expert_cache_eviction_heat(layer, expert, e);
             if (hotness < lowest_hotness ||
-                (hotness == lowest_hotness &&
-                 ds4_gpu_stream_expert_cache_eviction_recency(e) < oldest)) {
+                (hotness == lowest_hotness && e->last_used < oldest)) {
                 lowest_hotness = hotness;
-                oldest = ds4_gpu_stream_expert_cache_eviction_recency(e);
+                oldest = e->last_used;
                 victim_layer = layer;
                 victim_expert = expert;
             }
@@ -14835,8 +14811,7 @@ retry:
 
             const float hotness =
                 ds4_gpu_stream_expert_cache_eviction_heat(layer, expert, e);
-            const uint64_t last_used =
-                ds4_gpu_stream_expert_cache_eviction_recency(e);
+            const uint64_t last_used = e->last_used;
             if (victim_count < n_needed) {
                 victim_layers[victim_count] = layer;
                 victim_experts[victim_count] = expert;
@@ -14979,10 +14954,9 @@ static uint32_t ds4_gpu_stream_expert_cache_release_mlock_margin(
                 const float hotness =
                     g_stream_expert_cache_route_hotness[layer][expert];
                 if (hotness < lowest_hotness ||
-                    (hotness == lowest_hotness &&
-                     ds4_gpu_stream_expert_cache_eviction_recency(e) < oldest)) {
+                    (hotness == lowest_hotness && e->last_used < oldest)) {
                     lowest_hotness = hotness;
-                    oldest = ds4_gpu_stream_expert_cache_eviction_recency(e);
+                    oldest = e->last_used;
                     victim_layer = layer;
                     victim_expert = expert;
                     victim_slot = e->slab_slot;
@@ -15248,10 +15222,9 @@ static void ds4_gpu_stream_expert_cache_prune_global(
                 const float hotness =
                     g_stream_expert_cache_route_hotness[layer][expert];
                 if (hotness < lowest_hotness ||
-                    (hotness == lowest_hotness &&
-                     ds4_gpu_stream_expert_cache_eviction_recency(e) < oldest)) {
+                    (hotness == lowest_hotness && e->last_used < oldest)) {
                     lowest_hotness = hotness;
-                    oldest = ds4_gpu_stream_expert_cache_eviction_recency(e);
+                    oldest = e->last_used;
                     victim_layer = layer;
                     victim_expert = expert;
                 }
@@ -15321,9 +15294,6 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_peek(
     }
 
     e->last_used = ++g_stream_expert_cache_clock;
-    if (g_stream_expert_cache_decode_token_lru_policy_active) {
-        e->last_decode_token = g_stream_expert_cache_decode_tokens;
-    }
     e->use_count++;
     g_stream_expert_cache_hits++;
     g_stream_expert_cache_layer_hits[layer]++;
@@ -15398,9 +15368,6 @@ ds4_gpu_stream_expert_cache_install_loaded(
     e->down_expert_bytes = down_expert_bytes;
     e->logical_bytes = logical_bytes;
     e->last_used = ++g_stream_expert_cache_clock;
-    e->last_decode_token =
-        g_stream_expert_cache_decode_token_lru_policy_active ?
-        g_stream_expert_cache_decode_tokens : 0;
     e->use_count = 1;
     e->gate_inner = gate_inner;
     e->up_inner = up_inner;
@@ -16168,9 +16135,6 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
                                                   gate_expert_bytes,
                                                   down_expert_bytes)) {
         e->last_used = ++g_stream_expert_cache_clock;
-        if (g_stream_expert_cache_decode_token_lru_policy_active) {
-            e->last_decode_token = g_stream_expert_cache_decode_tokens;
-        }
         e->use_count++;
         g_stream_expert_cache_hits++;
         g_stream_expert_cache_layer_hits[layer]++;
