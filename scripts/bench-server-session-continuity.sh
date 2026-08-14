@@ -114,11 +114,26 @@ PY
         -H 'Content-Type: application/json' -d @"$second_payload" \
         -o "$second" -w '%{time_total}' "http://127.0.0.1:$port/v1/chat/completions")
 
+    mapfile -t completion_counts < <(python3 - "$first" "$second" <<'PY'
+import json, sys
+for path in sys.argv[1:]:
+    value = json.load(open(path, encoding='utf-8')).get('usage', {}).get('completion_tokens')
+    if not isinstance(value, int) or value <= 0:
+        raise SystemExit(f'invalid completion token count in {path}: {value!r}')
+    print(value)
+PY
+)
+    if [[ ${#completion_counts[@]} -ne 2 ]]; then
+        echo "missing completion counts" >&2
+        exit 1
+    fi
+    actual_first=${completion_counts[0]}
+    actual_second=${completion_counts[1]}
     mapfile -t traces < <(sed -n -E 's/.*trace token\[[0-9]+\]=([0-9]+).*/\1/p' "$log" | awk '
         NR <= first { a = a (NR == 1 ? "" : ",") $0; next }
         NR <= first + second { n = NR - first; b = b (n == 1 ? "" : ",") $0 }
         END { print a; print b }
-    ' first="$first_tokens" second="$second_tokens")
+    ' first="$actual_first" second="$actual_second")
     if [[ ${#traces[@]} -ne 2 ]] || [[ -z ${traces[0]} ]] || [[ -z ${traces[1]} ]]; then
         echo "missing turn trace in $log" >&2
         exit 1
@@ -140,12 +155,12 @@ PY
         echo "session continuity exact regression in repeat $repeat" >&2
         exit 1
     fi
-    printf 'repeat=%s turn1_seconds=%s turn1_tps=%s turn2_seconds=%s turn2_tps=%s turn1_trace=%s turn2_trace=%s turn1_sha256=%s turn2_sha256=%s\n' \
-        "$repeat" "$first_seconds" "$(python3 - "$first_tokens" "$first_seconds" <<'PY'
+    printf 'repeat=%s turn1_tokens=%s turn1_seconds=%s turn1_tps=%s turn2_tokens=%s turn2_seconds=%s turn2_tps=%s turn1_trace=%s turn2_trace=%s turn1_sha256=%s turn2_sha256=%s\n' \
+        "$repeat" "$actual_first" "$first_seconds" "$(python3 - "$actual_first" "$first_seconds" <<'PY'
 import sys
 print(f'{int(sys.argv[1])/float(sys.argv[2]):.4f}')
 PY
-)" "$second_seconds" "$(python3 - "$second_tokens" "$second_seconds" <<'PY'
+)" "$actual_second" "$second_seconds" "$(python3 - "$actual_second" "$second_seconds" <<'PY'
 import sys
 print(f'{int(sys.argv[1])/float(sys.argv[2]):.4f}')
 PY
