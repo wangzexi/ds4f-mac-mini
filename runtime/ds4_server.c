@@ -8685,29 +8685,10 @@ static void server_memory_plan_begin_prefill(
         server_log(DS4_LOG_PREFILL,
                    "ds4-server: diagnostic cleared selected-expert cache before Prefill");
     }
-    /*
-     * A continued one-session chat usually Prefills only a short suffix.
-     * On the fixed 16 GiB Mini that path prices a small (roughly 50 MiB)
-     * staging workspace by reducing the expert target from Decode's 967
-     * entries to 960.  Resizing to that slightly smaller target used to
-     * discard the whole 6.37 GiB Decode LRU slab before every follow-up,
-     * even though retaining seven additional experts is safely inside the
-     * measured working-set reserve.  Keep the Decode pool intact only for
-     * this narrow, exact small-suffix case.  Larger Prefills retain the
-     * regular memory plan and release behavior.
-     */
-    const bool retain_decode_cache =
-        plan->prefill.prefill_tokens <= DS4_SERVER_SMALL_PREFILL_MAX_ROWS &&
-        plan->decode_experts >= plan->prefill_experts &&
-        plan->decode_experts - plan->prefill_experts <= 8u;
-    const uint32_t prefill_experts = retain_decode_cache ?
-        plan->decode_experts : plan->prefill_experts;
-    const uint32_t prefill_pinned_experts = retain_decode_cache ?
-        plan->decode_pinned_experts : plan->prefill_pinned_experts;
     uint32_t applied = ds4_engine_resize_streaming_expert_cache(
             s->engine,
-            prefill_experts,
-            prefill_pinned_experts,
+            plan->prefill_experts,
+            plan->prefill_pinned_experts,
             true);
     uint32_t locked =
         ds4_engine_streaming_expert_cache_locked_count(s->engine);
@@ -8735,16 +8716,11 @@ static void server_memory_plan_begin_prefill(
                applied,
                (double)applied * (double)plan->prefill.per_expert_bytes /
                    1073741824.0,
-               prefill_pinned_experts,
-               (double)prefill_pinned_experts *
+               plan->prefill_pinned_experts,
+               (double)plan->prefill_pinned_experts *
                    (double)plan->prefill.per_expert_bytes / 1073741824.0,
                locked,
                (double)reacquired / 1073741824.0);
-    if (retain_decode_cache) {
-        server_log(DS4_LOG_PREFILL,
-                   "ds4-server: retained Decode expert cache for small continued Prefill (planned=%u retained=%u)",
-                   plan->prefill_experts, prefill_experts);
-    }
 }
 
 static void server_memory_plan_finish_prefill(
