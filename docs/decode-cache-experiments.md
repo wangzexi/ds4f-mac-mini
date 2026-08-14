@@ -392,3 +392,21 @@ reduce real SSD reads, and its measured readahead time was slightly higher in
 both interleaved runs. It therefore does not move the bottleneck and is not
 merged into production. The experiment remains available in
 `/private/tmp/ds4f-decode-readahead-coalesce` on the Mini for reproducibility.
+
+## Rejected Decode pread worker-count change
+
+The fixed Mini's production setting is five expert-pread workers. A four-worker
+variant was tested with the same live-session exact gate, first in two repeats
+and then in an interleaved `5 -> 4 -> 5 -> 4` run:
+
+| workers | two-repeat mean | interleaved mean | result |
+| ---: | ---: | ---: | --- |
+| 4 | 15.898 s | 15.828 s | exact, no stable gain |
+| 5 | 15.947 s | 15.782 s | exact, retained |
+
+All runs used 1,867 logical expert loads and 31.23 GiB of logical expert
+input. The profiler's selected-load wait remained about 10.7--10.9 s in both
+settings. The sub-percent differences move with run order and SSD queue
+state, so changing the default would be tuning noise rather than an
+optimization. Six workers had already shown no benefit in the earlier sweep;
+the production default remains five.
