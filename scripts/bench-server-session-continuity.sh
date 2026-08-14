@@ -114,7 +114,10 @@ PY
         -H 'Content-Type: application/json' -d @"$second_payload" \
         -o "$second" -w '%{time_total}' "http://127.0.0.1:$port/v1/chat/completions")
 
-    mapfile -t completion_counts < <(python3 - "$first" "$second" <<'PY'
+    completion_counts=()
+    while IFS= read -r value; do
+        completion_counts+=("$value")
+    done < <(python3 - "$first" "$second" <<'PY'
 import json, sys
 for path in sys.argv[1:]:
     value = json.load(open(path, encoding='utf-8')).get('usage', {}).get('completion_tokens')
@@ -129,7 +132,10 @@ PY
     fi
     actual_first=${completion_counts[0]}
     actual_second=${completion_counts[1]}
-    mapfile -t traces < <(sed -n -E 's/.*trace token\[[0-9]+\]=([0-9]+).*/\1/p' "$log" | awk '
+    traces=()
+    while IFS= read -r value; do
+        traces+=("$value")
+    done < <(sed -n -E 's/.*trace token\[[0-9]+\]=([0-9]+).*/\1/p' "$log" | awk '
         NR <= first { a = a (NR == 1 ? "" : ",") $0; next }
         NR <= first + second { n = NR - first; b = b (n == 1 ? "" : ",") $0 }
         END { print a; print b }
