@@ -171,6 +171,29 @@ minimum per layer produces the identical replay result.  Global borrowing is
 therefore retained because it costs no extra policy complexity and wins on
 longer measured prompts.
 
+### Short-continuation victim policy sweep
+
+The fixed runtime already uses plain global LRU after an uncached Prefill of
+more than 18 rows.  The only remaining question was the short-continuation
+branch, which preserves the immediately preceding Decode route for each layer
+while its other victims are ordered by decayed, route-weighted heat.
+
+On the live `你好` -> eight-token answer -> ten-token suffix -> 30-token
+answer fixture, replacing just those non-protected victims with pure global
+LRU was exact but slower: 15.960 s for the current policy versus 16.486 s for
+pure LRU (two runs each, a 3.3% regression).  This rejects the concern that a
+low-frequency, high-weight expert is merely pinning stale cache space: the
+recent weight signal is useful on this short trajectory.
+
+The heat half-life was then swept without changing Router outputs, selected
+experts, reads, or Metal work.  Four-token decay was worse (16.239 s and
+15.938 s).  Eight-token decay initially looked promising in an unpaired pair,
+so it was rerun against the normal 16-token half-life in an interleaved,
+identical two-run A/B.  The control averaged 15.837 s; half-life eight averaged
+15.839 s.  All runs had the same full two-turn token traces and SHA-256 reply
+hashes.  The 2 ms difference is noise, so the fixed 16-token half-life remains
+the production setting and no tuning switch is retained.
+
 ## Narrow next experiment: transient small-Prefill admission
 
 The ten-token continued Prefill contains 2,580 selections for 1,282 unique
