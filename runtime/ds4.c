@@ -60728,7 +60728,16 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             const char *em = getenv("DS4_GLM_TP_EXACT_PREFILL_MAX");
             if (em && em[0]) glm_exact_prefill_max = (uint32_t)atoi(em);
         }
-        if (s->engine->glm_tp_token_prefill ||
+        /* Diagnostic exactness path: execute a full prompt through the same
+         * token graph used when extending a live checkpoint.  The fixed Mini
+         * uses this only to test whether batch Prefill's reduction order is
+         * the source of a continuation/fresh transcript divergence. */
+        const char *force_token_prefill_env =
+            getenv("DS4_MINI_EXACT_TOKEN_PREFILL");
+        const bool force_token_prefill =
+            force_token_prefill_env && force_token_prefill_env[0] &&
+            strcmp(force_token_prefill_env, "0") != 0;
+        if (force_token_prefill || s->engine->glm_tp_token_prefill ||
             s->glm_graph.placement != NULL ||
             (s->glm_graph.tp_world == 2 &&
              (uint32_t)(prompt->len - start) <= glm_exact_prefill_max)) {
