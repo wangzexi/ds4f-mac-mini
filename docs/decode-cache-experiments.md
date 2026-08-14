@@ -410,3 +410,22 @@ settings. The sub-percent differences move with run order and SSD queue
 state, so changing the default would be tuning noise rather than an
 optimization. Six workers had already shown no benefit in the earlier sweep;
 the production default remains five.
+
+## Current selected-load and churn breakdown
+
+The latest fixed `你好` -> eight-token answer -> 30-token continuation profile
+measured 2,279 selected Decode layers. Of the 10.851 s selected-slot
+"bind" total, only 1.172 ms was route metadata, 0.455 ms was cache lookup,
+and 0.081 ms was the final cache/address tail. About 10.849 s was spent in
+`load_selected_missing`, waiting for or installing missing expert data. This
+confirms that another Metal binding API change cannot address the current
+bottleneck.
+
+The same run's churn profile recorded 2,045 second-turn loads, 1,532
+evictions, and 1,160 one-shot evictions (56.7% of loads). Of those one-shot
+evictions, 357 were later reread, for 2.35 GiB of logical duplicate input.
+The first eight-token turn had no evictions because the cache was still
+warming. The data supports reducing cache pollution, but the existing
+probation and heat-policy experiments above show that broad protection costs
+more than it saves; the short-continuation prior-route protection remains the
+accepted targeted policy.
