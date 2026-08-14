@@ -216,3 +216,16 @@ Prefill weights older rows less than recent rows. A disk KV hit restores the
 matching heat atomically with the graph payload. Loading an older checkpoint
 without this trailer resets heat instead of reusing state from another prompt.
 The 43 x 256 float32 matrix costs 44,032 bytes per checkpoint.
+
+An explicit restart regression confirms the durability boundary: after a
+16-token first reply, the test server was shut down (persisting KV and heat),
+then restarted before the second and third short turns. The restart log showed
+the 43 x 256 heat matrix restored at the original token clock, and all 48
+generated token IDs plus the three response SHA-256 values matched the
+no-restart conversation exactly. It is not a speed replacement for a resident
+server, however. The learned-expert cache belongs to the Metal process and is
+empty after restart: the restarted second/third requests took 17.93/16.30 s,
+versus about 11.20/10.68 s while the same process remained warm. For this
+single-Mini deployment, keep `ds4f-server` running; disk KV is the exact
+conversation-recovery mechanism, not a way to preserve 6.37 GiB of expert
+residency across process death.
