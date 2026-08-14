@@ -699,17 +699,19 @@ static float
  * Keep a pending bit after that eviction so a later install of the same
  * (layer, expert) measures the avoidable read-back directly. */
 static int g_stream_expert_cache_churn_profile_active;
-static int g_stream_expert_cache_decode_lru_policy_active;
-/* Decode-only probation LRU: on a short continued turn, a freshly read expert
- * gets one short chance to be selected again before it competes with the
- * mature cache. */
-static int g_stream_expert_cache_decode_probation_lru_policy_active;
+typedef enum ds4_decode_eviction_policy {
+    DS4_DECODE_EVICTION_NONE = 0,
+    DS4_DECODE_EVICTION_LRU,
+    DS4_DECODE_EVICTION_PROBATION_LRU,
+} ds4_decode_eviction_policy;
+/* Short continued turns give a fresh expert one token's chance to be reused;
+ * longer Prefills use plain global LRU. */
+static ds4_decode_eviction_policy g_stream_expert_cache_decode_policy;
 /* On a short continued Prefill, keep the prior token's selected six experts
  * protected until that same layer receives the next exact Router answer.  This
  * changes neither the six IDs nor any Metal operation, and needs no additional
  * buffers.  Long Prefills retain plain LRU: their broader working set needs
  * the whole cache as a victim pool. */
-static int g_stream_expert_cache_previous_route_protection_active;
 static uint8_t
     g_stream_expert_cache_previous_route_protected[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
 static uint8_t
@@ -13586,25 +13588,20 @@ void ds4_gpu_stream_expert_cache_decode_eviction_policy_begin(
      * logical rereads versus 2.85 GiB with LRU.  The uncached row count is
      * the precise phase boundary already used by the memory planner.
      */
-    g_stream_expert_cache_decode_lru_policy_active = prefill_rows > 18u;
-    g_stream_expert_cache_decode_probation_lru_policy_active =
-        !g_stream_expert_cache_decode_lru_policy_active;
-    g_stream_expert_cache_previous_route_protection_active =
-        !g_stream_expert_cache_decode_lru_policy_active;
+    g_stream_expert_cache_decode_policy = prefill_rows > 18u ?
+        DS4_DECODE_EVICTION_LRU : DS4_DECODE_EVICTION_PROBATION_LRU;
     memset(g_stream_expert_cache_previous_route_protected,
            0,
            sizeof(g_stream_expert_cache_previous_route_protected));
     fprintf(stderr,
             "ds4: Decode expert eviction policy rows=%u -> %s\n",
             prefill_rows,
-            g_stream_expert_cache_decode_lru_policy_active ?
+            g_stream_expert_cache_decode_policy == DS4_DECODE_EVICTION_LRU ?
                 "lru" : "probation-lru");
 }
 
 void ds4_gpu_stream_expert_cache_decode_eviction_policy_end(void) {
-    g_stream_expert_cache_decode_lru_policy_active = 0;
-    g_stream_expert_cache_decode_probation_lru_policy_active = 0;
-    g_stream_expert_cache_previous_route_protection_active = 0;
+    g_stream_expert_cache_decode_policy = DS4_DECODE_EVICTION_NONE;
     memset(g_stream_expert_cache_previous_route_protected,
            0,
            sizeof(g_stream_expert_cache_previous_route_protected));
@@ -13614,7 +13611,8 @@ static void ds4_gpu_stream_expert_cache_note_previous_route(
         uint32_t       layer,
         const int32_t *selected_ids,
         uint32_t       n_selected) {
-    if (!g_stream_expert_cache_previous_route_protection_active ||
+    if (g_stream_expert_cache_decode_policy !=
+            DS4_DECODE_EVICTION_PROBATION_LRU ||
         layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
         !selected_ids) {
         return;
@@ -13639,7 +13637,8 @@ static uint64_t ds4_gpu_stream_expert_cache_probation_lookups(void) {
 
 static int ds4_gpu_stream_expert_cache_entry_on_probation(
         const ds4_gpu_stream_expert_cache_entry *entry) {
-    if (!g_stream_expert_cache_decode_probation_lru_policy_active ||
+    if (g_stream_expert_cache_decode_policy !=
+            DS4_DECODE_EVICTION_PROBATION_LRU ||
         !entry || entry->use_count != 1 ||
         g_stream_expert_cache_clock < entry->last_used) {
         return 0;
@@ -13657,7 +13656,7 @@ static float ds4_gpu_stream_expert_cache_eviction_heat(
          * the finite penalty makes all mature candidates win first. */
         return FLT_MAX / 4.0f;
     }
-    if (g_stream_expert_cache_decode_lru_policy_active) {
+    if (g_stream_expert_cache_decode_policy == DS4_DECODE_EVICTION_LRU) {
         return 0.0f;
     }
     return g_stream_expert_cache_route_hotness[layer][expert];
@@ -14730,7 +14729,8 @@ static int ds4_gpu_stream_expert_cache_entry_protected(
         ds4_gpu_stream_expert_cache_keep_hash_layer_zero()) {
         return 1;
     }
-    if (g_stream_expert_cache_previous_route_protection_active &&
+    if (g_stream_expert_cache_decode_policy ==
+            DS4_DECODE_EVICTION_PROBATION_LRU &&
         layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER &&
         expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT &&
         g_stream_expert_cache_previous_route_protected[layer][expert]) {
