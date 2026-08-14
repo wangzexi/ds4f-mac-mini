@@ -40,10 +40,11 @@ kv_cache_min_tokens=${DS4F_SERVER_KV_CACHE_MIN_TOKENS:-1}
 prefill_measurements=${DS4F_SERVER_PREFILL_MEASUREMENTS:-$project_dir/cache/prefill-measurements.tsv}
 preload_static_decode=${DS4F_SERVER_PRELOAD_STATIC_DECODE_TRUNK:-1}
 allow_shared_expert_sidecar=${DS4F_SERVER_ALLOW_SHARED_EXPERT_SIDECAR:-0}
-# Decode LRU has lower churn and removes the long-context in-flight wait
-# chain.  Its earlier 4K output difference was traced to chunked Prefill
-# itself: a repeat with the heat baseline diverged at the same second chunk.
-decode_eviction_policy=${DS4F_SERVER_DECODE_EVICTION_POLICY:-lru}
+# A newly read routed expert should survive until the next visit to its own
+# layer.  On the fixed 43-layer/6-expert Flash path that is one Decode token
+# (258 lookups).  Exact 64-token runs averaged 2.266 token/s, versus 2.239
+# for plain LRU; retaining two token cycles was slower (2.253 token/s).
+decode_eviction_policy=${DS4F_SERVER_DECODE_EVICTION_POLICY:-probation-lru}
 # Decode on the fixed M4 Mini is usually a 4--5 resident / 1--2 missing
 # expert mix.  With L2-after-L0 release, an interleaved 512-token/32-token
 # A/B sweep found two misses the repeatable optimum: 2.42 token/s median,
