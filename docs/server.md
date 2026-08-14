@@ -61,6 +61,14 @@ Decode 保持全局 `lru`。在每层同时有命中和 miss 时，默认至少�
 32-token 输出交错三次 A/B 中，阈值 2 的中位数为 2.42 token/s；阈值 1 为 2.40，
 阈值 3–6 为 2.38–2.41。所有配置的 greedy token trace 相同。
 
+同一会话的续写也有独立的 exact 路径：当 KV 命中后新增后缀不超过 18 token，
+它逐 token 使用 Decode 图，不重新激活 2.91GiB 的 batch Prefill workspace，因而
+保留已有的 967 槽 Decode 专家缓存。两轮真实聊天回归中，第二轮新增 10 token、
+生成 30 token 的 greedy trace 与响应 SHA-256 均和 layer-major 基线一致，时间由
+17.15/17.29s 降至 15.97/16.20s（约 6.5%）。43-token 后缀的同类尝试虽也保持
+严格一致，但 32.65/36.06/33.81s 没有稳定胜过 33.53s 的 batch 基线，因此固定
+阈值保持 18，不把 workspace/cache 的取舍交给通用运行时开关。
+
 默认还会在 `cache/kv/` 保留最多 10240MiB（10GiB）的磁盘 KV 前缀缓存。
 每次成功 response 已经发送给客户端后，server 同步保存当前完整 token frontier
 和对应 KV；下次请求会在磁盘条目中选择最长的文本前缀命中，只恢复该快照并
