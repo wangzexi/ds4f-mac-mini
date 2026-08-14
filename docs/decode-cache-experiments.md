@@ -291,3 +291,29 @@ is reducing the selected-slot loading and binding boundary itself without
 reintroducing the unsafe GPU-address-table lifetime behaviour.  The production
 Flash path already uses its exact CPU Router before this boundary, so it has no
 GPU Router-ID readback to remove.
+
+## Rejected Decode-only raw GPU address table
+
+The raw-address route was retested more narrowly in August 2026.  The server
+kept the established CPU Router and selected-slot cache, enabled only the
+Decode address kernels, and explicitly disabled the Prefill batch-address
+route.  A 32-token one-request test matched the complete baseline trace and
+reply SHA.  A real three-turn conversation (16 greedy tokens per turn, with
+the actual previous replies included in subsequent prompts) also happened to
+match with the default resident/missing split enabled.
+
+That was not sufficient evidence to enable it.  The timing report showed that
+the address route lowered ordinary selected binding from 15.19s to 4.36s over
+3,096 selections, but it also implicitly enabled 1,344 resident/missing split
+layers and introduced 11.05s of split waiting.  The apparent end-to-end gain
+was therefore not stable.
+
+Most importantly, after adding a test-only guard that genuinely disabled the
+Flash/IQ2 split path (`split_layers=0`), the same three-turn exact fixture
+diverged at token 4.  Its three responses had SHA-256 values
+`c2fb3881…`, `06c9c6bf…`, and `d7904de1…`, rather than the accepted trajectory.
+The faster-looking 9.227s / 9.762s / 9.738s timings are invalid and must not
+be used.  This isolates a remaining correctness fault in the raw address
+kernel/path itself, not merely an overlap or Prefill handoff race.  The whole
+raw-address route remains disabled in production; only the ordinary selected
+`MTLBuffer` bindings are exact.
