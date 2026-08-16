@@ -1,115 +1,84 @@
 # ds4f-mini
 
-## Local development, Mini execution
+面向 Apple M4 Mac mini 16 GiB 统一内存的 DeepSeek V4 Flash 0731 专用推理运行时。
 
-The source repository can live on the development Mac while the 77+ GiB model,
-packed experts, KV cache, builds, and inference remain on the M4 Mini. The
-local clone uses a Git remote named `mini` that points directly to
-`/Users/zexi/workspace/ds4f-mini` on the Mini.
+当前目标固定为：
 
-Use the repository-local helper from the development Mac:
+- 单会话；
+- 最大 32K 上下文；
+- 精确 CPU Router Top-6；
+- Metal 推理；
+- SSD 流式专家读取；
+- 独立的 Prefill 和 Decode 路径；
+- Q4 主干、IQ2/Q2 路由专家。
+
+本项目不追求通用硬件兼容，也不支持 Ollama、DSpark/MTP、CUDA/ROCm 或多模型自动调参。
+
+## 快速开始
+
+所有操作流程都写在 Skill 中：
+
+- [ds4f-mini-ops](agents/skills/ds4f-mini-ops/SKILL.md)：模型初始化、下载量化、启动、停止、重启、状态检查和回归测试。
+
+在开发 Mac 上操作 Mini：
 
 ```sh
-./mini status       # remote Git, process, memory, and API health
-./mini deploy       # push committed code and build remotely
-./mini test         # numerical regression with automatic service restore
-./mini restart      # restart and health-check the production API
-./mini ship         # deploy + regression + restart + health check
-./mini logs         # follow the production log
-./mini shell        # open a shell in the remote repository
+./agents/skills/ds4f-mini-ops/scripts/mini status
+./agents/skills/ds4f-mini-ops/scripts/mini start
 ```
 
-`push`, `deploy`, and `ship` intentionally require a clean local worktree.
-The Mini repository uses Git's `receive.denyCurrentBranch=updateInstead`, so a
-push updates its checked-out `main` branch but refuses to overwrite uncommitted
-remote changes. Model and cache paths are ignored by Git and never enter the
-local clone.
+明确需要重启时：
 
-`ds4f-mini` is a single-purpose DeepSeek V4 Flash 0731 inference runtime for
-an Apple M4 Mac mini with 16GB unified memory. It intentionally supports one
-model layout, one 32K context target, and the Metal SSD-streaming path only.
+```sh
+./agents/skills/ds4f-mini-ops/scripts/mini restart
+```
 
-The runtime source is vendored in `runtime/`; building and running do not
-clone, patch, copy, or link a separate DwarfStar checkout. The local
-`reference-*` directories are research material and are ignored by Git.
+模型构建、磁盘要求和断点续传说明见
+[ds4f-mini-ops Skill](agents/skills/ds4f-mini-ops/SKILL.md)。
 
-## Current model
+## 当前模型
 
-The deployed model is:
+Mini 上的模型文件为：
 
 ```text
 models/DeepSeek-V4-Flash-0731-Mini-Q4Trunk-IQ2Experts.gguf
 models/DeepSeek-V4-Flash-0731-IQ2Experts-packed.bin
 ```
 
-Its routed experts are unchanged from the verified DwarfStar template:
+当前部署模型是有损量化版本，不保证与 Q8 模型数值等价。
 
-- gate/up experts: IQ2_XXS
-- down experts: Q2_K
-- router: F16
-- normalization: F32
-
-The Mini variant changes 346 non-routed tensors to Q4_K: token embedding,
-five attention projections per layer, three shared-expert projections per
-layer, and the output projection. This saves 3.601GiB on disk. It is lossy:
-the Q4 model has a reproducible greedy-output divergence from the Q8 template,
-including the `深度求趣公司` hallucination for a fresh `你好` chat request.
-Do not describe the Q4 trunk as numerically equivalent to Q8.
-
-See [MODEL_BUILD.md](MODEL_BUILD.md) for the exact tensor contract and
-[docs/32k-q4-runtime.md](docs/32k-q4-runtime.md) for measured memory, quality,
-prefill, and decode results.
-
-## Build
+## 本地构建
 
 ```sh
 make
 ```
 
-This builds only the two supported executables:
+构建结果：
 
-- `ds4f-q4-speed`: fixed 32K greedy runner used for numerical and performance checks
-- `ds4f-server`: OpenAI-, Responses-, and Anthropic-compatible HTTP server
+- `ds4f-q4-speed`：固定运行器；
+- `ds4f-server`：HTTP server。
 
-The old self-written prototype graph was intentionally removed after its
-Metal path was shown to diverge numerically. Historical experiments remain in
-Git history and under `results/`; they are not deployment entry points.
+## API
 
-## Run
-
-Start the HTTP server:
-
-```sh
-scripts/run-server.sh
-```
-
-Run a one-shot exact prompt:
-
-```sh
-scripts/run-32k.sh '你好' 32
-```
-
-Run the deterministic token regression:
-
-```sh
-make check-production \
-  MODEL=models/DeepSeek-V4-Flash-0731-Mini-Q4Trunk-IQ2Experts.gguf
-```
-
-The server API and terminal-client examples are documented in
-[docs/server.md](docs/server.md).
-
-## Repository layout
+server 提供以下兼容接口：
 
 ```text
-runtime/   bundled Metal runtime and HTTP server
-src/       fixed one-shot runner adapter
-scripts/   production launch, model build, and regression scripts
-tools/     GGUF inventory, quantization, packing, and verification tools
-docs/      current runtime and server documentation
-results/   historical benchmark and quality evidence
-models/    local weights; ignored by Git
+GET  /v1/models
+POST /v1/chat/completions
+POST /v1/completions
+POST /v1/responses
+POST /v1/messages
 ```
 
-The supported path deliberately excludes Ollama, DSpark/MTP, CUDA/ROCm,
-multi-model compatibility, and general hardware auto-tuning.
+默认监听 Mini 的 `8000` 端口。服务没有身份验证，只应在可信局域网或 Tailscale
+网络中使用。
+
+## 目录
+
+```text
+agents/skills/  可执行的模型和服务流程
+src/runtime/    Metal 运行时和 HTTP server
+src/            固定运行器适配层
+agents/skills/  量化器源码、模型布局、专家打包和服务流程
+models/         本地模型权重，已被 Git 忽略
+```

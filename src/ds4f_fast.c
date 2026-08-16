@@ -55,7 +55,7 @@ static int enter_runtime_dir(const char *program) {
     char *slash = strrchr(executable, '/');
     if (!slash) return -1;
     *slash = '\0';
-    int written = snprintf(runtime_dir, sizeof(runtime_dir), "%s/runtime", executable);
+    int written = snprintf(runtime_dir, sizeof(runtime_dir), "%s/src/runtime", executable);
     if (written < 0 || (size_t)written >= sizeof(runtime_dir)) return -1;
     return chdir(runtime_dir);
 }

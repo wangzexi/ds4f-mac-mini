@@ -1,0 +1,203 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir=$(CDPATH= cd -- "$(dirname -- "$0")/../../../.." && pwd)
+mini_host=${DS4F_MINI_HOST:-mini}
+mini_repo=${DS4F_MINI_REPO:-/Users/zexi/workspace/ds4f-mini}
+mini_remote=${DS4F_MINI_REMOTE:-mini}
+production_log=${DS4F_MINI_LOG:-/tmp/ds4f-server-production.log}
+
+usage() {
+    cat <<'EOF'
+Usage: ./mini COMMAND
+
+Local development, remote M4 Mini execution:
+  push       Push the committed local HEAD to the Mini main branch
+  build      Build runner and server on the Mini
+  deploy     Push and build, without restarting the running server
+  start      Start the production server when it is stopped
+  test       Stop the server, run numerical regression, then restart it
+  restart    Restart the production server and verify /v1/models
+  stop       Stop the production server
+  ship       Push, build, test, restart, and verify the production server
+  status     Show Git, process, memory, and API status on the Mini
+  logs       Follow the production server log
+  shell      Open an interactive shell in the Mini repository
+
+Environment overrides:
+  DS4F_MINI_HOST       SSH host (default: mini)
+  DS4F_MINI_REPO       remote repository path
+  DS4F_MINI_REMOTE     local Git remote name (default: mini)
+  DS4F_MINI_LOG        remote production log path
+EOF
+}
+
+require_local_clean() {
+    if [[ -n $(git -C "$repo_dir" status --porcelain) ]]; then
+        echo "local repository has uncommitted changes; commit them before pushing" >&2
+        git -C "$repo_dir" status --short >&2
+        return 1
+    fi
+}
+
+push_code() {
+    require_local_clean
+    git -C "$repo_dir" push "$mini_remote" HEAD:main
+}
+
+remote_build() {
+    ssh "$mini_host" "cd '$mini_repo' && make all"
+}
+
+remote_stop() {
+    ssh "$mini_host" bash -s -- "$mini_repo" <<'REMOTE'
+set -euo pipefail
+repo=$1
+pids=$(pgrep -f "^${repo}/ds4f-server( |$)" || true)
+if [[ -z $pids ]]; then
+    echo "ds4f-server is not running"
+    exit 0
+fi
+for pid in $pids; do
+    kill -TERM "$pid"
+done
+for _ in $(seq 1 30); do
+    alive=0
+    for pid in $pids; do
+        if kill -0 "$pid" 2>/dev/null; then alive=1; fi
+    done
+    if [[ $alive -eq 0 ]]; then
+        echo "ds4f-server stopped: $pids"
+        exit 0
+    fi
+    sleep 1
+done
+echo "ds4f-server did not stop within 30 seconds: $pids" >&2
+exit 1
+REMOTE
+}
+
+remote_start() {
+    ssh "$mini_host" bash -s -- "$mini_repo" "$production_log" <<'REMOTE'
+set -euo pipefail
+repo=$1
+log=$2
+if pgrep -f "^${repo}/ds4f-server( |$)" >/dev/null; then
+    echo "ds4f-server is already running" >&2
+    exit 1
+fi
+cd "$repo"
+nohup agents/skills/ds4f-mini-ops/scripts/run-server.sh >"$log" 2>&1 </dev/null &
+pid=$!
+echo "$pid" >/tmp/ds4f-server-production.pid
+for _ in $(seq 1 120); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "ds4f-server exited during startup" >&2
+        tail -80 "$log" >&2
+        exit 1
+    fi
+    if curl -fsS http://127.0.0.1:8000/v1/models >/dev/null 2>&1; then
+        echo "ds4f-server ready: pid=$pid"
+        grep -E "startup hash layer 0 preloaded|listening on" "$log" | tail -2
+        exit 0
+    fi
+    sleep 1
+done
+echo "ds4f-server did not become healthy within 120 seconds" >&2
+tail -80 "$log" >&2
+exit 1
+REMOTE
+}
+
+remote_restart() {
+    remote_stop
+    remote_start
+}
+
+remote_regression() {
+    ssh "$mini_host" \
+        "cd '$mini_repo' && make check-production MODEL=models/DeepSeek-V4-Flash-0731-Mini-Q4Trunk-IQ2Experts.gguf"
+}
+
+test_and_restore_service() {
+    remote_stop
+    local rc=0
+    remote_regression || rc=$?
+    remote_start || {
+        echo "warning: regression finished but production restart failed" >&2
+        return 1
+    }
+    return "$rc"
+}
+
+remote_status() {
+    ssh "$mini_host" bash -s -- "$mini_repo" <<'REMOTE'
+set -euo pipefail
+repo=$1
+echo "repository: $repo"
+git -C "$repo" status --short
+git -C "$repo" log -1 --oneline
+echo
+pids=$(pgrep -f "^${repo}/ds4f-server( |$)" || true)
+if [[ -z $pids ]]; then
+    echo "server: stopped"
+else
+    echo "server: running"
+    ps -o pid,%cpu,rss,vsz,etime,command -p $(echo "$pids" | tr '\n' ',')
+fi
+echo
+if curl -fsS http://127.0.0.1:8000/v1/models; then
+    echo
+else
+    echo "API: unavailable"
+fi
+REMOTE
+}
+
+command=${1:-help}
+case "$command" in
+    push|sync)
+        push_code
+        ;;
+    build)
+        remote_build
+        ;;
+    deploy)
+        push_code
+        remote_build
+        ;;
+    start)
+        remote_start
+        ;;
+    test)
+        test_and_restore_service
+        ;;
+    restart)
+        remote_restart
+        ;;
+    stop)
+        remote_stop
+        ;;
+    ship)
+        push_code
+        remote_build
+        test_and_restore_service
+        ;;
+    status)
+        remote_status
+        ;;
+    logs)
+        exec ssh -t "$mini_host" "tail -n 100 -F '$production_log'"
+        ;;
+    shell)
+        exec ssh -t "$mini_host" "cd '$mini_repo' && exec \${SHELL:-/bin/zsh} -l"
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        echo "unknown command: $command" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
