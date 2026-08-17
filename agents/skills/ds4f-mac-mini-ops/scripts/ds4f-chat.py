@@ -271,7 +271,7 @@ def run(args: argparse.Namespace) -> int:
     print("输入: /help 查看命令")
     while True:
         try:
-            prompt = input("\n").strip()
+            prompt = input("\n> ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
