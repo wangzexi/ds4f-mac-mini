@@ -268,7 +268,7 @@ def run(args: argparse.Namespace) -> int:
 
     print(
         f"{args.base_url.rstrip('/')}/v1/chat/completions  |  "
-        "DeepSeek V4 Flash 0731"
+        "DeepSeek V4 Flash 0731-Q4K-IQ2XXS-Q2K"
     )
     print("输入 /help 查看命令")
     while True:
