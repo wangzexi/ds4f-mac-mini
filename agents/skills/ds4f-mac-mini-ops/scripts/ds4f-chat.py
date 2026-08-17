@@ -175,23 +175,14 @@ def print_stats(usage: dict[str, Any]) -> None:
                 isinstance(decode_tokens, int)):
             prefill_rate = prefill_tokens / prefill_seconds
             decode_rate = decode_tokens / decode_seconds if decode_tokens > 0 else 0.0
-            print(
-                f"\n[完成 {tokens} tokens, 总耗时 {elapsed:.2f}s, "
-                f"prefill {prefill_tokens} tokens/{prefill_seconds:.2f}s = "
-                f"{prefill_rate:.2f} token/s, "
-                f"decode {decode_tokens} tokens/{decode_seconds:.2f}s = "
-                f"{decode_rate:.2f} token/s, 请求平均 {rate:.2f} token/s]"
-            )
+            print(f"\n[Prefill {prefill_rate:.2f} token/s, Decode {decode_rate:.2f} token/s]")
             return
     first = usage.get("first_token_seconds")
     if isinstance(first, (float, int)) and tokens > 1 and elapsed > first:
         decode_rate = (tokens - 1) / (elapsed - first)
-        print(
-            f"\n[完成 {tokens} tokens, 总耗时 {elapsed:.2f}s, "
-            f"请求平均 {rate:.2f} token/s, 首 token 后解码估算 {decode_rate:.2f} token/s]"
-        )
+        print(f"\n[Prefill N/A, Decode {decode_rate:.2f} token/s]")
     else:
-        print(f"\n[完成 {tokens} tokens, {elapsed:.2f}s, {rate:.2f} token/s]")
+        print(f"\n[Prefill N/A, Decode {rate:.2f} token/s]")
 
 
 def print_help() -> None:
