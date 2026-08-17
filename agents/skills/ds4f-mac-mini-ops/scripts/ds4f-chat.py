@@ -6,8 +6,9 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import time
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -52,6 +53,34 @@ def error_text(exc: Exception) -> str:
     return str(exc)
 
 
+class Spinner:
+    """Show a small typing indicator until the first response text arrives."""
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _run(self) -> None:
+        frames = (".  ", ".. ", "...")
+        index = 0
+        while not self._stop.is_set():
+            sys.stdout.write(f"\r模型> {frames[index % len(frames)]}")
+            sys.stdout.flush()
+            index += 1
+            self._stop.wait(0.35)
+
+    def stop(self) -> None:
+        if self._stop.is_set():
+            return
+        self._stop.set()
+        self._thread.join()
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
+
+
 def chat_once(
     base_url: str,
     model: str,
@@ -62,6 +91,7 @@ def chat_once(
     timeout: float,
     stream: bool,
     api_key: str,
+    on_first_text: Callable[[], None] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     payload: dict[str, Any] = {
         "model": model,
@@ -117,6 +147,8 @@ def chat_once(
                 parts.append(text)
                 if first_text_at is None:
                     first_text_at = time.monotonic()
+                    if on_first_text is not None:
+                        on_first_text()
                 sys.stdout.write(text)
                 sys.stdout.flush()
     usage["elapsed_seconds"] = time.monotonic() - started
@@ -158,7 +190,14 @@ def run(args: argparse.Namespace) -> int:
 
     def send(prompt: str) -> None:
         messages.append({"role": "user", "content": prompt})
-        print("模型> ", end="", flush=True)
+        spinner = Spinner()
+
+        def on_first_text() -> None:
+            spinner.stop()
+            sys.stdout.write("模型> ")
+            sys.stdout.flush()
+
+        spinner.start()
         try:
             content, usage = chat_once(
                 args.base_url,
@@ -170,13 +209,19 @@ def run(args: argparse.Namespace) -> int:
                 args.timeout,
                 stream,
                 args.api_key,
+                on_first_text if stream else None,
             )
         except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
             messages.pop()
+            spinner.stop()
             print(f"\n错误: {error_text(exc)}", file=sys.stderr)
             return
+        finally:
+            # If the server returns no text, the first-text callback never
+            # stops the indicator.
+            spinner.stop()
         if not stream:
-            print(content, end="")
+            print(f"模型> {content}", end="")
         print()
         messages.append({"role": "assistant", "content": content})
         print_stats(usage)
