@@ -184,7 +184,6 @@ run_server() {
         --kv-cache-min-tokens "$kv_cache_min_tokens"
         --kv-cache-cold-max-tokens 0
         --kv-cache-continued-interval-tokens 0
-        --batched-session 1
         --host "$host"
         --port "$port"
         --cors
