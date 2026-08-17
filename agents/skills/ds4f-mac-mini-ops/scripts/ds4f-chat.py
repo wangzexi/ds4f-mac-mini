@@ -184,7 +184,34 @@ def print_help() -> None:
     print("本客户端不添加默认 system prompt。")
 
 
+def configure_readline() -> None:
+    """Keep Backspace and the macOS Delete key working at end-of-line."""
+    try:
+        import readline
+    except ImportError:
+        return
+    if "libedit" in (readline.__doc__ or "").lower():
+        bindings = (
+            r'bind -e',
+            r'bind "\e[3~" ed-delete-next-char',
+            r'bind "^?" ed-delete-prev-char',
+            r'bind "^H" ed-delete-prev-char',
+        )
+    else:
+        bindings = (
+            r'"\e[3~": delete-char',
+            r'"\C-?": backward-delete-char',
+            r'"\C-h": backward-delete-char',
+        )
+    for binding in bindings:
+        try:
+            readline.parse_and_bind(binding)
+        except (ValueError, RuntimeError):
+            pass
+
+
 def run(args: argparse.Namespace) -> int:
+    configure_readline()
     messages: list[dict[str, str]] = []
     stream = not args.no_stream
 
