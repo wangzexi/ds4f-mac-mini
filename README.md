@@ -78,6 +78,9 @@ POST /v1/messages
 
 默认监听 `0.0.0.0:8000`。服务没有身份验证，公开部署前请自行配置网络隔离。
 
+终端连续对话可直接运行
+`python3 agents/skills/ds4f-mac-mini-ops/scripts/ds4f-chat.py --base-url http://mini:8000`。
+
 ## 目录
 
 ```text

@@ -94,6 +94,23 @@ Skill 启动命令固定启用 `--ssd-streaming`：Metal 主路径只保留 GGUF
 curl -fsS http://127.0.0.1:8000/v1/models
 ```
 
+在本机终端进行连续对话（只使用 Python 标准库，不注入默认 system prompt）：
+
+```sh
+python3 agents/skills/ds4f-mac-mini-ops/scripts/ds4f-chat.py \
+  --base-url http://127.0.0.1:8000
+```
+
+如果 server 在局域网里的 Mini 上运行，把地址改成 Mini 的地址：
+
+```sh
+python3 agents/skills/ds4f-mac-mini-ops/scripts/ds4f-chat.py \
+  --base-url http://mini:8000
+```
+
+支持 `/new` 开始新对话、`/stream on|off` 切换流式输出、`/max_tokens N` 调整输出上限，
+`/quit` 退出。也可以用 `--prompt "你好"` 做一次性请求。
+
 运行一次固定 runner：
 
 ```sh
