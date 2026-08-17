@@ -163,6 +163,26 @@ def print_stats(usage: dict[str, Any]) -> None:
     if not isinstance(tokens, int) or not isinstance(elapsed, (float, int)):
         return
     rate = tokens / elapsed if elapsed > 0 else 0.0
+    timing = usage.get("ds4_timing")
+    if isinstance(timing, dict):
+        prefill_seconds = timing.get("prefill_seconds")
+        prefill_tokens = timing.get("prefill_tokens")
+        decode_seconds = timing.get("decode_seconds")
+        decode_tokens = timing.get("decode_tokens")
+        if (isinstance(prefill_seconds, (float, int)) and prefill_seconds > 0 and
+                isinstance(prefill_tokens, int) and
+                isinstance(decode_seconds, (float, int)) and decode_seconds > 0 and
+                isinstance(decode_tokens, int)):
+            prefill_rate = prefill_tokens / prefill_seconds
+            decode_rate = decode_tokens / decode_seconds if decode_tokens > 0 else 0.0
+            print(
+                f"\n[完成 {tokens} tokens, 总耗时 {elapsed:.2f}s, "
+                f"prefill {prefill_tokens} tokens/{prefill_seconds:.2f}s = "
+                f"{prefill_rate:.2f} token/s, "
+                f"decode {decode_tokens} tokens/{decode_seconds:.2f}s = "
+                f"{decode_rate:.2f} token/s, 请求平均 {rate:.2f} token/s]"
+            )
+            return
     first = usage.get("first_token_seconds")
     if isinstance(first, (float, int)) and tokens > 1 and elapsed > first:
         decode_rate = (tokens - 1) / (elapsed - first)

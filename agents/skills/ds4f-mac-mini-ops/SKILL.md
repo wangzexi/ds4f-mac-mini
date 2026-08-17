@@ -109,7 +109,8 @@ python3 agents/skills/ds4f-mac-mini-ops/scripts/ds4f-chat.py \
 ```
 
 支持 `/new` 开始新对话、`/stream on|off` 切换流式输出、`/max_tokens N` 调整输出上限，
-`/quit` 退出。也可以用 `--prompt "你好"` 做一次性请求。
+`/quit` 退出。也可以用 `--prompt "你好"` 做一次性请求。每轮结束会显示 server 实测的
+Prefill 与 Decode 两段 token/s；Prefill 只统计本轮未命中 KV、实际新增计算的 token。
 
 运行一次固定 runner：
 

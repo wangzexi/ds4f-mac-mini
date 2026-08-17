@@ -80,6 +80,8 @@ POST /v1/messages
 
 终端连续对话可直接运行
 `python3 agents/skills/ds4f-mac-mini-ops/scripts/ds4f-chat.py --base-url http://mini:8000`。
+每轮结束会显示 server 实测的 Prefill 与 Decode 两段 token/s；Prefill 只统计本轮未命中
+KV、实际新增计算的 token。
 
 ## 目录
 

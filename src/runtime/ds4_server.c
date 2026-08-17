@@ -668,6 +668,12 @@ typedef struct {
     bool stream_include_usage;
     int cache_read_tokens;
     int cache_write_tokens;
+    /* Server-side phase timings exposed as the ds4_timing usage extension. */
+    double prefill_seconds;
+    double decode_seconds;
+    int prefill_timing_tokens;
+    int decode_timing_tokens;
+    bool timing_valid;
     ds4_think_mode think_mode;
     bool has_tools;
     bool prompt_preserves_reasoning;
@@ -5564,6 +5570,17 @@ static int clamp_usage_tokens(int value, int max) {
     return value;
 }
 
+static void append_ds4_timing_json(buf *b, const request *r) {
+    if (!b || !r || !r->timing_valid) return;
+    buf_printf(b,
+               ",\"ds4_timing\":{\"prefill_seconds\":%.6f,\"prefill_tokens\":%d,"
+               "\"decode_seconds\":%.6f,\"decode_tokens\":%d}",
+               r->prefill_seconds,
+               r->prefill_timing_tokens,
+               r->decode_seconds,
+               r->decode_timing_tokens);
+}
+
 static void append_openai_usage_json(buf *b, const request *r,
                                      int prompt_tokens, int completion_tokens) {
     int cached_tokens = r ? r->cache_read_tokens : 0;
@@ -5576,9 +5593,11 @@ static void append_openai_usage_json(buf *b, const request *r,
      * cache hits. */
     buf_printf(b,
                "{\"prompt_tokens\":%d,\"completion_tokens\":%d,\"total_tokens\":%d,"
-               "\"prompt_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d}}",
+               "\"prompt_tokens_details\":{\"cached_tokens\":%d,\"cache_write_tokens\":%d}",
                prompt_tokens, completion_tokens, prompt_tokens + completion_tokens,
                cached_tokens, cache_write_tokens);
+    append_ds4_timing_json(b, r);
+    buf_putc(b, '}');
 }
 
 static bool sse_usage_chunk(int fd, const request *r, const char *id,
@@ -11968,6 +11987,8 @@ static void generate_job(server *s, server_slot *slot, job *j) {
         ds4_gpu_stream_expert_cache_residency_profile_print_prefill();
     }
     server_memory_plan_finish_prefill(s, slot, &memory_plan);
+    j->req.prefill_seconds = now_sec() - t0;
+    j->req.prefill_timing_tokens = j->req.cache_write_tokens;
     free(disk_cache_path);
     /* Once a non-live request wins, old protocol live bindings are stale. Keep
      * a binding only when this request explicitly continued from it. */
@@ -12369,6 +12390,10 @@ decode_again:
         if (stop_decode) break;
     }
     server_generation_leave(s);
+
+    j->req.decode_seconds = now_sec() - decode_t0;
+    j->req.decode_timing_tokens = completion;
+    j->req.timing_valid = true;
 
     if (job_client_disconnected(j)) {
         server_log(DS4_LOG_GENERATION,
