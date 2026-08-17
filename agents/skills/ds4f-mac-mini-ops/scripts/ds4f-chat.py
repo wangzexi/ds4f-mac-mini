@@ -67,7 +67,7 @@ class Spinner:
         frames = (".  ", ".. ", "...")
         index = 0
         while not self._stop.is_set():
-            sys.stdout.write(f"\r模型> {frames[index % len(frames)]}")
+            sys.stdout.write(f"\r{frames[index % len(frames)]}")
             sys.stdout.flush()
             index += 1
             self._stop.wait(0.35)
@@ -192,7 +192,6 @@ def print_help() -> None:
     print("/stream on|off   开关流式输出")
     print("/history         显示当前消息数量")
     print("/quit            退出")
-    print("本客户端不添加默认 system prompt。")
 
 
 def configure_readline() -> None:
@@ -232,7 +231,6 @@ def run(args: argparse.Namespace) -> int:
 
         def on_first_text() -> None:
             spinner.stop()
-            sys.stdout.write("模型> ")
             sys.stdout.flush()
 
         spinner.start()
@@ -259,7 +257,7 @@ def run(args: argparse.Namespace) -> int:
             # stops the indicator.
             spinner.stop()
         if not stream:
-            print(f"模型> {content}", end="")
+            print(content, end="")
         print()
         messages.append({"role": "assistant", "content": content})
         print_stats(usage)
@@ -268,11 +266,12 @@ def run(args: argparse.Namespace) -> int:
         send(args.prompt)
         return 0
 
-    print(f"连接: {args.base_url}  模型: {args.model}")
-    print("输入 /help 查看命令；没有默认 system prompt。")
+    print(f"连接: {args.base_url}")
+    print(f"模型: {args.model}")
+    print("输入: /help 查看命令")
     while True:
         try:
-            prompt = input("\n你> ").strip()
+            prompt = input("\n").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
