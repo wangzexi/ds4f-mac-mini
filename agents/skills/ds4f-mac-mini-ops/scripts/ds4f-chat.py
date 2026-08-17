@@ -266,8 +266,11 @@ def run(args: argparse.Namespace) -> int:
         send(args.prompt)
         return 0
 
-    print(f"连接: {args.base_url.rstrip('/')}/v1/chat/completions")
-    print(f"模型: {args.model}")
+    print(
+        f"接口: {args.base_url.rstrip('/')}/v1/chat/completions  |  "
+        "模型: DeepSeek V4 Flash 0731\n"
+        "量化: Q4 主干 + Q2 专家"
+    )
     print("输入: /help 查看命令")
     while True:
         try:
