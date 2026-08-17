@@ -71,6 +71,9 @@ def chat_once(
         "top_p": top_p,
         "stream": stream,
     }
+    if stream:
+        # ds4f-server emits a final usage-only SSE event for this option.
+        payload["stream_options"] = {"include_usage": True}
     request = Request(
         f"{base_url.rstrip('/')}/v1/chat/completions",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -90,6 +93,7 @@ def chat_once(
 
     parts: list[str] = []
     usage: dict[str, Any] = {}
+    first_text_at: float | None = None
     with urlopen(request, timeout=timeout) as response:
         for raw_line in response:
             line = raw_line.decode("utf-8", errors="replace").strip()
@@ -111,9 +115,13 @@ def chat_once(
             text = delta.get("content") or ""
             if text:
                 parts.append(text)
+                if first_text_at is None:
+                    first_text_at = time.monotonic()
                 sys.stdout.write(text)
                 sys.stdout.flush()
     usage["elapsed_seconds"] = time.monotonic() - started
+    if first_text_at is not None:
+        usage["first_token_seconds"] = first_text_at - started
     return "".join(parts), usage
 
 
@@ -123,7 +131,15 @@ def print_stats(usage: dict[str, Any]) -> None:
     if not isinstance(tokens, int) or not isinstance(elapsed, (float, int)):
         return
     rate = tokens / elapsed if elapsed > 0 else 0.0
-    print(f"\n[完成 {tokens} tokens, {elapsed:.2f}s, {rate:.2f} token/s]")
+    first = usage.get("first_token_seconds")
+    if isinstance(first, (float, int)) and tokens > 1 and elapsed > first:
+        decode_rate = (tokens - 1) / (elapsed - first)
+        print(
+            f"\n[完成 {tokens} tokens, 总耗时 {elapsed:.2f}s, "
+            f"请求平均 {rate:.2f} token/s, 首 token 后解码估算 {decode_rate:.2f} token/s]"
+        )
+    else:
+        print(f"\n[完成 {tokens} tokens, {elapsed:.2f}s, {rate:.2f} token/s]")
 
 
 def print_help() -> None:
