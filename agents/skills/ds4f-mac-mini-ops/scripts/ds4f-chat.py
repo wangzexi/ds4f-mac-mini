@@ -266,7 +266,7 @@ def run(args: argparse.Namespace) -> int:
         send(args.prompt)
         return 0
 
-    print(f"连接: {args.base_url}")
+    print(f"连接: {args.base_url.rstrip('/')}/v1/chat/completions")
     print(f"模型: {args.model}")
     print("输入: /help 查看命令")
     while True:
