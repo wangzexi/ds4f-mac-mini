@@ -297,16 +297,6 @@ int ds4_gpu_stream_expert_cache_seed_experts(
         const uint32_t                    *expert_priorities,
         uint32_t                           n_experts);
 #ifdef __APPLE__
-/* Prefill-only full/partial layer staging. The payload remains in one packed
- * shared Metal buffer and is published only when its layer is reached. */
-int ds4_gpu_stream_expert_layer_prefetch_begin(
-        const ds4_gpu_stream_expert_table *table,
-        const int32_t                     *expert_ids,
-        uint32_t                           n_experts,
-        uint32_t                           protect_layer);
-int ds4_gpu_stream_expert_layer_prefetch_activate(
-        const ds4_gpu_stream_expert_table *table);
-void ds4_gpu_stream_expert_layer_prefetch_cancel_all(void);
 void ds4_gpu_stream_expert_cache_release_layer(uint32_t layer);
 /* Diagnostic Prefill scheduling override: bypass the L0 keep policy after
  * an exact layer boundary.  This never alters expert payload or math. */

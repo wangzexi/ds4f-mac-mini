@@ -1,6 +1,9 @@
-# ds4f-mini
+# ds4f-mac-mini
 
-面向 Apple M4 Mac mini 16 GiB 统一内存的 DeepSeek V4 Flash 0731 专用推理运行时。
+面向 Apple Silicon 统一内存设备的 DeepSeek V4 Flash 0731 专用推理运行时；支持
+16 GiB 及以上统一内存。16 GiB 是最低内存配置，也是当前已完成实机验证的基线；
+启动脚本会根据 Metal 设备的推荐工作集自动扩大专家缓存，更大内存通常会自然获得
+更大的缓存预算。当前没有对每种芯片和内存容量分别做性能验证。
 
 当前目标固定为：
 
@@ -18,34 +21,37 @@
 
 所有操作流程都写在 Skill 中：
 
-- [ds4f-mini-ops](agents/skills/ds4f-mini-ops/SKILL.md)：模型初始化、下载量化、启动、停止、重启、状态检查和回归测试。
+- [ds4f-mac-mini-ops](agents/skills/ds4f-mac-mini-ops/SKILL.md)：模型初始化、下载量化、本地构建、启动和回归测试。
 
-在开发 Mac 上操作 Mini：
+构建运行时：
 
 ```sh
-./agents/skills/ds4f-mini-ops/scripts/mini status
-./agents/skills/ds4f-mini-ops/scripts/mini start
+make
 ```
 
-明确需要重启时：
+启动本地服务时，通过环境变量指定模型：
 
 ```sh
-./agents/skills/ds4f-mini-ops/scripts/mini restart
+DS4F_SERVER_MODEL=/path/to/DeepSeek-V4-Flash-0731-Q4.gguf \
+./agents/skills/ds4f-mac-mini-ops/scripts/ds4f-cli server
 ```
 
 模型构建、磁盘要求和断点续传说明见
-[ds4f-mini-ops Skill](agents/skills/ds4f-mini-ops/SKILL.md)。
+[ds4f-mac-mini-ops Skill](agents/skills/ds4f-mac-mini-ops/SKILL.md)。
 
 ## 当前模型
 
-Mini 上的模型文件为：
+模型文件示例：
 
 ```text
-models/DeepSeek-V4-Flash-0731-Mini-Q4Trunk-IQ2Experts.gguf
-models/DeepSeek-V4-Flash-0731-IQ2Experts-packed.bin
+models/DeepSeek-V4-Flash-0731-Q4.gguf
 ```
 
 当前部署模型是有损量化版本，不保证与 Q8 模型数值等价。
+
+Metal 的 SSD 流式路径只在启动时用 `pread` 读取 GGUF 元数据；模型权重由运行时按
+调度计划显式 `pread` 到 Metal buffer，不使用权重 payload 的 `mmap`、缺页读取或系统
+预读。推荐始终通过 Skill 启动，它会自动带上 `--ssd-streaming`。
 
 ## 本地构建
 
@@ -70,15 +76,12 @@ POST /v1/responses
 POST /v1/messages
 ```
 
-默认监听 Mini 的 `8000` 端口。服务没有身份验证，只应在可信局域网或 Tailscale
-网络中使用。
+默认监听 `0.0.0.0:8000`。服务没有身份验证，公开部署前请自行配置网络隔离。
 
 ## 目录
 
 ```text
-agents/skills/  可执行的模型和服务流程
-src/runtime/    Metal 运行时和 HTTP server
-src/            固定运行器适配层
-agents/skills/  量化器源码、模型布局、专家打包和服务流程
+agents/skills/  模型初始化、量化器和服务流程
+src/            固定运行器与 Metal runtime/server
 models/         本地模型权重，已被 Git 忽略
 ```

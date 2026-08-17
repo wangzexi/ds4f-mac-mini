@@ -8544,6 +8544,16 @@ static uint64_t server_env_mib(const char *name, uint64_t fallback_mib) {
     return (uint64_t)mib * 1024ull * 1024ull;
 }
 
+static uint64_t server_default_working_set_mib(ds4_backend backend) {
+    const uint64_t mib = 1024ull * 1024ull;
+    if (backend == DS4_BACKEND_METAL) {
+        const uint64_t recommended = ds4_gpu_recommended_working_set_size();
+        if (recommended >= mib) return recommended / mib;
+    }
+    /* Conservative fallback for non-Metal builds and older Metal devices. */
+    return 11776ull;
+}
+
 static uint64_t server_add_sat_u64(uint64_t a, uint64_t b) {
     return a > UINT64_MAX - b ? UINT64_MAX : a + b;
 }
@@ -8662,7 +8672,7 @@ static server_request_memory_plan server_build_request_memory_plan(
                 workspace_owner_bytes :
                 DS4_SERVER_SMALL_PREFILL_RESIDENT_BYTES;
     } else {
-        /* M4/Flash-0731 calibration: at 19 rows Metal switches to the full
+        /* 16 GiB Flash-0731 calibration: at 19 rows Metal switches to the full
          * batched path. Price the exact owner-backed workspace allocation,
          * not a multiplier of logical graph bytes. */
         plan.prefill_workspace_bytes = workspace_owner_bytes != 0 ?
@@ -8674,7 +8684,7 @@ static server_request_memory_plan server_build_request_memory_plan(
             &plan.prefill,
             plan.prefill_workspace_bytes);
     /*
-     * Fixed M4/16GB + Flash-0731 policy: a batched Prefill has a known
+     * Flash-0731/16 GiB baseline policy: a batched Prefill has a known
      * whole-expert-layer path.  It becomes a real SSD/GPU pipeline only when
      * two complete 256-expert layers fit at once.  The normal 512 MiB reserve
      * leaves a 1.9K-token prompt at 502 slots and forces alternating layers.
@@ -13739,8 +13749,10 @@ int main(int argc, char **argv) {
     s.memory_calibration =
         memory_calibration && memory_calibration[0] &&
         strcmp(memory_calibration, "0") != 0;
+    const uint64_t default_working_set_mib =
+        server_default_working_set_mib(cfg.engine.backend);
     s.memory_working_set_bytes =
-        server_env_mib("DS4_SERVER_WORKING_SET_MIB", 11776);
+        server_env_mib("DS4_SERVER_WORKING_SET_MIB", default_working_set_mib);
     s.memory_prefill_pinned_bytes =
         server_env_mib("DS4_SERVER_PINNED_MIB", 4096);
     s.memory_decode_pinned_bytes =
@@ -13749,8 +13761,9 @@ int main(int argc, char **argv) {
         server_env_mib("DS4_SERVER_MEMORY_RESERVE_MIB", 512);
     if (s.dynamic_memory_planner) {
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: per-request memory planner enabled working_set=%.2f GiB prefill_lock_budget=%.2f GiB decode_lock_budget=%.2f GiB reserve=%.2f GiB small_prefill_rows=%u small_prefill_resident=%.2f MiB",
+                   "ds4-server: per-request memory planner enabled working_set=%.2f GiB%s prefill_lock_budget=%.2f GiB decode_lock_budget=%.2f GiB reserve=%.2f GiB small_prefill_rows=%u small_prefill_resident=%.2f MiB",
                    (double)s.memory_working_set_bytes / 1073741824.0,
+                   getenv("DS4_SERVER_WORKING_SET_MIB") ? " (override)" : " (Metal recommended)",
                    (double)s.memory_prefill_pinned_bytes / 1073741824.0,
                    (double)s.memory_decode_pinned_bytes / 1073741824.0,
                    (double)s.memory_reserve_bytes / 1073741824.0,
@@ -13804,7 +13817,7 @@ int main(int argc, char **argv) {
                    "ds4-server: hash layer 0 startup preload unavailable; continuing with exact synchronous fallback");
     }
 
-    /* This launcher has one active session and a fixed 16 GiB machine.  When
+    /* This launcher has one active session and a 16 GiB baseline machine.  When
      * enabled, make server-ready mean both L0 and the Decode static trunk are
      * resident.  The request planner sees this map and reduces its Prefill
      * expert-cache budget before the first prompt, so this is not an

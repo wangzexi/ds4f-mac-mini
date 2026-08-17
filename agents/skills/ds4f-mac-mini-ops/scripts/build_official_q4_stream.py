@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Build the official 0731 Q4/IQ2/Q2 model with one HF shard at a time.
+"""Build the official 0731 Q4 model with one HF shard at a time.
 
 The C quantizer owns the tensor mapping and writes selected tensor payloads at
-their final GGUF offsets.  This driver downloads only the shard group required
-for the current tensor group, quantizes it, records a checkpoint, and removes
-the source shard before continuing.  The final expert sidecar is built from
-the completed GGUF, so the official safetensors never need to coexist with it.
+ their final GGUF offsets.  This driver downloads only the shard group required
+ for the current tensor group, quantizes it, records a checkpoint, and removes
+ the source shard before continuing.  The result is one self-contained GGUF file.
 """
 
 from __future__ import annotations
@@ -14,7 +13,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -162,13 +160,6 @@ def parse_kv(output: str, key: str) -> str:
     die(f"quantizer output has no {key}")
 
 
-def parse_equals(output: str, key: str) -> int:
-    match = re.search(rf"\b{re.escape(key)}=(\d+)", output)
-    if not match:
-        die(f"command output has no {key}=... field")
-    return int(match.group(1))
-
-
 def read_stream_plan(args: argparse.Namespace, output: Path) -> list[tuple[int, str, tuple[str, ...]]]:
     output_text = run_checked(qargs(args, out=output) + ["--stream-plan"], capture=True)
     rows: list[tuple[int, str, tuple[str, ...]]] = []
@@ -246,22 +237,17 @@ def atomic_json_write(path: Path, value: object) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    project_dir = Path(__file__).resolve().parents[4]
     skill_dir = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo", default=DEFAULT_REPO)
     parser.add_argument("--revision", default=DEFAULT_REVISION)
     parser.add_argument("--staging", type=Path, default=Path("official-hf-staging"))
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--pack-out", type=Path)
     parser.add_argument("--layout", type=Path, default=skill_dir / "assets/deepseek-v4-flash-0731.layout.gguf")
     parser.add_argument("--quantizer", type=Path, required=True)
-    parser.add_argument("--pack-script", type=Path, default=skill_dir / "scripts/build_expert_pack.py")
-    parser.add_argument("--python", default=sys.executable)
     parser.add_argument("--imatrix", type=Path)
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--keep-shards", action="store_true")
-    parser.add_argument("--no-pack", action="store_true")
     parser.add_argument("--reset", action="store_true", help="remove only this build's checkpoint and output before starting")
     return parser.parse_args()
 
@@ -272,22 +258,17 @@ def main() -> None:
     args.out = args.out.resolve()
     args.layout = args.layout.resolve()
     args.quantizer = args.quantizer.resolve()
-    args.pack_script = args.pack_script.resolve()
-    if args.pack_out is None:
-        args.pack_out = args.out.with_name(args.out.stem + "-IQ2Experts-packed.bin")
-    args.pack_out = args.pack_out.resolve()
     token = os.environ.get("HF_TOKEN")
 
     if not args.layout.is_file():
         die(f"missing layout manifest: {args.layout}")
     if not args.quantizer.is_file() or not os.access(args.quantizer, os.X_OK):
         die(f"quantizer is not executable: {args.quantizer}")
-    if not args.pack_script.is_file() and not args.no_pack:
-        die(f"missing expert pack script: {args.pack_script}")
     args.staging.mkdir(parents=True, exist_ok=True)
+    args.out.parent.mkdir(parents=True, exist_ok=True)
     state_path = args.out.with_name(args.out.name + ".stream-state.json")
     if args.reset:
-        for path in (state_path, args.out, args.pack_out):
+        for path in (state_path, args.out):
             if path.exists():
                 path.unlink()
 
@@ -347,24 +328,15 @@ def main() -> None:
     elif args.out.stat().st_size != expected_gguf:
         die(f"initialized output size mismatch: got {args.out.stat().st_size}, expected {expected_gguf}")
 
-    expected_pack = 0
-    if not args.no_pack:
-        pack_plan = run_checked(
-            [args.python, str(args.pack_script), str(args.out), str(args.pack_out), "--dry-run"],
-            capture=True,
-        )
-        expected_pack = parse_equals(pack_plan, "bytes")
     free_bytes = shutil.disk_usage(args.staging).free
     reserve_bytes = int(os.environ.get("DS4F_STREAM_TEMP_RESERVE_BYTES", str(6 * 1024**3)))
-    missing_pack = 0 if args.pack_out.exists() and args.pack_out.stat().st_size == expected_pack else expected_pack
-    if free_bytes < missing_pack + reserve_bytes:
+    if free_bytes < reserve_bytes:
         die(
             f"insufficient free space on staging volume: free={free_bytes} "
-            f"need_at_least={missing_pack + reserve_bytes}"
+            f"need_at_least={reserve_bytes}"
         )
     print(
-        f"disk preflight: free={free_bytes} reserve={reserve_bytes} "
-        f"pack_remaining={missing_pack}",
+        f"disk preflight: free={free_bytes} reserve={reserve_bytes}",
         flush=True,
     )
 
@@ -387,19 +359,8 @@ def main() -> None:
         state["completed_groups"] = [list(item) for item in sorted(completed)]
         atomic_json_write(state_path, state)
 
-    if not args.no_pack:
-        if args.pack_out.exists() and args.pack_out.stat().st_size == expected_pack:
-            print(f"expert pack already complete: {args.pack_out}", flush=True)
-        else:
-            run_checked([args.python, str(args.pack_script), str(args.out), str(args.pack_out), "--sync"])
-        if args.pack_out.stat().st_size != expected_pack:
-            die(f"expert pack size mismatch: got {args.pack_out.stat().st_size}, expected {expected_pack}")
-
-    state["packed"] = not args.no_pack
     atomic_json_write(state_path, state)
     print(f"stream build complete: gguf={args.out} bytes={args.out.stat().st_size}", flush=True)
-    if not args.no_pack:
-        print(f"stream build complete: expert_pack={args.pack_out} bytes={args.pack_out.stat().st_size}", flush=True)
 
 
 if __name__ == "__main__":

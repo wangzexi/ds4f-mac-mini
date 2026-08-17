@@ -1,0 +1,208 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+project_dir=$(CDPATH= cd -- "$script_dir/../../../.." && pwd)
+
+usage() {
+    cat <<'EOF'
+Usage: ds4f-cli COMMAND [ARGS...]
+
+Commands:
+  server [OPTIONS]          Start the local HTTP server
+  run PROMPT|@FILE [N]      Run the fixed runner once
+  regression [MODEL]        Check accepted greedy token IDs
+
+The model path can be set with DS4F_SERVER_MODEL or DS4F_FAST_MODEL.
+EOF
+}
+
+run_prompt() {
+    if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+        echo "usage: ds4f-cli run PROMPT|@FILE [MAX_TOKENS]" >&2
+        exit 2
+    fi
+
+    prompt_input=$1
+    max_tokens=${2:-32}
+    cache_experts=${DS4F_FAST_CACHE_EXPERTS:-600}
+    model=${DS4F_FAST_MODEL:-"$project_dir/models/DeepSeek-V4-Flash-0731-Q4.gguf"}
+
+    case "$prompt_input" in
+        @*)
+            prompt_file=${prompt_input#@}
+            if [ ! -r "$prompt_file" ]; then
+                echo "prompt file is not readable: $prompt_file" >&2
+                exit 1
+            fi
+            prompt_bytes=$(wc -c < "$prompt_file" | tr -d ' ')
+            if [ "$prompt_bytes" -gt 500000 ]; then
+                echo "prompt file exceeds the 500000-byte argv safety limit" >&2
+                exit 2
+            fi
+            prompt=$(cat -- "$prompt_file")
+            ;;
+        *) prompt=$prompt_input ;;
+    esac
+
+    if [ ! -x "$project_dir/ds4f-q4-speed" ]; then
+        echo "missing runner; run: make ds4f-q4-speed" >&2
+        exit 1
+    fi
+    if [ ! -r "$model" ]; then
+        echo "fixed model is missing" >&2
+        exit 1
+    fi
+
+    runner_env=(
+        "DS4F_FAST_CACHE_EXPERTS=$cache_experts"
+        "DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER=1"
+    )
+    exec env "${runner_env[@]}" \
+        "$project_dir/ds4f-q4-speed" "$model" "$prompt" "$max_tokens"
+}
+
+run_regression() {
+    if [ "$#" -gt 1 ]; then
+        echo "usage: ds4f-cli regression [MODEL]" >&2
+        exit 2
+    fi
+    runner="$project_dir/ds4f-q4-speed"
+    model=${1:-${DS4F_FAST_MODEL:-"$project_dir/models/DeepSeek-V4-Flash-0731-Q4.gguf"}}
+    if [ ! -x "$runner" ] || [ ! -f "$model" ]; then
+        echo "runner or model is unavailable" >&2
+        exit 2
+    fi
+
+    trace=$(mktemp "${TMPDIR:-/tmp}/ds4f-production-trace.XXXXXX")
+    trap 'rm -f "$trace"' 0
+
+    check_case() {
+        prompt=$1
+        count=$2
+        shift 2
+        expected="$*"
+
+        DS4F_FAST_TRACE_IDS=1 "$runner" "$model" "$prompt" "$count" >/dev/null 2>"$trace"
+        actual=$(sed -n -E 's/.*trace token\[[0-9]+\]=([0-9]+).*/\1/p' "$trace" |
+            tr '\n' ' ' | sed 's/[[:space:]]*$//')
+
+        if [ "$actual" != "$expected" ]; then
+            echo "production token regression failed for: $prompt" >&2
+            echo "expected: $expected" >&2
+            echo "actual:   ${actual:-(none)}" >&2
+            return 1
+        fi
+        echo "ok: ${actual[*]}"
+    }
+
+    check_case 'Explain one plus one in one word.' 3 6111 2004 28
+    check_case '用一句话解释为什么 1+1=2。' 4 23385 33951 6573 303
+    echo "production numerical regression passed"
+}
+
+run_server() {
+    model=${DS4F_SERVER_MODEL:-"$project_dir/models/DeepSeek-V4-Flash-0731-Q4.gguf"}
+    runtime_dir="$project_dir/src/runtime"
+
+    host=${DS4F_SERVER_HOST:-0.0.0.0}
+    port=${DS4F_SERVER_PORT:-8000}
+    context=${DS4F_SERVER_CONTEXT:-32768}
+    tokens=${DS4F_SERVER_TOKENS:-4096}
+    cache_experts=${DS4F_SERVER_CACHE_EXPERTS:-auto}
+    keep_hash_layer0=${DS4F_SERVER_KEEP_HASH_LAYER0:-1}
+    prefill_release_hash_layer0_after=${DS4F_SERVER_PREFILL_RELEASE_HASH_LAYER0_AFTER:-2}
+    pread_threads=${DS4F_SERVER_PREAD_THREADS:-5}
+    working_set_mib=${DS4F_SERVER_WORKING_SET_MIB:-auto}
+    pinned_mib=${DS4F_SERVER_PINNED_MIB:-4096}
+    decode_pinned_mib=${DS4F_SERVER_DECODE_PINNED_MIB:-4096}
+    reserve_mib=${DS4F_SERVER_MEMORY_RESERVE_MIB:-512}
+    kv_cache_dir=${DS4F_SERVER_KV_CACHE_DIR:-/tmp/ds4f-mac-mini/kv}
+    kv_cache_mib=${DS4F_SERVER_KV_CACHE_MIB:-10240}
+    kv_cache_min_tokens=${DS4F_SERVER_KV_CACHE_MIN_TOKENS:-1}
+    prefill_measurements=${DS4F_SERVER_PREFILL_MEASUREMENTS:-$project_dir/cache/prefill-measurements.tsv}
+    preload_static_decode=${DS4F_SERVER_PRELOAD_STATIC_DECODE_TRUNK:-1}
+    decode_split_min_misses=${DS4F_SERVER_DECODE_SPLIT_MIN_MISSES:-2}
+    disable_streaming_expert_addr_table=${DS4F_SERVER_DISABLE_STREAMING_EXPERT_ADDR_TABLE:-1}
+
+    if [ ! -x "$project_dir/ds4f-server" ]; then
+        echo "missing ds4f-server; run: make server" >&2
+        exit 1
+    fi
+    if [ ! -r "$model" ]; then
+        echo "fixed model is missing" >&2
+        exit 1
+    fi
+
+    case "$decode_split_min_misses" in
+        1|2|3|4|5|6) ;;
+        *) echo "DS4F_SERVER_DECODE_SPLIT_MIN_MISSES must be an integer 1..6" >&2; exit 2 ;;
+    esac
+    case "$disable_streaming_expert_addr_table" in
+        0) unset DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE ;;
+        1) export DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE=1 ;;
+        *) echo "DS4F_SERVER_DISABLE_STREAMING_EXPERT_ADDR_TABLE must be 0 or 1" >&2; exit 2 ;;
+    esac
+    case "$keep_hash_layer0" in
+        0|1) ;;
+        *) echo "DS4F_SERVER_KEEP_HASH_LAYER0 must be 0 or 1" >&2; exit 2 ;;
+    esac
+    case "$prefill_release_hash_layer0_after" in
+        0|1|2|3|4|5|6|7|8|9|10|11|12|13|14|15|16|17|18|19|20|21|22|23|24|25|26|27|28|29|30|31|32|33|34|35|36|37|38|39|40|41|42) ;;
+        *) echo "DS4F_SERVER_PREFILL_RELEASE_HASH_LAYER0_AFTER must be a layer index 0..42" >&2; exit 2 ;;
+    esac
+
+    server_env=(
+        DS4_METAL_ENABLE_STREAMING_IQ2_CPU_ROUTER=1 \
+        DS4_METAL_PREFILL_STAGE_ALIAS=1 \
+        DS4_METAL_KEEP_HASH_LAYER0="$keep_hash_layer0" \
+        DS4_METAL_PREFILL_RELEASE_HASH_LAYER0_AFTER="$prefill_release_hash_layer0_after" \
+        DS4_METAL_STREAMING_EXPERT_PREAD_THREADS="$pread_threads" \
+        DS4_METAL_STREAMING_EXPERT_PREAD_POOL=1 \
+        DS4_METAL_STREAMING_EXPERT_SORT_PREAD_TASKS=1 \
+        DS4_METAL_STREAMING_EXPERT_SPLIT_MIN_MISSES="$decode_split_min_misses" \
+        DS4_METAL_PREFILL_MEASUREMENTS_PATH="$prefill_measurements" \
+        DS4_SERVER_PRELOAD_STATIC_DECODE_TRUNK="$preload_static_decode" \
+        DS4_SERVER_PINNED_MIB="$pinned_mib" \
+        DS4_SERVER_DECODE_PINNED_MIB="$decode_pinned_mib" \
+        DS4_SERVER_MEMORY_RESERVE_MIB="$reserve_mib" \
+        DS4_KVSTORE_STRICT_LRU=1 \
+    )
+    if [ "$working_set_mib" != auto ]; then
+        server_env+=("DS4_SERVER_WORKING_SET_MIB=$working_set_mib")
+    fi
+
+    server_args=(
+        "$project_dir/ds4f-server"
+        --model "$model"
+        --metal
+        --ssd-streaming
+        --ctx "$context"
+        --tokens "$tokens"
+        --kv-disk-dir "$kv_cache_dir"
+        --kv-disk-space-mb "$kv_cache_mib"
+        --kv-cache-min-tokens "$kv_cache_min_tokens"
+        --kv-cache-cold-max-tokens 0
+        --kv-cache-continued-interval-tokens 0
+        --batched-session 1
+        --host "$host"
+        --port "$port"
+        --cors
+    )
+    if [ "$cache_experts" != auto ]; then
+        server_args+=(--ssd-streaming-cache-experts "$cache_experts")
+    fi
+
+    cd "$runtime_dir"
+    exec env "${server_env[@]}" "${server_args[@]}" "$@"
+}
+
+command=${1:-help}
+shift || true
+case "$command" in
+    server) run_server "$@" ;;
+    run) run_prompt "$@" ;;
+    regression) run_regression "$@" ;;
+    help|-h|--help) usage ;;
+    *) echo "unknown command: $command" >&2; usage >&2; exit 2 ;;
+esac

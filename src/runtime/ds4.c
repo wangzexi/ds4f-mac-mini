@@ -8,10 +8,10 @@
  * narrow: validation accepts the known Flash and Pro layouts and fails early
  * for anything else.
  *
- * The fixed Apple SSD runtime maps only enough of GGUF to parse the header,
- * metadata, and tensor directory.  It then removes the tensor payload mapping
- * and explicitly reads every scheduled weight range into owned Metal buffers.
- * Other backends retain the upstream mmap path.
+ * The fixed Apple SSD runtime reads the GGUF header, metadata, and tensor
+ * directory into an owned heap buffer.  It explicitly reads every scheduled
+ * weight range into owned Metal buffers; the weight payload is never mmaped.
+ * Other backends retain the legacy mmap path for compatibility.
  */
 
 #include <errno.h>
@@ -2146,6 +2146,8 @@ typedef struct {
     const uint8_t *map;
     uint64_t size;
     uint64_t mapped_size;
+    bool map_owned;
+    bool payload_mapped;
 
     uint32_t version;
     uint64_t n_kv;
@@ -2243,7 +2245,7 @@ static bool tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes) {
 static ds4_cursor cursor_at(const ds4_model *m, uint64_t pos) {
     ds4_cursor c = {
         .base = m->map,
-        .size = m->size,
+        .size = m->mapped_size,
         .pos = pos,
         .error = {0},
     };
@@ -2382,7 +2384,11 @@ static void model_close(ds4_model *m) {
     free(m->kv);
     free(m->tensors);
     if (m->map && m->mapped_size) {
-        munmap((void *)m->map, (size_t)m->mapped_size);
+        if (m->map_owned) {
+            free((void *)m->map);
+        } else {
+            munmap((void *)m->map, (size_t)m->mapped_size);
+        }
     }
     if (m->fd >= 0) close(m->fd);
     memset(m, 0, sizeof(*m));
@@ -2390,7 +2396,7 @@ static void model_close(ds4_model *m) {
 }
 
 static void model_prefetch_cpu_mapping(const ds4_model *m) {
-    if (!m || !m->map || m->size == 0) return;
+    if (!m || !m->payload_mapped || !m->map || m->size == 0) return;
 
     /*
      * CPU generation touches expert weights according to router decisions, so a
@@ -2505,12 +2511,11 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
     }
 }
 
-/* Open and map the GGUF once.  Metal needs a shared mapping for no-copy
- * MTLBuffers; CPU uses a private read-only mapping to avoid Darwin VM stress.
- * Tokenizer-only callers pass prefetch_cpu=false so inspecting tokens never
- * walks the huge tensor payload. */
+/* Open the GGUF. The fixed Apple SSD path reads only metadata here and owns
+ * every tensor read through explicit pread calls; other backends retain the
+ * legacy mapped path for compatibility. */
 static void model_open(ds4_model *m, const char *path, bool metal_mapping,
-                       bool prefetch_cpu) {
+                       bool explicit_io, bool prefetch_cpu) {
     memset(m, 0, sizeof(*m));
     m->fd = -1;
 
@@ -2521,11 +2526,65 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     if (fstat(fd, &st) == -1) ds4_die_errno("cannot stat model", path);
     if (st.st_size < 32) ds4_die("model file is too small to be GGUF");
 
+    if (explicit_io) {
+        /* The fixed Apple streaming path owns all payload reads. Keep only a
+         * bounded copy of the GGUF header/metadata/tensor directory in heap
+         * memory; tensor bytes are fetched later with pread into Metal
+         * buffers. The official Flash-0731 GGUF header is well below this
+         * bound, while the bound prevents a malformed file from causing an
+         * unbounded metadata allocation. */
+        const uint64_t header_limit = 128ull * 1024ull * 1024ull;
+        const uint64_t header_bytes =
+            (uint64_t)st.st_size < header_limit ?
+                (uint64_t)st.st_size : header_limit;
+        uint8_t *header = malloc((size_t)header_bytes);
+        if (!header) ds4_die("out of memory while reading GGUF header");
+        uint64_t done = 0;
+        while (done < header_bytes) {
+            const size_t want = header_bytes - done > 8u * 1024u * 1024u ?
+                8u * 1024u * 1024u : (size_t)(header_bytes - done);
+            ssize_t nread;
+            do {
+                nread = pread(fd, header + done, want, (off_t)done);
+            } while (nread < 0 && errno == EINTR);
+            if (nread <= 0) {
+                free(header);
+                ds4_die_errno("cannot read GGUF header", path);
+            }
+            done += (uint64_t)nread;
+        }
+
+        m->fd = fd;
+        m->map = header;
+        m->size = (uint64_t)st.st_size;
+        m->mapped_size = header_bytes;
+        m->map_owned = true;
+        m->payload_mapped = false;
+
+        ds4_cursor c = cursor_at(m, 0);
+        uint32_t magic;
+        if (!cursor_u32(&c, &magic)) ds4_die(c.error);
+        if (magic != DS4_GGUF_MAGIC) ds4_die("model is not a GGUF file");
+        if (!cursor_u32(&c, &m->version)) ds4_die(c.error);
+        if (!cursor_u64(&c, &m->n_tensors)) ds4_die(c.error);
+        if (!cursor_u64(&c, &m->n_kv)) ds4_die(c.error);
+        if (m->version != 3) ds4_die("only GGUF v3 is supported");
+        parse_metadata(m, &c);
+        parse_tensors(m, &c);
+        if (m->tensor_data_pos > m->mapped_size) {
+            ds4_die("GGUF header exceeds the explicit metadata buffer limit");
+        }
+        fprintf(stderr,
+                "ds4-io: explicit GGUF metadata read header=%.2f MiB payload=%.2f GiB; mmap disabled\n",
+                (double)m->tensor_data_pos / 1048576.0,
+                (double)(m->size - m->tensor_data_pos) / 1073741824.0);
+        return;
+    }
+
     /*
-     * Metal wraps slices of this mapping as no-copy MTLBuffers, so the Metal
-     * path keeps the file-backed shared mapping. The CPU path only reads the
-     * weights through normal pointers and should not inherit Metal's VM policy:
-     * use a private read-only mapping there.
+     * Legacy compatibility path. Metal's explicit SSD path returned above
+     * never reaches this mapping, while non-streaming/other backends still
+     * use the original pointer-based model access.
      *
      * This is deliberately defensive against an OS-level Darwin VM bug observed
      * while the CPU backend streams the very large GGUF through a shared mmap:
@@ -2541,6 +2600,8 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
     m->map = map;
     m->size = (uint64_t)st.st_size;
     m->mapped_size = (uint64_t)st.st_size;
+    m->map_owned = false;
+    m->payload_mapped = true;
 
     ds4_cursor c = cursor_at(m, 0);
     uint32_t magic;
@@ -2564,6 +2625,7 @@ static void model_open(ds4_model *m, const char *path, bool metal_mapping,
  * of silently creating an unobservable file-backed page-in. */
 static bool model_drop_tensor_payload_mapping(ds4_model *m) {
     if (!m || !m->map || m->mapped_size == 0) return false;
+    if (!m->payload_mapped) return true;
     const uint64_t page = (uint64_t)getpagesize();
     if (page == 0 || m->tensor_data_pos > UINT64_MAX - (page - 1u)) return false;
     uint64_t keep = (m->tensor_data_pos + page - 1u) & ~(page - 1u);
@@ -3177,11 +3239,17 @@ static const void *tensor_data(const ds4_model *m, const ds4_tensor *t) {
         }
         return p;
     }
+    if (!m->payload_mapped ||
+        t->abs_offset > m->mapped_size ||
+        t->bytes > m->mapped_size - t->abs_offset) {
+        ds4_die("unplanned model payload access outside explicit I/O");
+    }
     return m->map + t->abs_offset;
 }
 
 /* Optional startup pass that touches tensor pages before timing generation. */
 static void model_warm_weights(const ds4_model *m) {
+    if (!m || !m->payload_mapped) return;
     const uint64_t start = m->tensor_data_pos;
     const uint64_t end = m->size;
     if (start >= end) return;
@@ -17788,6 +17856,7 @@ static void metal_graph_stream_readahead_range_impl(
         bool             enabled) {
     if (!enabled ||
         !model ||
+        !model->payload_mapped ||
         model->fd < 0 ||
         !model->map ||
         offset > model->size ||
@@ -17827,6 +17896,7 @@ static bool metal_graph_stream_madvise_willneed_range_impl(
         uint64_t        *advised) {
     if (!enabled ||
         !model ||
+        !model->payload_mapped ||
         !model->map ||
         offset > model->size ||
         size == 0 ||
@@ -17942,6 +18012,7 @@ static bool metal_graph_stream_prefill_selected_pagein_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
+           !ds4_gpu_explicit_model_io_enabled() &&
            glm_graph_env_present("DS4_ROCM_ENABLE_STREAMING_PREFILL_SELECTED_PAGEIN",
                                  "DS4_METAL_ENABLE_STREAMING_PREFILL_SELECTED_PAGEIN") &&
            !glm_graph_env_present("DS4_ROCM_DISABLE_STREAMING_PREFILL_SELECTED_PAGEIN",
@@ -17952,6 +18023,7 @@ static bool metal_graph_stream_prefill_selected_madvise_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
+           !ds4_gpu_explicit_model_io_enabled() &&
            glm_graph_env_present("DS4_ROCM_ENABLE_STREAMING_PREFILL_SELECTED_MADVISE",
                                  "DS4_METAL_ENABLE_STREAMING_PREFILL_SELECTED_MADVISE") &&
            !glm_graph_env_present("DS4_ROCM_DISABLE_STREAMING_PREFILL_SELECTED_MADVISE",
@@ -17962,6 +18034,7 @@ static bool metal_graph_stream_prefill_layer_pagein_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
+           !ds4_gpu_explicit_model_io_enabled() &&
            glm_graph_env_present("DS4_ROCM_ENABLE_STREAMING_PREFILL_LAYER_PAGEIN",
                                  "DS4_METAL_ENABLE_STREAMING_PREFILL_LAYER_PAGEIN") &&
            !glm_graph_env_present("DS4_ROCM_DISABLE_STREAMING_PREFILL_LAYER_PAGEIN",
@@ -17972,6 +18045,7 @@ static bool metal_graph_stream_prefill_layer_readahead_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
+           !ds4_gpu_explicit_model_io_enabled() &&
            glm_graph_env_present("DS4_ROCM_ENABLE_STREAMING_PREFILL_LAYER_READAHEAD",
                                  "DS4_METAL_ENABLE_STREAMING_PREFILL_LAYER_READAHEAD") &&
            !glm_graph_env_present("DS4_ROCM_DISABLE_STREAMING_PREFILL_LAYER_READAHEAD",
@@ -17994,6 +18068,7 @@ static bool metal_graph_stream_prefill_layer_madvise_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
+           !ds4_gpu_explicit_model_io_enabled() &&
            !glm_graph_env_present("DS4_ROCM_DISABLE_STREAMING_PREFILL_LAYER_PREPARE",
                                   "DS4_METAL_DISABLE_STREAMING_PREFILL_LAYER_PREPARE") &&
            !glm_graph_env_present("DS4_ROCM_DISABLE_STREAMING_PREFILL_LAYER_MADVISE",
@@ -19489,6 +19564,7 @@ static bool metal_graph_stream_prefill_selected_readahead_enabled(
         const ds4_gpu_graph *g) {
     return g &&
            g->ssd_streaming &&
+           !ds4_gpu_explicit_model_io_enabled() &&
            (glm_graph_env_present("DS4_ROCM_ENABLE_STREAMING_PREFILL_SELECTED_READAHEAD",
                                   "DS4_METAL_ENABLE_STREAMING_PREFILL_SELECTED_READAHEAD") ||
             glm_graph_env_present("DS4_ROCM_ENABLE_STREAMING_PREFILL_SELECTED_READAHEAD_SHARED",
@@ -19857,98 +19933,6 @@ static bool metal_graph_prefetch_prefill_trunk(
     return ok;
 }
 
-static uint32_t metal_graph_prefill_full_expert_prefetch_min_tokens(void) {
-    const char *env = getenv("DS4_METAL_PREFILL_FULL_EXPERT_MIN_TOKENS");
-    if (env && env[0]) {
-        char *end = NULL;
-        const unsigned long parsed = strtoul(env, &end, 10);
-        if (end != env && *end == '\0') {
-            return parsed > UINT32_MAX ? UINT32_MAX : (uint32_t)parsed;
-        }
-    }
-    /* A complete Flash expert layer takes about 0.8-0.97 s to stream on the
-     * fixed M4 Mini. At 302 prompt tokens full one-layer lookahead measured
-     * 7.63 t/s versus 5.27 t/s for exact demand reads, while short prompts do
-     * better without an untrusted partial guess. */
-    return 256u;
-}
-
-static uint32_t metal_graph_prefill_expert_prefetch_count(
-        uint32_t n_tokens) {
-    const char *env = getenv("DS4_METAL_PREFILL_EXPERT_PREFETCH_COUNT");
-    if (env && env[0]) {
-        char *end = NULL;
-        const unsigned long parsed = strtoul(env, &end, 10);
-        if (end != env && *end == '\0') {
-            return parsed >= DS4_N_EXPERT ? DS4_N_EXPERT : 0u;
-        }
-    }
-    return n_tokens < metal_graph_prefill_full_expert_prefetch_min_tokens() ?
-        0u : DS4_N_EXPERT;
-}
-
-/* Heat is attached to the restored KV prefix, so it is meaningful for a
- * continuing request but intentionally absent for a cold prompt.  Keep the
- * speculative buffer modest below the measured full-layer crossover: it is
- * enough to cover the high-probability experts while the first Router result
- * is becoming available, and can be discarded at the first expert boundary. */
-static uint32_t metal_graph_prefill_hot_expert_prefetch_count(
-        uint32_t n_tokens) {
-    /* A measurement-only override for this fixed Mini.  Zero deliberately
-     * disables heat speculation so the same cached prefix can be benchmarked
-     * against exact demand loading. */
-    const char *env = getenv("DS4_METAL_PREFILL_HOT_EXPERT_PREFETCH_COUNT");
-    if (env && env[0]) {
-        char *end = NULL;
-        const unsigned long parsed = strtoul(env, &end, 10);
-        if (end != env && *end == '\0') {
-            return parsed >= DS4_N_EXPERT ? DS4_N_EXPERT : (uint32_t)parsed;
-        }
-    }
-    /* Measured on the fixed Mini from one identical 24-token disk-KV prefix:
-     * suffix 10: demand=6.84 s, heat-12=7.36 s, heat-24=7.55 s;
-     * suffix 32: demand=13.18 s, heat-24=14.09 s;
-     * suffix 85: demand=23.97 s, heat-64=25.01 s.
-     * Candidate copying never repaid its own I/O below the established
-     * 256-token whole-layer crossover, so leave it opt-in for future trials.
-     * Long prompts retain the separately measured full-layer policy above. */
-    (void)n_tokens;
-    return 0u;
-}
-
-static void metal_graph_prefill_sort_hot_groups_by_address(
-        int32_t *expert_ids,
-        uint32_t n_experts) {
-    /* Preserve heat priority between groups, but issue each 8-expert group in
-     * packed-file order.  On the Mini this is the useful compromise between
-     * predicted-hit order and SSD locality. */
-    for (uint32_t begin = 0; begin < n_experts; begin += 8u) {
-        uint32_t end = begin + 8u;
-        if (end > n_experts) end = n_experts;
-        for (uint32_t i = begin + 1u; i < end; i++) {
-            const int32_t value = expert_ids[i];
-            uint32_t j = i;
-            while (j > begin && expert_ids[j - 1u] > value) {
-                expert_ids[j] = expert_ids[j - 1u];
-                j--;
-            }
-            expert_ids[j] = value;
-        }
-    }
-}
-
-static uint32_t metal_graph_prefill_prefetch_lookahead(void) {
-    const char *env = getenv("DS4_METAL_PREFILL_PREFETCH_LOOKAHEAD");
-    if (env && env[0]) {
-        char *end = NULL;
-        const unsigned long parsed = strtoul(env, &end, 10);
-        if (end != env && *end == '\0') {
-            return parsed > 6u ? 6u : (uint32_t)parsed;
-        }
-    }
-    return 3u;
-}
-
 static uint32_t metal_graph_prefill_io_chunk_mib(void) {
     const char *env = getenv("DS4_METAL_EXPLICIT_PREFETCH_CHUNK_MIB");
     if (env && env[0]) {
@@ -19972,183 +19956,6 @@ static uint32_t metal_graph_prefill_release_hash_layer0_after(void) {
     const unsigned long value = strtoul(env, &end, 10);
     if (end == env || *end != '\0' || value >= DS4_N_LAYER) return UINT32_MAX;
     return (uint32_t)value;
-}
-
-static uint32_t metal_graph_prefill_hash_expert_union(
-        const ds4_model         *model,
-        const ds4_layer_weights *layer,
-        const token_vec         *prompt,
-        uint32_t                 start,
-        uint32_t                 n_tokens,
-        int32_t                  expert_ids[DS4_N_EXPERT]) {
-    if (!model || !layer || !layer->ffn_gate_tid2eid || !prompt ||
-        start > (uint32_t)prompt->len ||
-        n_tokens > (uint32_t)prompt->len - start) {
-        return 0;
-    }
-    const ds4_tensor *route = layer->ffn_gate_tid2eid;
-    if (route->type != DS4_TENSOR_I32 || route->ndim != 2 ||
-        route->dim[0] != DS4_N_EXPERT_USED ||
-        route->dim[1] != DS4_N_VOCAB ||
-        route->bytes != (uint64_t)DS4_N_EXPERT_USED *
-                        DS4_N_VOCAB * sizeof(int32_t) ||
-        route->bytes > (uint64_t)SIZE_MAX ||
-        route->abs_offset > model->size ||
-        route->bytes > model->size - route->abs_offset ||
-        route->abs_offset > (uint64_t)LLONG_MAX ||
-        model->fd < 0) {
-        return 0;
-    }
-    /* SSD streaming deliberately unmaps model payload. Read this small
-     * frozen lookup into an owned CPU buffer instead of bypassing explicit
-     * I/O through tensor_data(). The L1/L2 Flash tables total 5.92 MiB. */
-    int32_t *table = xmalloc((size_t)route->bytes);
-    uint64_t done = 0;
-    while (done < route->bytes) {
-        const uint64_t remaining = route->bytes - done;
-        const size_t want = remaining > (uint64_t)SSIZE_MAX ?
-            (size_t)SSIZE_MAX : (size_t)remaining;
-        ssize_t got;
-        do {
-            got = pread(model->fd,
-                        (uint8_t *)table + done,
-                        want,
-                        (off_t)(route->abs_offset + done));
-        } while (got < 0 && errno == EINTR);
-        if (got <= 0) {
-            free(table);
-            return 0;
-        }
-        done += (uint64_t)got;
-    }
-    bool seen[DS4_N_EXPERT];
-    memset(seen, 0, sizeof(seen));
-    for (uint32_t t = 0; t < n_tokens; t++) {
-        const int token = prompt->v[start + t];
-        if (token < 0 || (uint32_t)token >= DS4_N_VOCAB) {
-            free(table);
-            return 0;
-        }
-        const int32_t *selected =
-            table + (uint64_t)token * DS4_N_EXPERT_USED;
-        for (uint32_t i = 0; i < DS4_N_EXPERT_USED; i++) {
-            if (selected[i] < 0 || (uint32_t)selected[i] >= DS4_N_EXPERT) {
-                free(table);
-                return 0;
-            }
-            seen[selected[i]] = true;
-        }
-    }
-    free(table);
-    uint32_t n = 0;
-    /* Packed experts are ordered by physical expert id. Building the exact
-     * union in ascending order therefore also gives the pread path its most
-     * sequential possible request order. */
-    for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
-        if (seen[expert]) expert_ids[n++] = (int32_t)expert;
-    }
-    return n;
-}
-
-static bool metal_graph_prefetch_prefill_expert_layer_selected(
-        const ds4_model   *model,
-        const ds4_weights *weights,
-        uint32_t           il,
-        const int32_t      *expert_ids,
-        uint32_t           n_prefetch,
-        uint32_t           protect_layer) {
-    if (!model || !weights || !expert_ids || il >= DS4_N_LAYER ||
-        n_prefetch == 0 || n_prefetch > DS4_N_EXPERT) {
-        return false;
-    }
-    const char *pack_path = getenv("DS4_METAL_STREAMING_EXPERT_PACK_PATH");
-    if (!pack_path || !pack_path[0]) return false;
-    const char *only_layer =
-        getenv("DS4_METAL_PREFILL_FULL_EXPERT_ONLY_LAYER");
-    if (only_layer && only_layer[0]) {
-        char *end = NULL;
-        const unsigned long selected = strtoul(only_layer, &end, 10);
-        if (end == only_layer || *end != '\0' || selected != il) {
-            return false;
-        }
-    }
-    const ds4_layer_weights *layer = &weights->layer[il];
-    uint64_t gate_expert_bytes = 0;
-    uint64_t down_expert_bytes = 0;
-    if (!streaming_layer_gate_down_expert_bytes(layer,
-                                                &gate_expert_bytes,
-                                                &down_expert_bytes)) {
-        return false;
-    }
-    const ds4_gpu_stream_expert_table table =
-        graph_stream_expert_table_make(model,
-                                       layer,
-                                       il,
-                                       gate_expert_bytes,
-                                       down_expert_bytes);
-    return ds4_gpu_stream_expert_layer_prefetch_begin(&table,
-                                                       expert_ids,
-                                                       n_prefetch,
-                                                       protect_layer) != 0;
-}
-
-static bool metal_graph_prefetch_prefill_expert_layer(
-        const ds4_model   *model,
-        const ds4_weights *weights,
-        uint32_t           il,
-        uint32_t           n_tokens,
-        uint32_t           protect_layer) {
-    const uint32_t cold_count =
-        metal_graph_prefill_expert_prefetch_count(n_tokens);
-    int32_t expert_ids[DS4_N_EXPERT];
-    uint32_t n_prefetch = 0;
-    if (cold_count == DS4_N_EXPERT) {
-        /* No prefix history: retain the measured full-layer policy for long
-         * prompts. Packed order is optimal when every expert is requested. */
-        n_prefetch = DS4_N_EXPERT;
-        for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
-            expert_ids[expert] = (int32_t)expert;
-        }
-    } else {
-        const uint32_t target =
-            metal_graph_prefill_hot_expert_prefetch_count(n_tokens);
-        n_prefetch = ds4_gpu_stream_expert_cache_rank_route_heat(
-                il, expert_ids, target);
-        if (n_prefetch == 0) return false;
-        metal_graph_prefill_sort_hot_groups_by_address(expert_ids, n_prefetch);
-        fprintf(stderr,
-                "ds4: heat prefill candidates layer=%u tokens=%u experts=%u "
-                "groups=8 source=kv-route-heat\n",
-                il, n_tokens, n_prefetch);
-    }
-    return metal_graph_prefetch_prefill_expert_layer_selected(model,
-                                                               weights,
-                                                               il,
-                                                               expert_ids,
-                                                               n_prefetch,
-                                                               protect_layer);
-}
-
-static bool metal_graph_activate_prefill_expert_layer(
-        const ds4_model   *model,
-        const ds4_weights *weights,
-        uint32_t           il) {
-    if (!model || !weights || il >= DS4_N_LAYER) return false;
-    const ds4_layer_weights *layer = &weights->layer[il];
-    uint64_t gate_expert_bytes = 0;
-    uint64_t down_expert_bytes = 0;
-    if (!streaming_layer_gate_down_expert_bytes(layer,
-                                                &gate_expert_bytes,
-                                                &down_expert_bytes)) {
-        return false;
-    }
-    const ds4_gpu_stream_expert_table table =
-        graph_stream_expert_table_make(model,
-                                       layer,
-                                       il,
-                                       gate_expert_bytes,
-                                       down_expert_bytes);
-    return ds4_gpu_stream_expert_layer_prefetch_activate(&table) != 0;
 }
 
 static bool metal_graph_stream_map_output(
@@ -34355,12 +34162,6 @@ static bool metal_graph_prefill_layer_major_decode_rows(
     const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
     const uint64_t hc_bytes = hc_dim * sizeof(float);
     if (g->ssd_streaming) {
-        const char *pack_path =
-            getenv("DS4_METAL_STREAMING_EXPERT_PACK_PATH");
-        const uint32_t planned_experts = pack_path && pack_path[0] ?
-            metal_graph_prefill_expert_prefetch_count(n_tokens) : 0u;
-        const uint32_t planned_lookahead = planned_experts == DS4_N_EXPERT ?
-            1u : metal_graph_prefill_prefetch_lookahead();
         uint64_t gate_bytes = 0;
         uint64_t down_bytes = 0;
         uint64_t expert_bytes = 0;
@@ -34371,16 +34172,10 @@ static bool metal_graph_prefill_layer_major_decode_rows(
             expert_bytes = gate_bytes * 2ull + down_bytes;
         }
         fprintf(stderr,
-                "ds4: exact prefill plan tokens=%u expert_prefetch=%u/layer "
-                "lookahead=%u expert_slot=%.2f MiB staged_experts=%u "
-                "staged_payload=%.2f GiB chunk=%zu MiB F_NOCACHE=1\n",
+                "ds4: exact prefill plan tokens=%u expert_slot=%.2f MiB "
+                "chunk=%zu MiB F_NOCACHE=1\n",
                 n_tokens,
-                planned_experts,
-                planned_lookahead,
                 (double)expert_bytes / 1048576.0,
-                planned_experts * planned_lookahead,
-                (double)expert_bytes * planned_experts * planned_lookahead /
-                    1073741824.0,
                 (size_t)metal_graph_prefill_io_chunk_mib());
     }
     bool ok = true;
@@ -34395,30 +34190,6 @@ static bool metal_graph_prefill_layer_major_decode_rows(
     uint32_t interrupted_row = UINT32_MAX;
     const uint32_t release_hash_layer0_after =
         metal_graph_prefill_release_hash_layer0_after();
-    int32_t hash_expert_ids[DS4_N_HASH_LAYER][DS4_N_EXPERT];
-    uint32_t hash_expert_counts[DS4_N_HASH_LAYER];
-    memset(hash_expert_counts, 0, sizeof(hash_expert_counts));
-    if (DS4_N_HASH_LAYER != 0 && DS4_N_LAYER != 0) {
-        hash_expert_counts[0] = DS4_N_EXPERT;
-        fprintf(stderr,
-                "ds4: exact hash prefill layer=0 tokens=%u experts=%u source=startup-full\n",
-                n_tokens,
-                (uint32_t)DS4_N_EXPERT);
-    }
-    for (uint32_t il = 1; il < DS4_N_HASH_LAYER && il < DS4_N_LAYER; il++) {
-        hash_expert_counts[il] = metal_graph_prefill_hash_expert_union(
-                model,
-                &weights->layer[il],
-                prompt,
-                start,
-                n_tokens,
-                hash_expert_ids[il]);
-        fprintf(stderr,
-                "ds4: exact hash prefill layer=%u tokens=%u experts=%u\n",
-                il,
-                n_tokens,
-                hash_expert_counts[il]);
-    }
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const double layer_started = layer_profile ? now_sec() : 0.0;
         if (cancel && cancel(cancel_ud)) {
@@ -34437,61 +34208,14 @@ static bool metal_graph_prefill_layer_major_decode_rows(
                 ok = false;
                 break;
             }
-            /* Hash layers have exact token-ID unions, and long learned layers
-             * intentionally stage all 256 experts.  A short learned layer is
-             * different: leave its heat-ordered I/O live until its first
-             * Router result reconciles completed slots and cancels the rest. */
-            if (il < DS4_N_HASH_LAYER ||
-                metal_graph_prefill_expert_prefetch_count(n_tokens) ==
-                    DS4_N_EXPERT) {
-                (void)metal_graph_activate_prefill_expert_layer(model,
-                                                                weights,
-                                                                il);
-            }
             if (!reuse_static_decode_map) {
-                const uint32_t lookahead =
-                    metal_graph_prefill_expert_prefetch_count(n_tokens) ==
-                        DS4_N_EXPERT ? 1u :
-                        metal_graph_prefill_prefetch_lookahead();
+                const uint32_t lookahead = 3u;
                 for (uint32_t d = 1;
                      d <= lookahead && il + d < DS4_N_LAYER;
                      d++) {
                     (void)metal_graph_prefetch_prefill_trunk(model,
                                                              weights,
                                                              il + d);
-                }
-            }
-            const uint32_t next = il + 1u;
-            if (next < DS4_N_LAYER) {
-                if (next < DS4_N_HASH_LAYER &&
-                    hash_expert_counts[next] != 0) {
-                    /* Hash-layer identities are fully known from token ids.
-                     * Roll one exact layer ahead: L0 computes while L1 reads,
-                     * then L1 computes while L2 reads. This prioritizes the
-                     * next critical-path read on the Mini's single SSD. */
-                    (void)metal_graph_prefetch_prefill_expert_layer_selected(
-                            model,
-                            weights,
-                            next,
-                            hash_expert_ids[next],
-                            hash_expert_counts[next],
-                            il);
-                } else {
-                    /* Trunk reads can be queued further ahead because their
-                     * payload is small. Expert prediction is deliberately
-                     * one layer ahead: the Mini has one SSD queue, and
-                     * competing candidate layers defeat cancellation. */
-                    for (uint32_t d = 1;
-                         d <= 1u && il + d < DS4_N_LAYER;
-                         d++) {
-                        if (il + d < DS4_N_HASH_LAYER) continue;
-                        (void)metal_graph_prefetch_prefill_expert_layer(
-                                model,
-                                weights,
-                                il + d,
-                                n_tokens,
-                                il);
-                    }
                 }
             }
             if (!reuse_static_decode_map && il + 1u == DS4_N_LAYER) {
@@ -34610,7 +34334,6 @@ static bool metal_graph_prefill_layer_major_decode_rows(
             g->streaming_static_decode_map_current =
                 metal_graph_stream_decode_static_map_state_cache_enabled();
         }
-        ds4_gpu_stream_expert_layer_prefetch_cancel_all();
         ds4_gpu_model_prefetch_cancel_all();
     }
     if (show_progress) fputc('\n', stderr);
@@ -48538,7 +48261,6 @@ static int generate_glm_metal_argmax(
         /* Decode-style short prefill may still own a speculative read buffer.
          * It has no semantic value once prefill is complete, but it consumes
          * the cache budget until explicitly cancelled. */
-        ds4_gpu_stream_expert_layer_prefetch_cancel_all();
         ds4_gpu_graph seed_graph;
         memset(&seed_graph, 0, sizeof(seed_graph));
         seed_graph.quality = quality;
@@ -48809,7 +48531,6 @@ static int generate_metal_graph_raw_swa(
          * prefill, so the measured first decode executes its actual six
          * experts with no selected-expert SSD miss.
          */
-        ds4_gpu_stream_expert_layer_prefetch_cancel_all();
         if (!metal_graph_seed_streaming_expert_cache_from_hotlist(&g,
                                                                    model,
                                                                    weights)) {
@@ -52565,7 +52286,7 @@ int ds4_dump_text_tokenization(const char *model_path, const char *text, FILE *f
     token_vec tokens = {0};
 
     if (!fp) fp = stdout;
-    model_open(&model, model_path, false, false);
+    model_open(&model, model_path, false, false, false);
     config_validate_model(&model);
     vocab_load(&vocab, &model);
     tokenize_rendered_chat_vocab(&vocab, text ? text : "", &tokens);
@@ -57630,7 +57351,11 @@ static int ds4_engine_open_internal(ds4_engine **out,
 
     const bool graph_backend = ds4_backend_uses_graph(opt->backend);
     if (graph_backend) ds4_linux_graph_backend_set_oom_score(opt->backend);
-    model_open(&e->model, opt->model_path, graph_backend, !opt->inspect_only);
+    model_open(&e->model,
+               opt->model_path,
+               graph_backend,
+               opt->ssd_streaming && graph_backend,
+               !opt->inspect_only);
     if (opt->warm_weights) model_warm_weights(&e->model);
     config_validate_model(&e->model);
     if (load_slice && load_layer_end == UINT32_MAX) {
@@ -57846,7 +57571,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     if (opt->inspect_only) {
         if (opt->mtp_path && opt->mtp_path[0] &&
             opt->distributed.role == DS4_DISTRIBUTED_NONE) {
-            model_open(&e->mtp_model, opt->mtp_path, false, false);
+            model_open(&e->mtp_model, opt->mtp_path, false, false, false);
             ds4_dspark_summary dspark = {0};
             e->support_kind =
                 support_model_detect(&e->mtp_model, &e->support_stages, &dspark);
@@ -57948,7 +57673,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
             *out = NULL;
             return 1;
         }
-        model_open(&e->mtp_model, opt->mtp_path, graph_backend, true);
+        model_open(&e->mtp_model, opt->mtp_path, graph_backend, false, true);
         ds4_dspark_summary dspark = {0};
         e->support_kind =
             support_model_detect(&e->mtp_model, &e->support_stages, &dspark);
@@ -58724,36 +58449,8 @@ uint32_t ds4_engine_resize_streaming_expert_cache(
 
 bool ds4_engine_preload_prefill_hash_layer_zero(ds4_engine *e) {
 #if !defined(DS4_NO_GPU) && defined(__APPLE__)
-    if (!e || !e->ssd_streaming || e->backend != DS4_BACKEND_METAL ||
-        DS4_N_LAYER == 0 || !e->weights.layer[0].ffn_gate_tid2eid) {
-        return true;
-    }
-    const char *disabled = getenv("DS4_METAL_DISABLE_HASH_LAYER0_PRELOAD");
-    if (disabled && disabled[0] && strcmp(disabled, "0") != 0) return true;
-
-    int32_t expert_ids[DS4_N_EXPERT];
-    for (uint32_t expert = 0; expert < DS4_N_EXPERT; expert++) {
-        expert_ids[expert] = (int32_t)expert;
-    }
-    const double t0 = now_sec();
-    if (!metal_graph_prefetch_prefill_expert_layer_selected(
-                &e->model,
-                &e->weights,
-                0,
-                expert_ids,
-                DS4_N_EXPERT,
-                UINT32_MAX) ||
-        !metal_graph_activate_prefill_expert_layer(&e->model,
-                                                   &e->weights,
-                                                   0)) {
-        fprintf(stderr,
-                "ds4: startup hash layer 0 preload failed; first prefill will fall back to synchronous reads\n");
-        return false;
-    }
-    fprintf(stderr,
-            "ds4: startup hash layer 0 preloaded experts=%u time=%.3f ms\n",
-            (uint32_t)DS4_N_EXPERT,
-            (now_sec() - t0) * 1000.0);
+    (void)e;
+    /* The single-GGUF runtime loads L0 on the first request. */
     return true;
 #else
     (void)e;
@@ -61261,7 +60958,6 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
          * diagnostic path above, install the trace-derived first-Decode
          * experts only after the complete prompt has had its turn to use the
          * cache.  This is timing instrumentation, never a production hint. */
-        ds4_gpu_stream_expert_layer_prefetch_cancel_all();
         if (!metal_graph_seed_streaming_expert_cache_from_hotlist(
                 &s->graph, &e->model, &e->weights)) {
             snprintf(err, errlen,
@@ -62171,7 +61867,6 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             /* The hotlist was recorded from this prompt's genuine first
              * Decode route.  Installing it here measures arithmetic without
              * selected-expert SSD misses; it has no production code path. */
-            ds4_gpu_stream_expert_layer_prefetch_cancel_all();
             ds4_gpu_graph seed_graph;
             memset(&seed_graph, 0, sizeof(seed_graph));
             seed_graph.quality = e->quality;

@@ -1,6 +1,6 @@
 # Runtime provenance
 
-This directory is a source snapshot owned and built by `ds4f-mini`; the build
+This directory is a source snapshot owned and built by `ds4f-mac-mini`; the build
 does not clone, copy, or link a separate DwarfStar checkout.
 
 The initial implementation was derived from the MIT-licensed `antirez/ds4`

@@ -4,11 +4,9 @@
 *.stream-state.json
 # The public build manifest contains GGUF metadata only; it has no weight
 # payload and is intentionally versioned with the model skill.
-!/agents/skills/ds4f-mini-ops/assets/
-!/agents/skills/ds4f-mini-ops/assets/*.gguf
+!/agents/skills/ds4f-mac-mini-ops/assets/
+!/agents/skills/ds4f-mac-mini-ops/assets/*.gguf
 /reference-ds4/
-/reference-deepspec/
-/reference-kimi-k3-in-c/
 /models/
 /cache/
 /official-hf-staging/
