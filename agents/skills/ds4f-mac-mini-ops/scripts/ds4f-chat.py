@@ -53,24 +53,24 @@ def error_text(exc: Exception) -> str:
     return str(exc)
 
 
-class Spinner:
-    """Show a small typing indicator until the first response text arrives."""
+class PrefillStatus:
+    """Show elapsed waiting time until the first response text arrives."""
 
     def __init__(self) -> None:
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
+        self._started = 0.0
 
     def start(self) -> None:
+        self._started = time.monotonic()
         self._thread.start()
 
     def _run(self) -> None:
-        frames = (".  ", ".. ", "...")
-        index = 0
         while not self._stop.is_set():
-            sys.stdout.write(f"\r{frames[index % len(frames)]}")
+            elapsed = time.monotonic() - self._started
+            sys.stdout.write(f"\r[Prefilling {elapsed:.1f}s]")
             sys.stdout.flush()
-            index += 1
-            self._stop.wait(0.35)
+            self._stop.wait(0.1)
 
     def stop(self) -> None:
         if self._stop.is_set():
@@ -227,13 +227,13 @@ def run(args: argparse.Namespace) -> int:
 
     def send(prompt: str) -> None:
         messages.append({"role": "user", "content": prompt})
-        spinner = Spinner()
+        status = PrefillStatus()
 
         def on_first_text() -> None:
-            spinner.stop()
+            status.stop()
             sys.stdout.flush()
 
-        spinner.start()
+        status.start()
         try:
             content, usage = chat_once(
                 args.base_url,
@@ -249,13 +249,13 @@ def run(args: argparse.Namespace) -> int:
             )
         except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
             messages.pop()
-            spinner.stop()
+            status.stop()
             print(f"\n错误: {error_text(exc)}", file=sys.stderr)
             return
         finally:
             # If the server returns no text, the first-text callback never
             # stops the indicator.
-            spinner.stop()
+            status.stop()
         if not stream:
             print(content, end="")
         print()
