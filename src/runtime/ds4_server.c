@@ -8550,6 +8550,7 @@ typedef struct {
 static uint64_t server_env_mib(const char *name, uint64_t fallback_mib) {
     const char *value = getenv(name);
     if (!value || !value[0]) return fallback_mib * 1024ull * 1024ull;
+    if (strcmp(value, "greedy") == 0) return UINT64_MAX;
     char *end = NULL;
     errno = 0;
     unsigned long long mib = strtoull(value, &end, 10);
@@ -8561,6 +8562,18 @@ static uint64_t server_env_mib(const char *name, uint64_t fallback_mib) {
         return fallback_mib * 1024ull * 1024ull;
     }
     return (uint64_t)mib * 1024ull * 1024ull;
+}
+
+static void server_memory_budget_text(
+        uint64_t bytes,
+        char    *out,
+        size_t    out_size) {
+    if (!out || out_size == 0) return;
+    if (bytes == UINT64_MAX) {
+        snprintf(out, out_size, "greedy");
+        return;
+    }
+    snprintf(out, out_size, "%.2f GiB", (double)bytes / 1073741824.0);
 }
 
 static uint64_t server_default_working_set_mib(ds4_backend backend) {
@@ -8665,6 +8678,15 @@ static server_request_memory_plan server_build_request_memory_plan(
      * the complete non-routed trunk after its one-time phase transition. */
     plan.decode.resident_model_bytes =
         plan.decode.decode_resident_model_bytes;
+    /* Decode is the post-Prefill phase for this single active session.  Its
+     * planner must see the temporary Prefill headroom as reclaimable capacity;
+     * otherwise the later resize is clamped to the startup dynamic cache. */
+    plan.decode.configured_cache_experts =
+        ds4_engine_streaming_expert_cache_post_prefill_capacity(s->engine);
+    /* Prefill uses the same total temporary budget, so a full 256-expert
+     * layer is always representable even though Decode starts at 227 slots. */
+    plan.prefill.configured_cache_experts =
+        ds4_engine_streaming_expert_cache_post_prefill_capacity(s->engine);
     const bool reuse_static_decode_map = uncached != 0 &&
         slot && ds4_session_streaming_static_decode_map_current(slot->session);
     if (reuse_static_decode_map) {
@@ -8754,12 +8776,9 @@ static void server_memory_plan_begin_prefill(
     }
     /*
      * A continued one-session chat usually Prefills only a short suffix.
-     * On this fixed Mini that path prices a roughly 50 MiB staging workspace
-     * by reducing the expert target from Decode's 967 entries to 960.  A
-     * resize would discard the entire 6.37 GiB Decode LRU slab for seven
-     * entries.  The seven-entry delta fits inside the measured reserve, so
-     * retain the Decode pool only for this narrow small-suffix case.  Larger
-     * Prefills retain the normal memory plan and release behavior.
+     * On this fixed Mini that path prices a roughly 50 MiB staging workspace.
+     * If the planned Prefill and Decode pools are already the same size, keep
+     * the existing hot cache instead of clearing it for a short suffix.
      */
     const bool retain_decode_cache =
         plan->prefill.prefill_tokens <= DS4_SERVER_SMALL_PREFILL_MAX_ROWS &&
@@ -8769,22 +8788,19 @@ static void server_memory_plan_begin_prefill(
         plan->decode_experts : plan->prefill_experts;
     const uint32_t prefill_pinned_experts = retain_decode_cache ?
         plan->decode_pinned_experts : plan->prefill_pinned_experts;
-    uint32_t applied = ds4_engine_resize_streaming_expert_cache(
+    uint32_t applied = ds4_engine_resize_streaming_expert_cache_for_prefill(
             s->engine,
             prefill_experts,
-            prefill_pinned_experts,
-            true);
+            prefill_pinned_experts);
     uint32_t locked =
         ds4_engine_streaming_expert_cache_locked_count(s->engine);
-    /* A short continued Flash suffix takes the exact Decode-style path and
-     * never reads a layer-major batch buffer.  Leaving that 4K workspace
-     * purgeable preserves the prior Decode experts instead of forcing their
-     * eviction just to reactivate unused scratch. */
+    /* The Prefill pool is fixed and already resident from startup. A short
+     * continued Flash suffix may use the Decode graph, but it never changes
+     * the ownership or residency of the fixed pool. */
     const bool small_continued_decode_prefill =
         plan->prefill.prefill_tokens <= DS4_SERVER_SMALL_PREFILL_MAX_ROWS &&
         plan->uncached_tokens > 0 && plan->cached_tokens > 0;
-    uint64_t reacquired = small_continued_decode_prefill ? 0 :
-        ds4_session_prepare_prefill_workspace(slot->session);
+    const uint64_t reacquired = 0;
     plan->footprint_before_prefill = s->memory_calibration ?
         ds4_engine_task_phys_footprint(s->engine) : 0;
     pthread_mutex_unlock(&s->inference_mu);
@@ -8821,7 +8837,7 @@ static void server_memory_plan_begin_prefill(
     }
     if (small_continued_decode_prefill) {
         server_log(DS4_LOG_PREFILL,
-                   "ds4-server: small continued Flash Prefill uses exact Decode graph; batch workspace stays purgeable");
+                   "ds4-server: small continued Flash Prefill uses exact Decode graph; fixed workspace remains resident");
     }
 }
 
@@ -8833,7 +8849,14 @@ static void server_memory_plan_finish_prefill(
     pthread_mutex_lock(&s->inference_mu);
     const uint64_t footprint_prefill_peak = s->memory_calibration ?
         ds4_engine_task_phys_footprint(s->engine) : 0;
-    uint64_t released = ds4_session_release_prefill_workspace(slot->session);
+    /* Fixed-memory mode keeps the Prefill pool resident. The pointer ranges
+     * are reused by the next request instead of being marked purgeable. */
+    const uint64_t retained = ds4_session_prefill_workspace_owner_bytes(
+            slot->session);
+    const uint32_t cache_before_release =
+        plan->prefill.configured_cache_experts;
+    const uint32_t cache_after_release =
+        ds4_engine_release_prefill_expert_headroom(s->engine);
     const bool shrinking_expert_pool =
         plan->decode_experts < plan->prefill_experts;
     uint32_t applied = ds4_engine_resize_streaming_expert_cache(
@@ -8848,7 +8871,7 @@ static void server_memory_plan_finish_prefill(
         ds4_engine_task_phys_footprint(s->engine) : 0;
     pthread_mutex_unlock(&s->inference_mu);
     server_log(DS4_LOG_PREFILL,
-               "ds4-server: memory plan decode ctx=%d cache=%u/%.2f GiB pinned_target=%u/%.2f GiB locked_now=%u prefill_workspace_purged=%.2f GiB",
+               "ds4-server: memory plan decode ctx=%d cache=%u/%.2f GiB pinned_target=%u/%.2f GiB locked_now=%u prefill_workspace_retained=%.2f GiB headroom_reclaimed=%u->%u",
                plan->planned_context_tokens,
                applied,
                (double)applied * (double)plan->decode.per_expert_bytes /
@@ -8857,7 +8880,9 @@ static void server_memory_plan_finish_prefill(
                (double)plan->decode_pinned_experts *
                    (double)plan->decode.per_expert_bytes / 1073741824.0,
                locked,
-               (double)released / 1073741824.0);
+               (double)retained / 1073741824.0,
+               cache_before_release,
+               cache_after_release);
     if (s->memory_calibration) {
         const uint64_t touched_delta =
             footprint_prefill_peak > plan->footprint_before_prefill ?
@@ -8869,7 +8894,7 @@ static void server_memory_plan_finish_prefill(
                    "ds4-server: memory calibration rows=%u graph_logical=%llu workspace_owner=%llu footprint_before=%llu footprint_prefill=%llu footprint_after=%llu touched_delta=%llu purge_delta=%llu",
                    plan->prefill.prefill_tokens,
                    (unsigned long long)plan->prefill.graph_bytes,
-                   (unsigned long long)released,
+                   (unsigned long long)retained,
                    (unsigned long long)plan->footprint_before_prefill,
                    (unsigned long long)footprint_prefill_peak,
                    (unsigned long long)footprint_after_purge,
@@ -13779,18 +13804,26 @@ int main(int argc, char **argv) {
     s.memory_working_set_bytes =
         server_env_mib("DS4_SERVER_WORKING_SET_MIB", default_working_set_mib);
     s.memory_prefill_pinned_bytes =
-        server_env_mib("DS4_SERVER_PINNED_MIB", 4096);
+        server_env_mib("DS4_SERVER_PINNED_MIB", 8192);
     s.memory_decode_pinned_bytes =
-        server_env_mib("DS4_SERVER_DECODE_PINNED_MIB", 6144);
+        server_env_mib("DS4_SERVER_DECODE_PINNED_MIB", 8192);
     s.memory_reserve_bytes =
         server_env_mib("DS4_SERVER_MEMORY_RESERVE_MIB", 512);
     if (s.dynamic_memory_planner) {
+        char prefill_lock_budget[32];
+        char decode_lock_budget[32];
+        server_memory_budget_text(s.memory_prefill_pinned_bytes,
+                                  prefill_lock_budget,
+                                  sizeof(prefill_lock_budget));
+        server_memory_budget_text(s.memory_decode_pinned_bytes,
+                                  decode_lock_budget,
+                                  sizeof(decode_lock_budget));
         server_log(DS4_LOG_DEFAULT,
-                   "ds4-server: per-request memory planner enabled working_set=%.2f GiB%s prefill_lock_budget=%.2f GiB decode_lock_budget=%.2f GiB reserve=%.2f GiB small_prefill_rows=%u small_prefill_resident=%.2f MiB",
+                   "ds4-server: per-request memory planner enabled working_set=%.2f GiB%s prefill_lock_budget=%s decode_lock_budget=%s reserve=%.2f GiB small_prefill_rows=%u small_prefill_resident=%.2f MiB",
                    (double)s.memory_working_set_bytes / 1073741824.0,
                    getenv("DS4_SERVER_WORKING_SET_MIB") ? " (override)" : " (Metal recommended)",
-                   (double)s.memory_prefill_pinned_bytes / 1073741824.0,
-                   (double)s.memory_decode_pinned_bytes / 1073741824.0,
+                   prefill_lock_budget,
+                   decode_lock_budget,
                    (double)s.memory_reserve_bytes / 1073741824.0,
                    DS4_SERVER_SMALL_PREFILL_MAX_ROWS,
                    (double)DS4_SERVER_SMALL_PREFILL_RESIDENT_BYTES / 1048576.0);
@@ -13833,6 +13866,20 @@ int main(int argc, char **argv) {
         }
     }
 
+    if (slot_count == 1) {
+        uint64_t fixed_workspace_bytes = 0;
+        if (!ds4_session_preallocate_fixed_memory(
+                    s.slots[0].session, &fixed_workspace_bytes)) {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: fixed startup memory pool unavailable");
+            server_close_resources(&s);
+            return 1;
+        }
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: startup fixed Prefill/Decode workspace ready %.2f GiB",
+                   (double)fixed_workspace_bytes / 1073741824.0);
+    }
+
     /* This server is dedicated to one fixed Flash model. Spend idle startup
      * memory on all 256 experts of hash layer 0 so the first request can begin
      * L0 computation immediately after tokenization. L1/L2 are selected
@@ -13857,6 +13904,25 @@ int main(int argc, char **argv) {
         } else {
             server_log(DS4_LOG_WARNING,
                        "ds4-server: startup Decode static trunk preload unavailable; continuing with lazy exact fallback");
+        }
+    }
+
+    /* Single-session Mini mode owns the whole working set.  Preallocate and
+     * touch the complete routed-expert arena after the static trunk is ready,
+     * so later Prefill/Decode misses recycle slots instead of creating new
+     * Metal slabs. Set DS4_SERVER_EAGER_MEMORY=0 to return to lazy allocation.
+     */
+    const char *eager_memory = getenv("DS4_SERVER_EAGER_MEMORY");
+    if (slot_count == 1 && (!eager_memory || strcmp(eager_memory, "0") != 0)) {
+        const uint32_t eager_slots =
+            ds4_engine_preallocate_streaming_expert_cache(engine);
+        if (eager_slots != 0) {
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: startup fixed expert arena ready slots=%u",
+                       eager_slots);
+        } else {
+            server_log(DS4_LOG_WARNING,
+                       "ds4-server: startup fixed expert arena unavailable; using lazy expert slabs");
         }
     }
 

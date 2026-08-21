@@ -108,9 +108,9 @@ python3 agents/skills/ds4f-mac-mini-ops/scripts/ds4f-chat.py \
   --base-url http://mini:8000
 ```
 
-支持 `/new` 开始新对话、`/stream on|off` 切换流式输出、`/max_tokens N` 调整输出上限，
+支持 `/new` 开始新对话、`/max_tokens N` 调整输出上限、`/think on|off` 开关思考模式，
 `/quit` 退出。也可以用 `--prompt "你好"` 做一次性请求。每轮结束会显示 server 实测的
-Prefill 与 Decode 两段 token/s；Prefill 只统计本轮未命中 KV、实际新增计算的 token。
+Prefill 与 Decode 两段 token/s；开启思考模式时，终端会实时显示思考内容。终端支持直接粘贴多行文本，整段内容会作为一轮请求发送。Prefill 只统计本轮未命中 KV、实际新增计算的 token。
 
 运行一次固定 runner：
 

@@ -8276,6 +8276,16 @@ ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
             tensor.buffer = nil;
             return NULL;
         }
+        /* Fixed-memory server mode deliberately backs every tensor page at
+         * allocation time. This moves the VM fault cost to startup and makes
+         * later Prefill/Decode requests reuse a stable physical footprint. */
+        if (!ds4_gpu_tensor_touch((__bridge ds4_gpu_tensor *)tensor)) {
+            fprintf(stderr,
+                    "ds4: failed to touch Metal tensor allocation (%.2f MiB)\n",
+                    (double)bytes / (1024.0 * 1024.0));
+            ds4_gpu_tensor_free((__bridge ds4_gpu_tensor *)tensor);
+            return NULL;
+        }
         if (ds4_gpu_trace_allocs()) {
             fprintf(stderr,
                     "ds4: Metal tensor alloc %.3f MiB live %.3f MiB peak %.3f MiB\n",
@@ -8364,6 +8374,23 @@ void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
     DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
     return (uint8_t *)[obj.buffer contents] + obj.offset;
+}
+
+int ds4_gpu_tensor_touch(ds4_gpu_tensor *tensor) {
+    if (!tensor) return 0;
+    DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
+    if (!obj.buffer || obj.bytes == 0) return 1;
+    void *contents = [obj.buffer contents];
+    if (!contents) return 0;
+    const uint64_t page = (uint64_t)getpagesize();
+    volatile uint8_t *p = (volatile uint8_t *)contents + obj.offset;
+    for (uint64_t off = 0; off < obj.bytes; off += page) {
+        p[off] = 0;
+    }
+    p[obj.bytes - 1u] = 0;
+    [obj.buffer didModifyRange:NSMakeRange((NSUInteger)obj.offset,
+                                           (NSUInteger)obj.bytes)];
+    return 1;
 }
 
 uint64_t ds4_gpu_tensor_set_reusable(ds4_gpu_tensor *tensor, bool reusable) {
@@ -12838,6 +12865,94 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
                                                    gate_inner,
                                                    up_inner,
                                                    down_inner);
+}
+
+uint32_t ds4_gpu_preallocate_streaming_expert_cache(uint32_t experts) {
+    if (!g_ssd_streaming_mode || !ds4_gpu_stream_expert_slab_enabled() ||
+        experts == 0 || g_stream_expert_cache_expert_bytes == 0) {
+        return 0;
+    }
+
+    const uint32_t budget = ds4_gpu_stream_expert_cache_configured_budget();
+    if (budget != 0 && experts > budget) experts = budget;
+
+    uint64_t slot_bytes = g_stream_expert_cache_expert_bytes;
+    const uint64_t page = (uint64_t)getpagesize();
+    if (page != 0) slot_bytes = round_up_u64(slot_bytes, page);
+    if (slot_bytes == 0 || slot_bytes > (uint64_t)NSUIntegerMax) return 0;
+    if (g_stream_expert_cache_slab_slot_bytes != 0 &&
+        g_stream_expert_cache_slab_slot_bytes != slot_bytes) {
+        return 0;
+    }
+    g_stream_expert_cache_slab_slot_bytes = slot_bytes;
+
+    /* Turn unused capacity in slabs already created by the L0 startup
+     * preload into ordinary free slots before allocating another slab. */
+    for (uint32_t i = 0; i < g_stream_expert_cache_slab_count; i++) {
+        const uint32_t start = g_stream_expert_cache_slab_start_slot[i];
+        const uint32_t used = g_stream_expert_cache_slab_slots_used[i];
+        const uint32_t end = g_stream_expert_cache_slab_slot_count[i];
+        for (uint32_t local = used; local < end; local++) {
+            ds4_gpu_stream_expert_slab_push_free_slot(start + local);
+        }
+        g_stream_expert_cache_slab_slots_used[i] = end;
+    }
+
+    while (g_stream_expert_cache_slab_total_slots < experts) {
+        if (g_stream_expert_cache_slab_count >=
+            DS4_METAL_STREAM_EXPERT_CACHE_MAX_SLABS) {
+            break;
+        }
+        const uint32_t remaining =
+            experts - g_stream_expert_cache_slab_total_slots;
+        uint64_t target = ds4_gpu_stream_expert_slab_target_bytes();
+        uint64_t slots64 = target / slot_bytes;
+        if (slots64 == 0) slots64 = 1;
+        if (slots64 > remaining) slots64 = remaining;
+        uint32_t slots = (uint32_t)slots64;
+        id<MTLBuffer> slab_buffer = nil;
+        while (slots != 0) {
+            if ((uint64_t)slots <= UINT64_MAX / slot_bytes &&
+                (uint64_t)slots * slot_bytes <= (uint64_t)NSUIntegerMax) {
+                slab_buffer = ds4_gpu_stream_expert_alloc_slab_buffer(
+                        (uint64_t)slots * slot_bytes,
+                        @"ds4_stream_expert_eager_slab");
+                if (slab_buffer) break;
+            }
+            slots /= 2u;
+        }
+        if (!slab_buffer || slots == 0) break;
+
+        const uint32_t slab = g_stream_expert_cache_slab_count++;
+        const uint32_t start = g_stream_expert_cache_slab_total_slots;
+        g_stream_expert_cache_slabs[slab] = slab_buffer;
+        g_stream_expert_cache_slab_start_slot[slab] = start;
+        g_stream_expert_cache_slab_slot_count[slab] = slots;
+        g_stream_expert_cache_slab_slots_used[slab] = slots;
+        g_stream_expert_cache_slab_total_slots += slots;
+        for (uint32_t local = 0; local < slots; local++) {
+            ds4_gpu_stream_expert_slab_push_free_slot(start + local);
+        }
+    }
+
+    /* Touch every page so the arena is physically backed during startup,
+     * rather than merely reserving virtual Metal address space. */
+    for (uint32_t i = 0; i < g_stream_expert_cache_slab_count; i++) {
+        id<MTLBuffer> buffer = g_stream_expert_cache_slabs[i];
+        if (!buffer) continue;
+        void *contents = [buffer contents];
+        if (!contents) continue;
+        memset(contents, 0, (size_t)[buffer length]);
+        [buffer didModifyRange:NSMakeRange(0, [buffer length])];
+    }
+    (void)ds4_gpu_stream_expert_cache_apply_mlock_budget();
+    fprintf(stderr,
+            "ds4: eager streaming expert arena allocated=%u/%u slots %.2f GiB\n",
+            g_stream_expert_cache_slab_total_slots,
+            experts,
+            ds4_gpu_gib((uint64_t)g_stream_expert_cache_slab_total_slots *
+                        g_stream_expert_cache_slab_slot_bytes));
+    return g_stream_expert_cache_slab_total_slots;
 }
 
 static uint64_t ds4_gpu_stream_expert_buffer_object_count(

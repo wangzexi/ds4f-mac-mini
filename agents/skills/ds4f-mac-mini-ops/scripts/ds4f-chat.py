@@ -5,12 +5,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import select
 import sys
+import termios
 import threading
 import time
+import tty
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+MODEL_NAME = "deepseek-v4-flash"
 
 
 def parse_args() -> argparse.Namespace:
@@ -22,16 +28,10 @@ def parse_args() -> argparse.Namespace:
         default="http://127.0.0.1:8000",
         help="OpenAI-compatible server base URL",
     )
-    parser.add_argument("--model", default="deepseek-v4-flash")
     parser.add_argument("--max-tokens", type=int, default=4096)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
     parser.add_argument("--timeout", type=float, default=7200.0)
-    parser.add_argument(
-        "--no-stream",
-        action="store_true",
-        help="wait for the complete response instead of printing it incrementally",
-    )
     parser.add_argument("--api-key", default="", help="optional Bearer token")
     parser.add_argument("--prompt", help="send one prompt and exit")
     return parser.parse_args()
@@ -83,27 +83,25 @@ class PrefillStatus:
 
 def chat_once(
     base_url: str,
-    model: str,
     messages: list[dict[str, str]],
     max_tokens: int,
     temperature: float,
     top_p: float,
     timeout: float,
-    stream: bool,
+    think_enabled: bool,
     api_key: str,
     on_first_text: Callable[[], None] | None = None,
 ) -> tuple[str, dict[str, Any]]:
     payload: dict[str, Any] = {
-        "model": model,
+        "model": MODEL_NAME,
         "messages": messages,
         "max_tokens": max_tokens,
         "temperature": temperature,
         "top_p": top_p,
-        "stream": stream,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "thinking": think_enabled,
     }
-    if stream:
-        # ds4f-server emits a final usage-only SSE event for this option.
-        payload["stream_options"] = {"include_usage": True}
     request = Request(
         f"{base_url.rstrip('/')}/v1/chat/completions",
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
@@ -112,18 +110,12 @@ def chat_once(
     )
 
     started = time.monotonic()
-    if not stream:
-        with urlopen(request, timeout=timeout) as response:
-            result = json.loads(response.read().decode("utf-8"))
-        choices = result.get("choices") or []
-        content = choices[0].get("message", {}).get("content", "") if choices else ""
-        usage = result.get("usage") or {}
-        usage["elapsed_seconds"] = time.monotonic() - started
-        return content, usage
-
     parts: list[str] = []
     usage: dict[str, Any] = {}
     first_text_at: float | None = None
+    reasoning_started = False
+    reasoning_needs_line_break = False
+    content_started = False
     with urlopen(request, timeout=timeout) as response:
         for raw_line in response:
             line = raw_line.decode("utf-8", errors="replace").strip()
@@ -142,15 +134,40 @@ def chat_once(
             if not choices:
                 continue
             delta = choices[0].get("delta") or {}
+            reasoning = delta.get("reasoning_content") or ""
             text = delta.get("content") or ""
+            if reasoning:
+                if first_text_at is None:
+                    first_text_at = time.monotonic()
+                    if on_first_text is not None:
+                        on_first_text()
+                if not reasoning_started:
+                    sys.stdout.write("<think>\n")
+                    reasoning_started = True
+                sys.stdout.write(reasoning)
+                reasoning_needs_line_break = not reasoning.endswith("\n")
+                sys.stdout.flush()
             if text:
                 parts.append(text)
                 if first_text_at is None:
                     first_text_at = time.monotonic()
                     if on_first_text is not None:
                         on_first_text()
+                if think_enabled and not content_started:
+                    if reasoning_started:
+                        if reasoning_needs_line_break:
+                            sys.stdout.write("\n")
+                        sys.stdout.write("</think>\n\n")
+                    else:
+                        sys.stdout.write("<think>\n</think>\n\n")
+                content_started = True
                 sys.stdout.write(text)
                 sys.stdout.flush()
+    if reasoning_started and not content_started:
+        if reasoning_needs_line_break:
+            sys.stdout.write("\n")
+        sys.stdout.write("</think>\n\n")
+        sys.stdout.flush()
     usage["elapsed_seconds"] = time.monotonic() - started
     if first_text_at is not None:
         usage["first_token_seconds"] = first_text_at - started
@@ -187,43 +204,120 @@ def print_stats(usage: dict[str, Any]) -> None:
 
 def print_help() -> None:
     print("/new             清空当前对话")
-    print("/model NAME      切换模型名")
     print("/max_tokens N    设置本轮最大输出 token 数")
-    print("/stream on|off   开关流式输出")
-    print("/history         显示当前消息数量")
+    print("/think on|off    开关思考模式")
     print("/quit            退出")
 
 
-def configure_readline() -> None:
-    """Keep Backspace and the macOS Delete key working at end-of-line."""
+def _read_byte(fd: int) -> bytes:
+    return os.read(fd, 1)
+
+
+def _read_escape_sequence(fd: int) -> bytes:
+    """Read a short terminal escape sequence after the initial ESC byte."""
+    sequence = bytearray()
+    known_endings = (b"[A", b"[B", b"[C", b"[D", b"[3~", b"[200~")
+    deadline = time.monotonic() + 0.1
+    while len(sequence) < 5:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        ready, _, _ = select.select([fd], [], [], remaining)
+        if not ready:
+            break
+        sequence.extend(_read_byte(fd))
+        current = bytes(sequence)
+        if current in known_endings:
+            break
+    return bytes(sequence)
+
+
+def _read_bracketed_paste(fd: int) -> str:
+    """Read one terminal bracketed-paste block, including embedded newlines."""
+    end_marker = b"\x1b[201~"
+    data = bytearray()
+    while True:
+        data.extend(_read_byte(fd))
+        if data.endswith(end_marker):
+            del data[-len(end_marker):]
+            break
+    return bytes(data).replace(b"\r\n", b"\n").replace(b"\r", b"\n").decode(
+        "utf-8", errors="replace"
+    )
+
+
+def read_prompt(prompt: str) -> str | None:
+    """Read a line and keep bracketed multi-line pastes as one prompt."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        line = sys.stdin.readline()
+        if not line:
+            return None
+        return line.rstrip("\r\n")
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    buffer: list[str] = []
     try:
-        import readline
-    except ImportError:
-        return
-    if "libedit" in (readline.__doc__ or "").lower():
-        bindings = (
-            r'bind -e',
-            r'bind "\e[3~" ed-delete-next-char',
-            r'bind "^?" ed-delete-prev-char',
-            r'bind "^H" ed-delete-prev-char',
-        )
-    else:
-        bindings = (
-            r'"\e[3~": delete-char',
-            r'"\C-?": backward-delete-char',
-            r'"\C-h": backward-delete-char',
-        )
-    for binding in bindings:
-        try:
-            readline.parse_and_bind(binding)
-        except (ValueError, RuntimeError):
-            pass
+        tty.setcbreak(fd)
+        sys.stdout.write("\x1b[?2004h")
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        while True:
+            byte = _read_byte(fd)
+            if byte in {b"\r", b"\n"}:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return "".join(buffer)
+            if byte == b"\x03":
+                raise KeyboardInterrupt
+            if byte == b"\x04":
+                if not buffer:
+                    raise EOFError
+                continue
+            if byte in {b"\x7f", b"\x08"}:
+                if buffer:
+                    buffer.pop()
+                    sys.stdout.write("\r\033[K" + prompt + "".join(buffer))
+                    sys.stdout.flush()
+                continue
+            if byte == b"\x15":
+                buffer.clear()
+                sys.stdout.write("\r\033[K" + prompt)
+                sys.stdout.flush()
+                continue
+            if byte == b"\x1b":
+                sequence = _read_escape_sequence(fd)
+                if sequence == b"[200~":
+                    pasted = _read_bracketed_paste(fd)
+                    buffer.extend(pasted)
+                    sys.stdout.write(pasted)
+                    sys.stdout.flush()
+                elif sequence == b"[3~" and buffer:
+                    buffer.pop()
+                    sys.stdout.write("\r\033[K" + prompt + "".join(buffer))
+                    sys.stdout.flush()
+                continue
+            if byte[0] < 0x20:
+                continue
+            pending = byte
+            while True:
+                try:
+                    character = pending.decode("utf-8")
+                    break
+                except UnicodeDecodeError:
+                    pending += _read_byte(fd)
+            buffer.append(character)
+            sys.stdout.write(character)
+            sys.stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        sys.stdout.write("\x1b[?2004l")
+        sys.stdout.flush()
 
 
 def run(args: argparse.Namespace) -> int:
-    configure_readline()
     messages: list[dict[str, str]] = []
-    stream = not args.no_stream
+    think_enabled = False
 
     def send(prompt: str) -> None:
         messages.append({"role": "user", "content": prompt})
@@ -237,15 +331,14 @@ def run(args: argparse.Namespace) -> int:
         try:
             content, usage = chat_once(
                 args.base_url,
-                args.model,
                 messages,
                 args.max_tokens,
                 args.temperature,
                 args.top_p,
                 args.timeout,
-                stream,
+                think_enabled,
                 args.api_key,
-                on_first_text if stream else None,
+                on_first_text,
             )
         except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
             messages.pop()
@@ -256,8 +349,6 @@ def run(args: argparse.Namespace) -> int:
             # If the server returns no text, the first-text callback never
             # stops the indicator.
             status.stop()
-        if not stream:
-            print(content, end="")
         print()
         messages.append({"role": "assistant", "content": content})
         print_stats(usage)
@@ -271,13 +362,21 @@ def run(args: argparse.Namespace) -> int:
     print("帮助 /help 查看命令")
     while True:
         try:
-            prompt = input("\n> ").strip()
+            prompt = read_prompt("\n> ")
         except (EOFError, KeyboardInterrupt):
             print()
             return 0
-        if not prompt:
+        if prompt is None:
+            print()
+            return 0
+        if not prompt.strip():
             continue
-        command, _, argument = prompt.partition(" ")
+        command_line = prompt.strip()
+        if "\n" in prompt:
+            command = ""
+            argument = ""
+        else:
+            command, _, argument = command_line.partition(" ")
         if command in {"/quit", "/exit", "/q"}:
             return 0
         if command == "/help":
@@ -287,20 +386,12 @@ def run(args: argparse.Namespace) -> int:
             messages.clear()
             print("已开始新对话。")
             continue
-        if command == "/history":
-            print(f"当前对话消息: {len(messages)}")
-            continue
-        if command == "/model" and argument.strip():
-            args.model = argument.strip()
-            print(f"模型已切换为: {args.model}")
-            continue
         if command == "/max_tokens" and argument.strip().isdigit():
             args.max_tokens = max(1, int(argument.strip()))
             print(f"max_tokens={args.max_tokens}")
             continue
-        if command == "/stream" and argument.strip() in {"on", "off"}:
-            stream = argument.strip() == "on"
-            print(f"stream={'on' if stream else 'off'}")
+        if command == "/think" and argument.strip() in {"on", "off"}:
+            think_enabled = argument.strip() == "on"
             continue
         if command.startswith("/"):
             print("未知命令，输入 /help 查看帮助。")

@@ -50,6 +50,8 @@ ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base, uint64_t offset,
 void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor);
 uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor);
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor);
+/* Physically back every page of an owner buffer before serving requests. */
+int ds4_gpu_tensor_touch(ds4_gpu_tensor *tensor);
 /* Mark owner-backed shared tensor pages reclaimable between prefill calls.
  * On Metal, reusable=true uses macOS VM reusable-page accounting and
  * reusable=false reacquires the range before the GPU touches it again.
@@ -185,6 +187,10 @@ uint32_t ds4_gpu_resize_streaming_expert_cache_budget(
         uint32_t pinned_experts,
         bool     release_resident);
 void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
+/* Eagerly allocate and touch the configured expert-cache arena.  The cache
+ * remains pageable above macOS' measured mlock limit, but no later expert
+ * miss needs to create a new slab. */
+uint32_t ds4_gpu_preallocate_streaming_expert_cache(uint32_t experts);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint64_t ds4_gpu_task_phys_footprint(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);

@@ -261,6 +261,16 @@ bool ds4_engine_request_memory_profile(
         int                         planned_context_tokens,
         uint32_t                    prefill_tokens,
         ds4_request_memory_profile *out);
+/* The startup cache budget is split between the live Decode cache and a
+ * temporary Prefill headroom.  A single-session server may reclaim that
+ * headroom after Prefill and use it for Decode. */
+uint32_t ds4_engine_streaming_expert_cache_post_prefill_capacity(ds4_engine *e);
+uint32_t ds4_engine_release_prefill_expert_headroom(ds4_engine *e);
+uint32_t ds4_engine_resize_streaming_expert_cache_for_prefill(
+        ds4_engine *e,
+        uint32_t    experts,
+        uint32_t    pinned_experts);
+uint32_t ds4_engine_preallocate_streaming_expert_cache(ds4_engine *e);
 uint32_t ds4_engine_resize_streaming_expert_cache(
         ds4_engine *e,
         uint32_t    experts,
@@ -399,6 +409,8 @@ int ds4_session_sync(ds4_session *s, const ds4_tokens *prompt, char *err, size_t
 uint64_t ds4_session_prepare_prefill_workspace(ds4_session *s);
 uint64_t ds4_session_release_prefill_workspace(ds4_session *s);
 uint64_t ds4_session_prefill_workspace_owner_bytes(ds4_session *s);
+bool ds4_session_preallocate_fixed_memory(ds4_session *s,
+                                           uint64_t *bytes_out);
 bool ds4_session_rewrite_requires_rebuild(int live_len, int canonical_len, int common);
 ds4_session_rewrite_result ds4_session_rewrite_from_common(
         ds4_session *s, const ds4_tokens *prompt, int common,

@@ -114,8 +114,10 @@ run_server() {
     prefill_release_hash_layer0_after=${DS4F_SERVER_PREFILL_RELEASE_HASH_LAYER0_AFTER:-2}
     pread_threads=${DS4F_SERVER_PREAD_THREADS:-5}
     working_set_mib=${DS4F_SERVER_WORKING_SET_MIB:-auto}
-    pinned_mib=${DS4F_SERVER_PINNED_MIB:-4096}
-    decode_pinned_mib=${DS4F_SERVER_DECODE_PINNED_MIB:-4096}
+    # Greedily ask macOS to wire the entire eager expert arena. The kernel/
+    # Metal path stops at the first rejected lock request.
+    pinned_mib=${DS4F_SERVER_PINNED_MIB:-greedy}
+    decode_pinned_mib=${DS4F_SERVER_DECODE_PINNED_MIB:-greedy}
     reserve_mib=${DS4F_SERVER_MEMORY_RESERVE_MIB:-512}
     kv_cache_dir=${DS4F_SERVER_KV_CACHE_DIR:-/tmp/ds4f-mac-mini/kv}
     kv_cache_mib=${DS4F_SERVER_KV_CACHE_MIB:-10240}

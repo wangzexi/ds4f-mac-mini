@@ -58424,6 +58424,125 @@ bool ds4_engine_request_memory_profile(
     return true;
 }
 
+uint32_t ds4_engine_streaming_expert_cache_post_prefill_capacity(ds4_engine *e) {
+    if (!e || !e->ssd_streaming) return 0;
+
+    uint64_t per_expert_bytes = 0;
+    if (!ds4_streaming_routed_expert_bytes(&e->weights,
+                                           &per_expert_bytes) ||
+        per_expert_bytes == 0) {
+        return e->ssd_streaming_cache_experts;
+    }
+
+    uint64_t extra_experts =
+        e->ssd_streaming_prefill_headroom_bytes / per_expert_bytes;
+    uint64_t capacity = (uint64_t)e->ssd_streaming_cache_experts;
+    if (extra_experts > UINT64_MAX - capacity) return UINT32_MAX;
+    capacity += extra_experts;
+
+    uint64_t max_cacheable = 0;
+    if (ds4_streaming_cacheable_expert_count(&e->weights,
+                                             &max_cacheable,
+                                             NULL) &&
+        capacity > max_cacheable) {
+        capacity = max_cacheable;
+    }
+    if (capacity > UINT32_MAX) capacity = UINT32_MAX;
+    return (uint32_t)capacity;
+}
+
+uint32_t ds4_engine_release_prefill_expert_headroom(ds4_engine *e) {
+    if (!e || !e->ssd_streaming) return 0;
+
+    const uint32_t old_capacity = e->ssd_streaming_cache_experts;
+    const uint64_t headroom_bytes = e->ssd_streaming_prefill_headroom_bytes;
+    if (headroom_bytes == 0) return old_capacity;
+
+    const uint32_t new_capacity =
+        ds4_engine_streaming_expert_cache_post_prefill_capacity(e);
+    if (new_capacity > old_capacity) {
+        uint64_t per_expert_bytes = 0;
+        if (ds4_streaming_routed_expert_bytes(&e->weights,
+                                               &per_expert_bytes) &&
+            per_expert_bytes != 0 &&
+            (uint64_t)new_capacity <= UINT64_MAX / per_expert_bytes) {
+            e->ssd_streaming_cache_experts = new_capacity;
+            e->ssd_streaming_cache_bytes =
+                (uint64_t)new_capacity * per_expert_bytes;
+        }
+    }
+    /* The headroom is now part of the live cache budget.  Clear it before
+     * the next request profile is built so it cannot be reserved twice. */
+    e->ssd_streaming_prefill_headroom_bytes = 0;
+    return e->ssd_streaming_cache_experts;
+}
+
+uint32_t ds4_engine_resize_streaming_expert_cache_for_prefill(
+        ds4_engine *e,
+        uint32_t    experts,
+        uint32_t    pinned_experts) {
+    if (!e || !e->ssd_streaming) return 0;
+
+    const uint32_t prefill_capacity =
+        ds4_engine_streaming_expert_cache_post_prefill_capacity(e);
+    if (experts > prefill_capacity) experts = prefill_capacity;
+
+    /* The normal resize path deliberately clamps to the Decode cache ceiling.
+     * Temporarily expose the reclaimable Prefill headroom so a full 256-expert
+     * layer (or the measured two-layer reserve) can actually be staged.  Keep
+     * the engine's phase accounting unchanged until Prefill finishes; the
+     * completion path then converts the headroom into the Decode ceiling. */
+    const uint32_t old_experts = e->ssd_streaming_cache_experts;
+    const uint64_t old_cache_bytes = e->ssd_streaming_cache_bytes;
+    uint64_t per_expert_bytes = 0;
+    if (experts > old_experts &&
+        ds4_streaming_routed_expert_bytes(&e->weights,
+                                          &per_expert_bytes) &&
+        per_expert_bytes != 0 &&
+        (uint64_t)prefill_capacity <= UINT64_MAX / per_expert_bytes) {
+        e->ssd_streaming_cache_experts = prefill_capacity;
+        e->ssd_streaming_cache_bytes =
+            (uint64_t)prefill_capacity * per_expert_bytes;
+    }
+    const uint32_t applied = ds4_engine_resize_streaming_expert_cache(
+            e, experts, pinned_experts, false);
+    e->ssd_streaming_cache_experts = old_experts;
+    e->ssd_streaming_cache_bytes = old_cache_bytes;
+    return applied;
+}
+
+uint32_t ds4_engine_preallocate_streaming_expert_cache(ds4_engine *e) {
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+    if (!e || !e->ssd_streaming || e->backend != DS4_BACKEND_METAL) return 0;
+
+    const uint32_t capacity =
+        ds4_engine_streaming_expert_cache_post_prefill_capacity(e);
+    const uint32_t old_experts = e->ssd_streaming_cache_experts;
+    const uint64_t old_cache_bytes = e->ssd_streaming_cache_bytes;
+    uint64_t per_expert_bytes = 0;
+    if (capacity > old_experts &&
+        ds4_streaming_routed_expert_bytes(&e->weights,
+                                          &per_expert_bytes) &&
+        per_expert_bytes != 0 &&
+        (uint64_t)capacity <= UINT64_MAX / per_expert_bytes) {
+        e->ssd_streaming_cache_experts = capacity;
+        e->ssd_streaming_cache_bytes =
+            (uint64_t)capacity * per_expert_bytes;
+    }
+    const uint32_t budget = e->ssd_streaming_cache_experts;
+    (void)ds4_gpu_resize_streaming_expert_cache_budget(
+            budget, budget, false);
+    const uint32_t allocated =
+        ds4_gpu_preallocate_streaming_expert_cache(budget);
+    e->ssd_streaming_cache_experts = old_experts;
+    e->ssd_streaming_cache_bytes = old_cache_bytes;
+    return allocated;
+#else
+    (void)e;
+    return 0;
+#endif
+}
+
 uint32_t ds4_engine_resize_streaming_expert_cache(
         ds4_engine *e,
         uint32_t    experts,
@@ -66977,6 +67096,41 @@ uint64_t ds4_session_prepare_prefill_workspace(ds4_session *s) {
 #else
     (void)s;
     return 0;
+#endif
+}
+
+bool ds4_session_preallocate_fixed_memory(ds4_session *s,
+                                          uint64_t *bytes_out) {
+    if (bytes_out) *bytes_out = 0;
+#ifndef DS4_NO_GPU
+    if (!s || !s->engine ||
+        s->engine->backend != DS4_BACKEND_METAL ||
+        DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK4) {
+        return true;
+    }
+
+    /* batch_ffn_out used to be created on the first batched Prefill. Make it
+     * part of the startup-owned pool so no request can grow the Metal graph. */
+    for (int t = 0; t < DS4_MAX_GPUS; t++) {
+        if (!s->graph.batch_cur_hc_by_tier[t]) continue;
+        if (!metal_graph_ensure_batch_ffn_out_on(&s->graph, t)) {
+            fprintf(stderr,
+                    "ds4: fixed-memory startup could not allocate batch FFN pool on tier %d\n",
+                    t);
+            return false;
+        }
+    }
+
+    /* Keep the complete Prefill pool non-purgeable for the lifetime of the
+     * single session. Tensor allocation already touches all owner buffers;
+     * this call also reacquires any range that an earlier setup path marked
+     * reusable. */
+    (void)metal_graph_set_prefill_workspace_reusable(&s->graph, false);
+    if (bytes_out) *bytes_out = metal_graph_prefill_workspace_owner_bytes(&s->graph);
+    return true;
+#else
+    (void)s;
+    return true;
 #endif
 }
 
