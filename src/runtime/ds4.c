@@ -19790,6 +19790,58 @@ static bool metal_graph_prefill_full_layer_enabled(void) {
                    "DS4_METAL_DISABLE_STREAMING_PREFILL_FULL_LAYER");
 }
 
+/* Producer-consumer adaptation for the rolling full-layer Prefill window.
+ * Whole-layer reads only pay off while Prefill compute is slower than one
+ * full-layer SSD read, so the prefetch window stays ahead of the consumer.
+ * When compute is faster (short prompts), the window never builds up and
+ * every whole-layer byte lands on the critical path; precise expert-cache
+ * miss reads of just the routed experts are then strictly cheaper. */
+static bool metal_graph_prefill_adaptive_full_layer_enabled(void) {
+    const char *env = getenv("DS4_METAL_PREFILL_ADAPTIVE_FULL_LAYER");
+    if (env && env[0] && strcmp(env, "0") == 0) return false;
+    return metal_graph_prefill_full_layer_enabled();
+}
+
+static double metal_graph_prefill_adaptive_read_rate_mibs(void) {
+    const char *env = getenv("DS4_METAL_PREFILL_ADAPTIVE_READ_RATE_MIBS");
+    if (env && env[0]) {
+        char *end = NULL;
+        const double value = strtod(env, &end);
+        if (end != env && *end == '\0' && value > 0.0) return value;
+    }
+    return 1800.0;
+}
+
+/* Precise miss reads serialize with compute and their byte count grows
+ * quickly with rows (routed sets saturate after a few dozen tokens), so the
+ * adaptive switch is only profitable for short chunks. */
+static uint32_t metal_graph_prefill_adaptive_max_rows(void) {
+    const char *env = getenv("DS4_METAL_PREFILL_ADAPTIVE_MAX_ROWS");
+    if (env && env[0]) {
+        char *end = NULL;
+        const unsigned long value = strtoul(env, &end, 10);
+        if (end != env && *end == '\0') return (uint32_t)value;
+    }
+    return 128u;
+}
+
+static double metal_graph_prefill_adaptive_full_layer_read_ms(
+        const ds4_weights *weights,
+        uint32_t           il) {
+    ds4_model_map_span_vec spans;
+    if (!weights_model_map_spans(weights, il, il, false, &spans)) {
+        return 0.0;
+    }
+    uint64_t bytes = 0;
+    for (uint32_t i = 0; i < spans.len; i++) {
+        bytes += spans.v[i].end - spans.v[i].off;
+    }
+    free(spans.v);
+    if (bytes == 0) return 0.0;
+    return (double)bytes / 1048576.0 /
+           metal_graph_prefill_adaptive_read_rate_mibs() * 1000.0;
+}
+
 static uint32_t metal_graph_prefill_static_decode_prefetch_max_tokens(void) {
     if (metal_graph_prefill_full_layer_enabled()) {
         return UINT32_MAX;
@@ -34236,6 +34288,15 @@ static bool metal_graph_prefill_layer_major_decode_rows(
     uint32_t interrupted_row = UINT32_MAX;
     const uint32_t release_hash_layer0_after =
         metal_graph_prefill_release_hash_layer0_after();
+    const bool adaptive_full_layer =
+        metal_graph_prefill_adaptive_full_layer_enabled();
+    const double adaptive_read_ms =
+        adaptive_full_layer ?
+        metal_graph_prefill_adaptive_full_layer_read_ms(weights, 1) :
+        0.0;
+    const uint32_t adaptive_max_rows =
+        metal_graph_prefill_adaptive_max_rows();
+    double adaptive_compute_ema_ms = 0.0;
     if (g->ssd_streaming && !reuse_static_decode_map &&
         full_layer_prefetch_mode) {
         ds4_gpu_streaming_prefill_full_expert_addr_table_begin();
@@ -34307,6 +34368,28 @@ static bool metal_graph_prefill_layer_major_decode_rows(
                         true,
                         full_layer_prefetched);
             }
+            if (full_layer_prefetch_available && adaptive_full_layer &&
+                n_tokens <= adaptive_max_rows &&
+                adaptive_read_ms > 0.0 && adaptive_compute_ema_ms > 0.0 &&
+                adaptive_compute_ema_ms < adaptive_read_ms) {
+                /* The consumer outruns the producer: a whole layer is read
+                 * faster than it is consumed, so the rolling window never
+                 * accumulates slack.  Stop submitting whole-layer reads and
+                 * serve the remaining layers from precise expert-cache miss
+                 * reads instead. */
+                full_layer_prefetch_available = false;
+                memset(full_layer_prefetched,
+                       0,
+                       sizeof(full_layer_prefetched));
+                ds4_gpu_model_prefetch_cancel_all();
+                ds4_gpu_streaming_prefill_full_expert_addr_table_end();
+                fprintf(stderr,
+                        "ds4: Prefill adaptive: layer compute %.1f ms stays below "
+                        "the %.1f ms whole-layer read; switched to precise "
+                        "selected-expert reads\n",
+                        adaptive_compute_ema_ms,
+                        adaptive_read_ms);
+            }
             if (!reuse_static_decode_map) {
                 if (!full_layer_prefetch_available) {
                     for (uint32_t d = 1;
@@ -34327,7 +34410,8 @@ static bool metal_graph_prefill_layer_major_decode_rows(
                                                           n_tokens);
             }
         }
-        const double compute_started = layer_profile ? now_sec() : 0.0;
+        const double compute_started =
+            (layer_profile || adaptive_full_layer) ? now_sec() : 0.0;
         if (ok) ok = ds4_gpu_begin_commands() != 0;
         for (uint32_t t = 0; ok && t < n_tokens; t++) {
             if (cancel && cancel(cancel_ud)) {
@@ -34374,7 +34458,15 @@ static bool metal_graph_prefill_layer_major_decode_rows(
         }
         if (ok) ok = ds4_gpu_end_commands() != 0;
         else (void)ds4_gpu_synchronize();
-        const double compute_finished = layer_profile ? now_sec() : 0.0;
+        const double compute_finished =
+            (layer_profile || adaptive_full_layer) ? now_sec() : 0.0;
+        if (adaptive_full_layer && compute_finished > compute_started) {
+            const double compute_ms =
+                (compute_finished - compute_started) * 1000.0;
+            adaptive_compute_ema_ms = adaptive_compute_ema_ms > 0.0 ?
+                0.5 * adaptive_compute_ema_ms + 0.5 * compute_ms :
+                compute_ms;
+        }
         if (layer_profile) {
             fprintf(stderr,
                     "ds4-prefill-layer: layer=%u tokens=%u prepare_ms=%.3f "
