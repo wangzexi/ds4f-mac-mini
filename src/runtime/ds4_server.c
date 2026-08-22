@@ -10135,6 +10135,30 @@ static void kv_cache_store_response_end(server *s, server_slot *slot,
     }
 }
 
+static bool server_prefill_layer_zero_enabled(const server *s) {
+    if (!s || s->slot_count != 1) return false;
+    const char *enabled = getenv("DS4_SERVER_PREFILL_PRELOAD_FIRST_LAYER");
+    return enabled && enabled[0] && strcmp(enabled, "0") != 0;
+}
+
+/* Start or rearm the idle Prefill layer for the single-session server. The
+ * Decode trunk and live KV remain resident; only layer 0 is read ahead. */
+static void server_start_or_rearm_prefill_layer_zero(server *s,
+                                                      server_slot *slot,
+                                                      const char *phase) {
+    if (!s || !slot || !server_prefill_layer_zero_enabled(s) ||
+        !slot->session) return;
+    if (ds4_session_preload_prefill_layer_zero(slot->session)) {
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: %s Prefill layer 0 preload active slot=%d",
+                   phase ? phase : "idle", slot->id);
+    } else {
+        server_log(DS4_LOG_WARNING,
+                   "ds4-server: %s Prefill layer 0 preload unavailable slot=%d; next request will read on demand",
+                   phase ? phase : "idle", slot->id);
+    }
+}
+
 #ifdef DS4_SERVER_TEST
 static int kv_cache_suppress_continued_store(kv_disk_cache *kc, int tokens) {
     return ds4_kvstore_suppress_continued_store(kc, tokens);
@@ -11777,8 +11801,16 @@ static void generate_job(server *s, server_slot *slot, job *j) {
                    "Anthropic continuation state is not available; retry by replaying the full messages history");
         return;
     } else if (cached == 0) {
+        /* Any engine whose live checkpoint is a plain token-prefix state can
+         * reuse a fully-matched prompt prefix by rewinding the session; the
+         * compressor partial-window state is rebuilt deterministically from
+         * the token count on the next prefill.  Set
+         * DS4_SERVER_LIVE_REWIND_DISABLE=1 to temporarily fall back to a full
+         * re-prefill. */
+        const bool backend_can_rewind =
+            getenv("DS4_SERVER_LIVE_REWIND_DISABLE") == NULL;
         const int rewind_to = live_prefix_rewind_target(
-            ds4_engine_is_glm_dsa(s->engine), old_pos,
+            backend_can_rewind, old_pos,
             j->req.prompt.len, common);
         if (rewind_to >= 0) {
             pthread_mutex_lock(&s->inference_mu);
@@ -11788,7 +11820,7 @@ static void generate_job(server *s, server_slot *slot, job *j) {
             cache_source = "memory-rewind";
             cache_diag.rewind_to = rewind_to;
             server_log(DS4_LOG_KVCACHE,
-                       "ds4-server: rewound GLM live prefix from %d to %d; final prompt token will be reevaluated",
+                       "ds4-server: rewound live prefix from %d to %d; final prompt token will be reevaluated",
                        old_pos, rewind_to);
         } else {
             cached = common == old_pos && j->req.prompt.len >= old_pos ? common : 0;
@@ -12848,6 +12880,7 @@ decode_again:
      * exact post-response frontier before the worker accepts another request,
      * so a future full-history prompt can restore it from disk safely. */
     kv_cache_store_response_end(s, slot, final_finish);
+    server_start_or_rearm_prefill_layer_zero(s, slot, "response-end");
     free(parsed_content);
     free(parsed_reasoning);
     tool_calls_free(&parsed_calls);
@@ -13925,6 +13958,11 @@ int main(int argc, char **argv) {
                        "ds4-server: startup fixed expert arena unavailable; using lazy expert slabs");
         }
     }
+
+    /* Keep the first complete Prefill layer warm while the single-session
+     * server is idle. The request path adopts this pending buffer and starts
+     * rolling reads from layer 1 without rereading layer 0. */
+    server_start_or_rearm_prefill_layer_zero(&s, &s.slots[0], "startup");
 
     if (cfg.kv_disk_dir) {
         kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
