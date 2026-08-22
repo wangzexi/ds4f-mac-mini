@@ -146,8 +146,6 @@ typedef struct {
     uint64_t simulate_used_memory_bytes;
     bool warm_weights;
     bool quality;
-    bool glm_mtp;
-    bool glm_mtp_timing;
     bool dspark;
     bool dspark_strict;
     bool dspark_confidence_threshold_set;

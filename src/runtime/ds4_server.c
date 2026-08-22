@@ -962,23 +962,16 @@ static bool parse_output_config_effort(const char **p, ds4_think_mode *effort) {
 static bool model_alias_disables_thinking(const char *model) {
     return model &&
            (!strcmp(model, "deepseek-v4-flash") ||
-            !strcmp(model, "deepseek-chat") ||
-            !strcmp(model, "glm-5.2-chat") ||
-            !strcmp(model, "glm-5.2-no-think") ||
-            !strcmp(model, "glm-5.2-nothink") ||
-            !strcmp(model, "zai/glm-5.2-chat"));
+            !strcmp(model, "deepseek-chat"));
 }
 
 static bool model_alias_enables_thinking(const char *model) {
-    return model &&
-           (!strcmp(model, "deepseek-reasoner") ||
-            !strcmp(model, "glm-5.2-reasoner") ||
-            !strcmp(model, "zai/glm-5.2-reasoner"));
+    return model && !strcmp(model, "deepseek-reasoner");
 }
 
 static server_model_syntax server_model_syntax_for_engine(ds4_engine *engine) {
-    return ds4_engine_is_glm_dsa(engine) ?
-           SERVER_MODEL_SYNTAX_GLM : SERVER_MODEL_SYNTAX_DEEPSEEK;
+    (void)engine;
+    return SERVER_MODEL_SYNTAX_DEEPSEEK;
 }
 
 static const char *server_model_id_from_engine(ds4_engine *engine) {
@@ -2094,23 +2087,6 @@ static void append_tools_prompt_text(buf *b, const char *tool_schemas) {
                 "Use the exact parameter names from the schemas.");
 }
 
-static void append_glm_tools_prompt_text(buf *b, const char *tool_schemas) {
-    if (!tool_schemas || !tool_schemas[0]) return;
-    buf_puts(b,
-        "## Tools\n\n"
-        "You may call one or more functions to help answer the user question.\n\n"
-        "You are provided with function signatures within <tools></tools> XML tags:\n"
-        "<tools>\n");
-    buf_puts(b, tool_schemas);
-    buf_puts(b,
-        "\n</tools>\n\n"
-        "For each function call, use exactly this XML format:\n"
-        "<tool_call>{function-name}"
-        "<arg_key>{argument-name}</arg_key>"
-        "<arg_value>{argument-value}</arg_value>"
-        "</tool_call>\n\n"
-        "Emit one <tool_call> block per function call. Use the exact tool and argument names from the schemas.");
-}
 
 static void json_escape(buf *b, const char *s);
 
@@ -2220,29 +2196,9 @@ static void append_dsml_parameter_text(buf *b, const char *s) {
     }
 }
 
-static void append_glm_tag_body_text(buf *b, const char *s, const char *end) {
-    const size_t endlen = strlen(end);
-    for (s = s ? s : ""; *s;) {
-        if (!strncmp(s, end, endlen)) {
-            buf_puts(b, "&lt;");
-            s++;
-        } else {
-            buf_putc(b, *s++);
-        }
-    }
-}
 
-static void append_glm_arg_key_text(buf *b, const char *s) {
-    append_glm_tag_body_text(b, s, "</arg_key>");
-}
 
-static void append_glm_arg_value_text(buf *b, const char *s) {
-    append_glm_tag_body_text(b, s, "</arg_value>");
-}
 
-static void append_glm_tool_response_text(buf *b, const char *s) {
-    append_glm_tag_body_text(b, s, "</tool_response>");
-}
 
 static void append_tool_result_text(buf *b, const char *s) {
     /* Tool output is data.  DeepSeek's renderer keeps it as ordinary text inside
@@ -2286,13 +2242,6 @@ static void append_dsml_arg(buf *b, const json_arg *arg) {
     buf_puts(b, "</｜DSML｜parameter>\n");
 }
 
-static void append_glm_arg(buf *b, const json_arg *arg) {
-    buf_puts(b, "<arg_key>");
-    append_glm_arg_key_text(b, arg->key);
-    buf_puts(b, "</arg_key><arg_value>");
-    append_glm_arg_value_text(b, arg->value);
-    buf_puts(b, "</arg_value>");
-}
 
 static bool append_dsml_arguments_from_json(buf *b, const char *json, const tool_schema_order *order) {
     json_args args = {0};
@@ -2313,24 +2262,6 @@ static bool append_dsml_arguments_from_json(buf *b, const char *json, const tool
     return true;
 }
 
-static bool append_glm_arguments_from_json(buf *b, const char *json, const tool_schema_order *order) {
-    json_args args = {0};
-    if (!json_args_parse(json, &args)) return false;
-    if (order) {
-        for (int i = 0; i < order->len; i++) {
-            int idx = json_args_find_unused(&args, order->prop[i]);
-            if (idx < 0) continue;
-            append_glm_arg(b, &args.v[idx]);
-            args.v[idx].used = true;
-        }
-    }
-    for (int i = 0; i < args.len; i++) {
-        if (args.v[i].used) continue;
-        append_glm_arg(b, &args.v[i]);
-    }
-    json_args_free(&args);
-    return true;
-}
 
 static void append_json_arg_pair(buf *b, const json_arg *arg) {
     json_escape(b, arg->key);
@@ -2378,38 +2309,14 @@ static void append_dsml_tool_calls_text(buf *b, const tool_calls *calls) {
     buf_puts(b, "</｜DSML｜tool_calls>");
 }
 
-static void append_glm_tool_calls_text(buf *b, const tool_calls *calls,
-                                       const tool_schema_orders *tool_orders) {
-    if (!calls || calls->len == 0) return;
-    if (calls->raw_tool_text && calls->raw_tool_text[0]) {
-        buf_puts(b, calls->raw_tool_text);
-        return;
-    }
-    for (int i = 0; i < calls->len; i++) {
-        const tool_call *tc = &calls->v[i];
-        const tool_schema_order *order =
-            tool_schema_orders_find(tool_orders, tc->name);
-        if (i || b->len) buf_puts(b, "\n\n");
-        buf_puts(b, "<tool_call>");
-        buf_puts(b, tc->name ? tc->name : "");
-        if (!append_glm_arguments_from_json(b, tc->arguments, order)) {
-            buf_puts(b, "<arg_key>arguments</arg_key><arg_value>");
-            append_glm_arg_value_text(b, tc->arguments);
-            buf_puts(b, "</arg_value>");
-        }
-        buf_puts(b, "</tool_call>");
-    }
-}
 
 static void append_tool_calls_text_for_syntax(buf *b,
                                               server_model_syntax syntax,
                                               const tool_calls *calls,
                                               const tool_schema_orders *tool_orders) {
-    if (syntax == SERVER_MODEL_SYNTAX_GLM) {
-        append_glm_tool_calls_text(b, calls, tool_orders);
-    } else {
-        append_dsml_tool_calls_text(b, calls);
-    }
+    (void)syntax;
+    (void)tool_orders;
+    append_dsml_tool_calls_text(b, calls);
 }
 
 static bool role_is_system(const char *role) {
@@ -2514,102 +2421,15 @@ static char *render_deepseek_chat_prompt_text(const chat_msgs *msgs, const char 
     return buf_take(&out);
 }
 
-static bool text_starts_with_think_tag(const char *s) {
-    return s && (!strncmp(s, "<think>", 7) || !strncmp(s, "</think>", 8));
-}
 
-static void append_glm_assistant_message_prefix(buf *out,
-                                                const chat_msg *m,
-                                                bool preserve_reasoning) {
-    const char *content = m && m->content ? m->content : "";
-    if (text_starts_with_think_tag(content)) return;
-    if (preserve_reasoning) {
-        buf_puts(out, "<think>");
-        buf_puts(out, m && m->reasoning ? m->reasoning : "");
-        buf_puts(out, "</think>");
-    } else {
-        buf_puts(out, "<think></think>");
-    }
-}
 
-static char *render_glm_chat_prompt_text(const chat_msgs *msgs,
-                                         const char *tool_schemas,
-                                         const tool_schema_orders *tool_orders,
-                                         ds4_think_mode think_mode) {
-    const bool think = ds4_think_mode_enabled(think_mode);
-    const bool tool_context = chat_history_uses_tool_context(msgs, tool_schemas);
-    int last_user_idx = -1;
-    for (int i = 0; msgs && i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (role_is_user_like(m->role)) last_user_idx = i;
-    }
-
-    buf out = {0};
-    buf_puts(&out, "[gMASK]<sop>");
-    if (think) {
-        const char *effort = ds4_glm_reasoning_effort_text(think_mode);
-        buf_puts(&out, "<|system|>");
-        buf_puts(&out, effort ? effort : "Reasoning Effort: Max");
-    }
-    if (tool_schemas && tool_schemas[0]) {
-        buf tools = {0};
-        append_glm_tools_prompt_text(&tools, tool_schemas);
-        if (tools.len) {
-            buf_puts(&out, "<|system|>");
-            buf_puts(&out, tools.ptr);
-        }
-        buf_free(&tools);
-    }
-    for (int i = 0; msgs && i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (!role_is_system(m->role)) continue;
-        buf_puts(&out, "<|system|>");
-        buf_puts(&out, m->content ? m->content : "");
-    }
-
-    bool pending_assistant = false;
-    for (int i = 0; msgs && i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (role_is_system(m->role)) {
-            continue;
-        } else if (!strcmp(m->role, "user")) {
-            buf_puts(&out, "<|user|>");
-            buf_puts(&out, m->content ? m->content : "");
-            pending_assistant = true;
-        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
-            buf_puts(&out, "<|observation|><tool_response>");
-            append_glm_tool_response_text(&out, m->content);
-            buf_puts(&out, "</tool_response>");
-            pending_assistant = true;
-        } else if (!strcmp(m->role, "assistant")) {
-            (void)pending_assistant;
-            buf_puts(&out, "<|assistant|>");
-            append_glm_assistant_message_prefix(
-                &out, m, think && (tool_context || i > last_user_idx));
-            buf_puts(&out, m->content ? m->content : "");
-            append_tool_calls_text_for_syntax(&out, SERVER_MODEL_SYNTAX_GLM,
-                                              &m->calls, tool_orders);
-            pending_assistant = false;
-        }
-    }
-
-    if (pending_assistant) {
-        buf_puts(&out, "<|assistant|>");
-        buf_puts(&out, think ? "<think>" : "<think></think>");
-    }
-
-    return buf_take(&out);
-}
 
 static char *render_chat_prompt_text_for_syntax(server_model_syntax syntax,
                                                 const chat_msgs *msgs,
                                                 const char *tool_schemas,
                                                 const tool_schema_orders *tool_orders,
                                                 ds4_think_mode think_mode) {
-    if (syntax == SERVER_MODEL_SYNTAX_GLM) {
-        return render_glm_chat_prompt_text(msgs, tool_schemas,
-                                           tool_orders, think_mode);
-    }
+    (void)syntax;
     return render_deepseek_chat_prompt_text(msgs, tool_schemas,
                                             tool_orders, think_mode);
 }
@@ -2690,49 +2510,13 @@ static char *render_deepseek_live_tool_tail(const chat_msgs *msgs, int start,
     return buf_take(&out);
 }
 
-static char *render_glm_live_tool_tail(const chat_msgs *msgs, int start,
-                                       const tool_schema_orders *tool_orders,
-                                       ds4_think_mode think_mode) {
-    const bool think = ds4_think_mode_enabled(think_mode);
-    buf out = {0};
-    bool pending_assistant = false;
-    for (int i = start; msgs && i < msgs->len; i++) {
-        const chat_msg *m = &msgs->v[i];
-        if (role_is_system(m->role)) {
-            continue;
-        } else if (!strcmp(m->role, "user")) {
-            buf_puts(&out, "<|user|>");
-            buf_puts(&out, m->content ? m->content : "");
-            pending_assistant = true;
-        } else if (!strcmp(m->role, "tool") || !strcmp(m->role, "function")) {
-            buf_puts(&out, "<|observation|><tool_response>");
-            append_glm_tool_response_text(&out, m->content);
-            buf_puts(&out, "</tool_response>");
-            pending_assistant = true;
-        } else if (!strcmp(m->role, "assistant")) {
-            buf_puts(&out, "<|assistant|>");
-            append_glm_assistant_message_prefix(&out, m, think);
-            buf_puts(&out, m->content ? m->content : "");
-            append_tool_calls_text_for_syntax(&out, SERVER_MODEL_SYNTAX_GLM,
-                                              &m->calls, tool_orders);
-            pending_assistant = false;
-        }
-    }
-
-    if (pending_assistant) {
-        buf_puts(&out, "<|assistant|>");
-        buf_puts(&out, think ? "<think>" : "<think></think>");
-    }
-    return buf_take(&out);
-}
 
 static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
                                               const chat_msgs *msgs, int start,
                                               const tool_schema_orders *tool_orders,
                                               ds4_think_mode think_mode) {
-    if (syntax == SERVER_MODEL_SYNTAX_GLM) {
-        return render_glm_live_tool_tail(msgs, start, tool_orders, think_mode);
-    }
+    (void)syntax;
+    (void)tool_orders;
     return render_deepseek_live_tool_tail(msgs, start, think_mode);
 }
 
@@ -5045,152 +4829,7 @@ static bool parse_deepseek_generated_message_ex(const char *text,
     }
 }
 
-static void trim_const_span(const char **start, const char **end) {
-    while (*start < *end && isspace((unsigned char)**start)) (*start)++;
-    while (*end > *start && isspace((unsigned char)(*end)[-1])) (*end)--;
-}
 
-static bool parse_glm_generated_message_ex(const char *text,
-                                           bool require_thinking_closed,
-                                           char **content_out,
-                                           char **reasoning_out,
-                                           tool_calls *calls) {
-    static const char tool_start[] = "<tool_call>";
-    static const char tool_end[] = "</tool_call>";
-    static const char arg_key_start[] = "<arg_key>";
-    static const char arg_key_end[] = "</arg_key>";
-    static const char arg_value_start[] = "<arg_value>";
-    static const char arg_value_end[] = "</arg_value>";
-
-    text = text ? text : "";
-    const char *tool_search = text;
-    bool recovered_unclosed_tool = false;
-    if (require_thinking_closed) {
-        const char *think_end = find_last_substr(text, "</think>");
-        if (!think_end) {
-            const char *candidate = strstr(text, tool_start);
-            if (!candidate || !strstr(candidate, tool_end)) {
-                fprintf(stderr, "ds4-server: thinking not closed, ignoring incomplete GLM tool calls in reasoning\n");
-                ds4_local_unterminated_reasoning(text, content_out, reasoning_out);
-                return true;
-            }
-            tool_search = candidate;
-            recovered_unclosed_tool = true;
-        } else {
-            tool_search = think_end + 8;
-        }
-    }
-
-    const char *start = strstr(tool_search, tool_start);
-    if (!start) {
-        split_reasoning_content(text, strlen(text), content_out, reasoning_out);
-        return true;
-    }
-
-    const char *raw_block_start = start;
-    if (start >= text + 2 && start[-2] == '\n' && start[-1] == '\n') {
-        raw_block_start = start - 2;
-    }
-    size_t content_len = trim_tool_separator_ws(text, 0,
-                                                (size_t)(raw_block_start - text));
-    const char *p = start;
-    for (;;) {
-        p = skip_ascii_ws(p);
-        if (strncmp(p, tool_start, strlen(tool_start)) != 0) break;
-        p += strlen(tool_start);
-
-        const char *close = strstr(p, tool_end);
-        if (!close) return false;
-        const char *arg = strstr(p, arg_key_start);
-        if (arg && arg > close) arg = NULL;
-
-        const char *name_start = p;
-        const char *name_end = arg ? arg : close;
-        trim_const_span(&name_start, &name_end);
-        if (name_end <= name_start) return false;
-        char *name = xstrndup(name_start, (size_t)(name_end - name_start));
-        p = name_end;
-
-        buf args = {0};
-        for (;;) {
-            p = skip_ascii_ws(p);
-            if (!strncmp(p, tool_end, strlen(tool_end))) {
-                p += strlen(tool_end);
-                break;
-            }
-            if (strncmp(p, arg_key_start, strlen(arg_key_start)) != 0) {
-                free(name);
-                buf_free(&args);
-                return false;
-            }
-            p += strlen(arg_key_start);
-            const char *key_end = strstr(p, arg_key_end);
-            if (!key_end || key_end > close) {
-                free(name);
-                buf_free(&args);
-                return false;
-            }
-            const char *key_start = p;
-            const char *key_trim_end = key_end;
-            trim_const_span(&key_start, &key_trim_end);
-            char *raw_key = xstrndup(key_start, (size_t)(key_trim_end - key_start));
-            char *key = dsml_unescape_text(raw_key);
-            free(raw_key);
-
-            p = key_end + strlen(arg_key_end);
-            p = skip_ascii_ws(p);
-            if (strncmp(p, arg_value_start, strlen(arg_value_start)) != 0) {
-                free(name);
-                free(key);
-                buf_free(&args);
-                return false;
-            }
-            p += strlen(arg_value_start);
-            const char *value_end = strstr(p, arg_value_end);
-            if (!value_end || value_end > close) {
-                free(name);
-                free(key);
-                buf_free(&args);
-                return false;
-            }
-            char *raw_value = xstrndup(p, (size_t)(value_end - p));
-            char *value = dsml_unescape_text(raw_value);
-            tool_call_json_args_add(&args, key, value, "true");
-            free(key);
-            free(raw_value);
-            free(value);
-            p = value_end + strlen(arg_value_end);
-        }
-
-        tool_call tc = {0};
-        tc.name = name;
-        buf wrapped = {0};
-        buf_putc(&wrapped, '{');
-        buf_puts(&wrapped, args.ptr ? args.ptr : "");
-        buf_putc(&wrapped, '}');
-        tc.arguments = buf_take(&wrapped);
-        tool_calls_push(calls, tc);
-        buf_free(&args);
-
-        const char *next = skip_ascii_ws(p);
-        if (strncmp(next, tool_start, strlen(tool_start)) != 0) {
-            p = next;
-            break;
-        }
-        p = next;
-    }
-
-    if (calls->len == 0) return false;
-    free(calls->raw_tool_text);
-    calls->raw_tool_text = xstrndup(raw_block_start, (size_t)(p - raw_block_start));
-    if (recovered_unclosed_tool) {
-        ds4_unterminated_reasoning_before_tool(text, content_len,
-                                               content_out, reasoning_out);
-    } else {
-        split_reasoning_content(text, content_len, content_out, reasoning_out);
-    }
-    return true;
-}
 
 static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
                                                   const char *text,
@@ -5198,11 +4837,7 @@ static bool parse_generated_message_ex_for_syntax(server_model_syntax syntax,
                                                   char **content_out,
                                                   char **reasoning_out,
                                                   tool_calls *calls) {
-    if (syntax == SERVER_MODEL_SYNTAX_GLM) {
-        return parse_glm_generated_message_ex(text, require_thinking_closed,
-                                              content_out, reasoning_out,
-                                              calls);
-    }
+    (void)syntax;
     return parse_deepseek_generated_message_ex(text, require_thinking_closed,
                                                content_out, reasoning_out,
                                                calls);
@@ -10953,41 +10588,10 @@ static char *build_invalid_dsml_tool_error_suffix(const request *r,
     return buf_take(&suffix);
 }
 
-static char *build_invalid_glm_tool_error_suffix(const request *r,
-                                                 const thinking_state *thinking,
-                                                 const char *detail) {
-    buf tool_error = {0};
-    buf_puts(&tool_error, "Tool error: invalid GLM tool call");
-    if (detail && detail[0]) {
-        buf_puts(&tool_error, ": ");
-        buf_puts(&tool_error, detail);
-    }
-    buf_puts(&tool_error,
-             "\nThe previous assistant output was not executed because the "
-             "<tool_call> syntax was malformed. Emit a new valid <tool_call>, "
-             "or answer normally if no tool is needed.");
-
-    buf suffix = {0};
-    if (r && ds4_think_mode_enabled(r->think_mode) && thinking && thinking->inside) {
-        buf_puts(&suffix, "</think>");
-    }
-    buf_puts(&suffix, "<|observation|><tool_response>");
-    append_glm_tool_response_text(&suffix, tool_error.ptr ? tool_error.ptr : "");
-    buf_puts(&suffix, "</tool_response><|assistant|>");
-    buf_puts(&suffix,
-             r && ds4_think_mode_enabled(r->think_mode) ?
-             "<think>" : "<think></think>");
-
-    buf_free(&tool_error);
-    return buf_take(&suffix);
-}
 
 static char *build_invalid_tool_call_error_suffix(const request *r,
                                                   const thinking_state *thinking,
                                                   const char *detail) {
-    if (r && r->model_syntax == SERVER_MODEL_SYNTAX_GLM) {
-        return build_invalid_glm_tool_error_suffix(r, thinking, detail);
-    }
     return build_invalid_dsml_tool_error_suffix(r, thinking, detail);
 }
 
@@ -11287,9 +10891,7 @@ static char *build_tool_checkpoint_suffix(const request *r, const char *content,
     buf_puts(&suffix, content ? content : "");
     append_tool_calls_text_for_syntax(&suffix, syntax, calls,
                                       r ? &r->tool_orders : NULL);
-    if (syntax != SERVER_MODEL_SYNTAX_GLM) {
-        buf_puts(&suffix, "<｜end▁of▁sentence｜>");
-    }
+    buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     return buf_take(&suffix);
 }
 
@@ -11317,9 +10919,7 @@ static char *build_responses_visible_assistant_suffix(const request *r,
     buf_puts(&suffix, content ? content : "");
     append_tool_calls_text_for_syntax(&suffix, syntax, calls,
                                       r ? &r->tool_orders : NULL);
-    if (syntax != SERVER_MODEL_SYNTAX_GLM) {
-        buf_puts(&suffix, "<｜end▁of▁sentence｜>");
-    }
+    buf_puts(&suffix, "<｜end▁of▁sentence｜>");
     return buf_take(&suffix);
 }
 
@@ -13545,11 +13145,6 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
             c.engine.mtp_margin = parse_float_arg(need_arg(&i, argc, argv, arg), arg, 0.0f, 1000.0f);
-        } else if (!strcmp(arg, "--glm-mtp")) {
-            c.engine.glm_mtp = true;
-        } else if (!strcmp(arg, "--glm-mtp-timing")) {
-            c.engine.glm_mtp = true;
-            c.engine.glm_mtp_timing = true;
         } else if (!strcmp(arg, "--dspark")) {
             c.engine.dspark = true;
         } else if (!strcmp(arg, "--dspark-confidence")) {
@@ -15144,64 +14739,6 @@ static void test_openai_tool_stream_sends_partial_arguments(void) {
     close(sv[1]);
 }
 
-static void test_openai_glm_tool_stream_suppresses_raw_tool_call(void) {
-    int sv[2];
-    TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
-    if (sv[0] < 0 || sv[1] < 0) return;
-
-    request r;
-    request_init(&r, REQ_CHAT, 128);
-    r.api = API_OPENAI;
-    r.stream = true;
-    r.think_mode = DS4_THINK_NONE;
-    r.has_tools = true;
-    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
-    r.tool_orders = make_bash_order();
-
-    TEST_ASSERT(sse_chunk(sv[0], &r, "chatcmpl_glm_tool", NULL, NULL));
-
-    openai_stream st;
-    openai_stream_start(&r, &st);
-    const char *raw =
-        "Before.\n\n"
-        "<tool_call>bash"
-        "<arg_key>command</arg_key><arg_value>pwd</arg_value>"
-        "</tool_call>";
-    TEST_ASSERT(openai_sse_stream_update(sv[0], NULL, &r, "chatcmpl_glm_tool", &st,
-                                         raw, strlen(raw), false));
-
-    char *parsed_content = NULL;
-    char *parsed_reasoning = NULL;
-    tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_GLM, raw, false,
-        &parsed_content, &parsed_reasoning, &calls));
-    TEST_ASSERT(calls.len == 1);
-    TEST_ASSERT(openai_sse_finish_live(sv[0], NULL, &r, "chatcmpl_glm_tool", &st,
-                                       raw, strlen(raw), &calls,
-                                       "tool_calls", 10, 4));
-
-    shutdown(sv[0], SHUT_WR);
-    char *out = read_socket_text(sv[1]);
-
-    TEST_ASSERT(strstr(out, "\"content\":\"Before.\"") != NULL);
-    TEST_ASSERT(strstr(out, "\"tool_calls\"") != NULL);
-    TEST_ASSERT(strstr(out, "\"name\":\"bash\"") != NULL);
-    TEST_ASSERT(strstr(out, "\\\"command\\\":") != NULL);
-    TEST_ASSERT(strstr(out, "\\\"pwd\\\"") != NULL);
-    TEST_ASSERT(strstr(out, "<tool_call>") == NULL);
-    TEST_ASSERT(strstr(out, "<arg_key>") == NULL);
-
-    free(out);
-    free(parsed_content);
-    free(parsed_reasoning);
-    tool_calls_free(&calls);
-    openai_stream_free(&st);
-    request_free(&r);
-    close(sv[0]);
-    close(sv[1]);
-}
-
 static void test_openai_tool_stream_waits_for_incomplete_tool_tags(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -15489,15 +15026,9 @@ static void test_reasoning_effort_mapping(void) {
 
 static void test_model_alias_thinking_controls(void) {
     TEST_ASSERT(model_alias_disables_thinking("deepseek-chat"));
-    TEST_ASSERT(model_alias_disables_thinking("glm-5.2-chat"));
-    TEST_ASSERT(model_alias_disables_thinking("glm-5.2-no-think"));
-    TEST_ASSERT(model_alias_disables_thinking("zai/glm-5.2-chat"));
-    TEST_ASSERT(!model_alias_disables_thinking("glm-5.2"));
+    TEST_ASSERT(!model_alias_disables_thinking("deepseek-v4-flash"));
     TEST_ASSERT(model_alias_enables_thinking("deepseek-reasoner"));
-    TEST_ASSERT(model_alias_enables_thinking("glm-5.2-reasoner"));
-    TEST_ASSERT(model_alias_enables_thinking("zai/glm-5.2-reasoner"));
-    TEST_ASSERT(server_model_alias_known("glm-5.2-chat"));
-    TEST_ASSERT(server_model_alias_known("glm-5.2-reasoner"));
+    TEST_ASSERT(!model_alias_enables_thinking("deepseek-chat"));
 }
 
 static void test_api_thinking_controls_parse(void) {
@@ -15646,98 +15177,6 @@ static void test_render_chat_prompt_text_renders_tools_before_system(void) {
     chat_msgs_free(&msgs);
 }
 
-static void test_render_glm_chat_prompt_text(void) {
-    chat_msgs msgs = {0};
-    chat_msg sys = {0};
-    sys.role = xstrdup("system");
-    sys.content = xstrdup("You are terse.");
-    chat_msgs_push(&msgs, sys);
-    chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup("Hello");
-    chat_msgs_push(&msgs, user);
-
-    tool_schema_orders orders = make_bash_order();
-    const char *tool_schemas =
-        "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
-        "\"command\":{}}}}";
-    char *prompt = render_chat_prompt_text_for_syntax(
-        SERVER_MODEL_SYNTAX_GLM, &msgs, tool_schemas, &orders, DS4_THINK_HIGH);
-
-    TEST_ASSERT(prompt != NULL);
-    TEST_ASSERT(!strncmp(prompt, "[gMASK]<sop>", strlen("[gMASK]<sop>")));
-    TEST_ASSERT(strstr(prompt, "<|system|>Reasoning Effort: High") != NULL);
-    TEST_ASSERT(strstr(prompt, "<tools>") != NULL);
-    TEST_ASSERT(strstr(prompt, "<tool_call>{function-name}") != NULL);
-    TEST_ASSERT(strstr(prompt, "<|system|>You are terse.") != NULL);
-    TEST_ASSERT(strstr(prompt, "<|user|>Hello<|assistant|><think>") != NULL);
-    TEST_ASSERT(strstr(prompt, "DSML") == NULL);
-
-    free(prompt);
-    tool_schema_orders_free(&orders);
-    chat_msgs_free(&msgs);
-}
-
-static void test_render_glm_drops_old_reasoning_without_tools(void) {
-    chat_msgs msgs = {0};
-    chat_msg user1 = {0};
-    user1.role = xstrdup("user");
-    user1.content = xstrdup("first");
-    chat_msgs_push(&msgs, user1);
-    chat_msg assistant = {0};
-    assistant.role = xstrdup("assistant");
-    assistant.reasoning = xstrdup("old hidden reasoning");
-    assistant.content = xstrdup("first answer");
-    chat_msgs_push(&msgs, assistant);
-    chat_msg user2 = {0};
-    user2.role = xstrdup("user");
-    user2.content = xstrdup("second");
-    chat_msgs_push(&msgs, user2);
-
-    char *prompt = render_chat_prompt_text_for_syntax(
-        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, NULL, DS4_THINK_HIGH);
-    TEST_ASSERT(prompt != NULL);
-    TEST_ASSERT(strstr(prompt, "old hidden reasoning") == NULL);
-    TEST_ASSERT(strstr(prompt, "<|assistant|><think></think>first answer") != NULL);
-    TEST_ASSERT(strstr(prompt, "<|user|>second<|assistant|><think>") != NULL);
-
-    free(prompt);
-    chat_msgs_free(&msgs);
-}
-
-static void test_render_glm_preserves_reasoning_with_tools(void) {
-    chat_msgs msgs = {0};
-    chat_msg user1 = {0};
-    user1.role = xstrdup("user");
-    user1.content = xstrdup("first");
-    chat_msgs_push(&msgs, user1);
-    chat_msg assistant = {0};
-    assistant.role = xstrdup("assistant");
-    assistant.reasoning = xstrdup("tool reasoning");
-    assistant.content = xstrdup("");
-    tool_call tc = {0};
-    tc.name = xstrdup("bash");
-    tc.arguments = xstrdup("{\"command\":\"pwd\"}");
-    tool_calls_push(&assistant.calls, tc);
-    chat_msgs_push(&msgs, assistant);
-    chat_msg tool = {0};
-    tool.role = xstrdup("tool");
-    tool.content = xstrdup("/tmp");
-    chat_msgs_push(&msgs, tool);
-
-    tool_schema_orders orders = make_bash_order();
-    char *prompt = render_chat_prompt_text_for_syntax(
-        SERVER_MODEL_SYNTAX_GLM, &msgs, NULL, &orders, DS4_THINK_HIGH);
-    TEST_ASSERT(prompt != NULL);
-    TEST_ASSERT(strstr(prompt, "<think>tool reasoning</think>") != NULL);
-    TEST_ASSERT(strstr(prompt, "<tool_call>bash") != NULL);
-    TEST_ASSERT(strstr(prompt, "<|observation|><tool_response>/tmp</tool_response>") != NULL);
-
-    free(prompt);
-    tool_schema_orders_free(&orders);
-    chat_msgs_free(&msgs);
-}
-
 static void test_dsml_tool_args_preserve_call_order(void) {
     tool_calls calls = make_swapped_bash_call();
     buf b = {0};
@@ -15834,35 +15273,6 @@ static void test_parse_short_dsml_and_canonical_suffix(void) {
     free(reasoning);
     tool_calls_free(&calls);
     request_free(&r);
-}
-
-static void test_parse_glm_tool_call_message(void) {
-    const char *generated =
-        "<think>need bash</think>OK\n\n"
-        "<tool_call>bash"
-        "<arg_key>command</arg_key><arg_value>echo hi</arg_value>"
-        "<arg_key>timeout</arg_key><arg_value>10</arg_value>"
-        "</tool_call>";
-    char *content = NULL;
-    char *reasoning = NULL;
-    tool_calls calls = {0};
-
-    TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_GLM, generated, true,
-        &content, &reasoning, &calls));
-    TEST_ASSERT(reasoning && !strcmp(reasoning, "need bash"));
-    TEST_ASSERT(content && !strcmp(content, "OK"));
-    TEST_ASSERT(calls.len == 1);
-    TEST_ASSERT(calls.v[0].name && !strcmp(calls.v[0].name, "bash"));
-    TEST_ASSERT(strstr(calls.v[0].arguments, "\"command\": \"echo hi\"") != NULL);
-    TEST_ASSERT(strstr(calls.v[0].arguments, "\"timeout\": \"10\"") != NULL);
-    TEST_ASSERT(calls.raw_tool_text &&
-                !strncmp(calls.raw_tool_text, "\n\n<tool_call>bash",
-                         strlen("\n\n<tool_call>bash")));
-
-    free(content);
-    free(reasoning);
-    tool_calls_free(&calls);
 }
 
 static void test_dsml_parser_recovers_loose_nested_parameters(void) {
@@ -16160,27 +15570,6 @@ static void test_invalid_dsml_tool_error_suffix_includes_system_prompt(void) {
     free(r.prompt_text);
 }
 
-static void test_invalid_glm_tool_error_suffix(void) {
-    request r;
-    request_init(&r, REQ_CHAT, 128);
-    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
-    r.think_mode = DS4_THINK_HIGH;
-    thinking_state st = {.inside = true};
-
-    char *suffix = build_invalid_tool_call_error_suffix(&r, &st,
-                                                        "missing arg_value");
-    TEST_ASSERT(suffix != NULL);
-    TEST_ASSERT(strstr(suffix, "</think><|observation|><tool_response>") == suffix);
-    TEST_ASSERT(strstr(suffix,
-                       "Tool error: invalid GLM tool call: missing arg_value") != NULL);
-    TEST_ASSERT(strstr(suffix, "</tool_response><|assistant|><think>") != NULL);
-    TEST_ASSERT(strstr(suffix, "DSML") == NULL);
-    TEST_ASSERT(strstr(suffix, "<｜end▁of▁sentence｜>") == NULL);
-
-    free(suffix);
-    request_free(&r);
-}
-
 static void test_thinking_dsml_is_not_executable_before_think_close(void) {
     const char *generated =
         "<think>I might mention a malformed or tentative tool call here:\n\n"
@@ -16288,82 +15677,6 @@ static void test_tool_checkpoint_suffix_is_future_prompt_canonical(void) {
     char *future_prompt = render_chat_prompt_text(&history_msgs, tool_schemas,
                                                   &r.tool_orders, DS4_THINK_HIGH);
 
-    TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
-
-    free(future_prompt);
-    buf_free(&canonical);
-    free(suffix);
-    free(prompt_text);
-    free(content);
-    free(reasoning);
-    chat_msgs_free(&history_msgs);
-    chat_msgs_free(&prefix_msgs);
-    tool_calls_free(&calls);
-    request_free(&r);
-    tool_schema_orders_free(&orders);
-}
-
-static void test_glm_tool_checkpoint_suffix_is_canonical(void) {
-    tool_schema_orders orders = make_bash_order();
-    const char *tool_schemas =
-        "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\",\"properties\":{"
-        "\"command\":{},\"description\":{}}}}";
-
-    chat_msgs prefix_msgs = {0};
-    chat_msg user = {0};
-    user.role = xstrdup("user");
-    user.content = xstrdup("inspect");
-    chat_msgs_push(&prefix_msgs, user);
-    char *prompt_text = render_chat_prompt_text_for_syntax(
-        SERVER_MODEL_SYNTAX_GLM, &prefix_msgs, tool_schemas,
-        &orders, DS4_THINK_HIGH);
-
-    const char *generated =
-        "need bash</think>done\n\n"
-        "<tool_call>bash"
-        "<arg_key>description</arg_key><arg_value>list files</arg_value>"
-        "<arg_key>command</arg_key><arg_value>ls -la</arg_value>"
-        "</tool_call>";
-    char *content = NULL;
-    char *reasoning = NULL;
-    tool_calls calls = {0};
-    TEST_ASSERT(parse_generated_message_ex_for_syntax(
-        SERVER_MODEL_SYNTAX_GLM, generated, false,
-        &content, &reasoning, &calls));
-    TEST_ASSERT(calls.len == 1);
-
-    request r;
-    request_init(&r, REQ_CHAT, 128);
-    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
-    r.think_mode = DS4_THINK_HIGH;
-    r.tool_orders = orders;
-    memset(&orders, 0, sizeof(orders));
-
-    char *suffix = build_tool_checkpoint_suffix(&r, content, reasoning, &calls);
-    TEST_ASSERT(strstr(suffix, "need bash</think>done\n\n<tool_call>bash") != NULL);
-    TEST_ASSERT(strstr(suffix, "<｜end▁of▁sentence｜>") == NULL);
-    TEST_ASSERT(strstr(suffix, "DSML") == NULL);
-
-    buf canonical = {0};
-    buf_puts(&canonical, prompt_text);
-    buf_puts(&canonical, suffix);
-
-    chat_msgs history_msgs = {0};
-    chat_msg user2 = {0};
-    user2.role = xstrdup("user");
-    user2.content = xstrdup("inspect");
-    chat_msgs_push(&history_msgs, user2);
-    chat_msg assistant = {0};
-    assistant.role = xstrdup("assistant");
-    assistant.reasoning = xstrdup(reasoning ? reasoning : "");
-    assistant.content = xstrdup(content ? content : "");
-    assistant.calls = calls;
-    memset(&calls, 0, sizeof(calls));
-    chat_msgs_push(&history_msgs, assistant);
-
-    char *future_prompt = render_chat_prompt_text_for_syntax(
-        SERVER_MODEL_SYNTAX_GLM, &history_msgs, tool_schemas,
-        &r.tool_orders, DS4_THINK_HIGH);
     TEST_ASSERT(!strcmp(canonical.ptr, future_prompt));
 
     free(future_prompt);
@@ -18611,9 +17924,6 @@ static void ds4_server_unit_tests_run(void) {
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
-    test_render_glm_chat_prompt_text();
-    test_render_glm_drops_old_reasoning_without_tools();
-    test_render_glm_preserves_reasoning_with_tools();
     test_tool_schema_order_from_anthropic_schema();
     test_tool_schema_order_from_openai_tools();
     test_tool_schema_order_from_responses_tool_search();
@@ -18640,7 +17950,6 @@ static void ds4_server_unit_tests_run(void) {
     test_responses_usage_reports_cache_details();
     test_openai_chat_stream_splits_reasoning_without_tools();
     test_openai_tool_stream_sends_partial_arguments();
-    test_openai_glm_tool_stream_suppresses_raw_tool_call();
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();
     test_openai_tool_stream_holds_partial_dsml_entities();
@@ -18648,16 +17957,13 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_handles_multiple_calls();
     test_streaming_holds_partial_utf8();
     test_parse_short_dsml_and_canonical_suffix();
-    test_parse_glm_tool_call_message();
     test_dsml_parser_recovers_loose_nested_parameters();
     test_dsml_repair_produces_parseable_calls();
     test_tool_parse_failure_returns_recoverable_finish();
     test_invalid_dsml_tool_error_suffix_includes_system_prompt();
-    test_invalid_glm_tool_error_suffix();
     test_thinking_dsml_is_not_executable_before_think_close();
     test_thinking_dsml_after_think_close_is_executable();
     test_tool_checkpoint_suffix_is_future_prompt_canonical();
-    test_glm_tool_checkpoint_suffix_is_canonical();
     test_tool_checkpoint_minifies_json_parameters();
     test_tool_memory_replays_sampled_dsml();
     test_anthropic_tool_memory_replays_sampled_dsml();

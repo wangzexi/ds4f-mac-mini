@@ -597,50 +597,6 @@ static const ds4_shape DS4_SHAPE_PRO = {
     .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
 };
 
-static const ds4_shape DS4_SHAPE_GLM52 = {
-    .name = "GLM 5.2",
-    .family = DS4_MODEL_FAMILY_GLM_DSA,
-    .variant = DS4_VARIANT_GLM52,
-    .n_layer = 79,
-    .n_embd = 6144,
-    .n_vocab = 154880,
-    .n_head = 64,
-    .n_head_kv = 1,
-    .n_head_dim = 576,
-    .n_value_dim = 512,
-    .n_rot = 64,
-    .n_out_group = 0,
-    .n_lora_q = 2048,
-    .n_lora_o = 0,
-    .n_expert = 256,
-    .n_expert_used = 8,
-    .n_expert_shared = 1,
-    .n_ff_exp = 2048,
-    .n_ff_dense = 12288,
-    .n_hash_layer = 0,
-    .n_swa = 0,
-    .n_indexer_head = 32,
-    .n_indexer_head_dim = 128,
-    .n_indexer_top_k = 2048,
-    .n_hc = 0,
-    .n_hc_sinkhorn_iter = 0,
-    .n_nextn_predict = 1,
-    .n_leading_dense = 3,
-    .n_kv_lora = 512,
-    .n_key_mla = 256,
-    .n_value_mla = 256,
-    .rms_eps = 1.0e-5f,
-    .hc_eps = 0.0f,
-    .expert_weight_scale = 2.5f,
-    .swiglu_clamp_exp = 0.0f,
-    .rope_freq_base = 8000000.0f,
-    .rope_scale_factor = 1.0f,
-    .rope_yarn_beta_fast = 0.0f,
-    .rope_yarn_beta_slow = 0.0f,
-    .compress_rope_freq_base = 0.0f,
-    .rope_orig_ctx = 1048576,
-};
-
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -4156,14 +4112,6 @@ static uint32_t required_u32(const ds4_model *m, const char *key) {
     return v;
 }
 
-static uint64_t required_u64_compat(const ds4_model *m, const char *key) {
-    uint64_t v = 0;
-    if (!model_get_u64_compat(m, key, &v)) {
-        fprintf(stderr, "ds4: required metadata key is missing: %s\n", key);
-        exit(1);
-    }
-    return v;
-}
 
 static float required_f32(const ds4_model *m, const char *key) {
     float v = 0.0f;
@@ -5365,12 +5313,6 @@ static void config_expect_u32(const char *name, uint32_t got, uint32_t expected)
     exit(1);
 }
 
-static void config_expect_u64(const char *name, uint64_t got, uint64_t expected) {
-    if (got == expected) return;
-    fprintf(stderr, "ds4: expected %s=%" PRIu64 " for %s, got %" PRIu64 "\n",
-            name, expected, DS4_MODEL_SHAPE_NAME, got);
-    exit(1);
-}
 
 static void config_expect_f32(const char *name, float got, float expected) {
     const float scale = fabsf(expected) > 1.0f ? fabsf(expected) : 1.0f;
@@ -5505,81 +5447,7 @@ static void config_validate_deepseek4_model(const ds4_model *m) {
     config_expect_bool("expert_weights_norm", expert_weight_norm, true);
 }
 
-static void config_validate_glm_dsa_model(const ds4_model *m) {
-    g_ds4_shape = DS4_SHAPE_GLM52;
-    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
-
-    const uint32_t n_layer = required_u32(m, "glm-dsa.block_count");
-    const uint64_t n_ctx = required_u64_compat(m, "glm-dsa.context_length");
-    const uint32_t n_embd = required_u32(m, "glm-dsa.embedding_length");
-    const uint32_t n_vocab = required_u32(m, "glm-dsa.vocab_size");
-    const uint32_t n_ff_dense = required_u32(m, "glm-dsa.feed_forward_length");
-    const uint32_t n_head = required_u32(m, "glm-dsa.attention.head_count");
-    const uint32_t n_head_kv = required_u32(m, "glm-dsa.attention.head_count_kv");
-    const uint32_t n_head_dim = required_u32(m, "glm-dsa.attention.key_length");
-    const uint32_t n_value_dim = required_u32(m, "glm-dsa.attention.value_length");
-    const uint32_t n_rot = required_u32(m, "glm-dsa.rope.dimension_count");
-    const uint32_t n_lora_q = required_u32(m, "glm-dsa.attention.q_lora_rank");
-    const uint32_t n_kv_lora = required_u32(m, "glm-dsa.attention.kv_lora_rank");
-    const uint32_t n_key_mla = required_u32(m, "glm-dsa.attention.key_length_mla");
-    const uint32_t n_value_mla = required_u32(m, "glm-dsa.attention.value_length_mla");
-    const uint32_t n_expert = required_u32(m, "glm-dsa.expert_count");
-    const uint32_t n_expert_used = required_u32(m, "glm-dsa.expert_used_count");
-    const uint32_t n_ff_exp = required_u32(m, "glm-dsa.expert_feed_forward_length");
-    const uint32_t n_expert_shared = required_u32(m, "glm-dsa.expert_shared_count");
-    const uint32_t n_expert_group = required_u32(m, "glm-dsa.expert_group_count");
-    const uint32_t n_expert_group_used = required_u32(m, "glm-dsa.expert_group_used_count");
-    const uint32_t expert_gating_func = required_u32(m, "glm-dsa.expert_gating_func");
-    const uint32_t n_leading_dense = required_u32(m, "glm-dsa.leading_dense_block_count");
-    const uint32_t n_nextn = required_u32(m, "glm-dsa.nextn_predict_layers");
-    const uint32_t n_indexer_head = required_u32(m, "glm-dsa.attention.indexer.head_count");
-    const uint32_t n_indexer_head_dim = required_u32(m, "glm-dsa.attention.indexer.key_length");
-    const uint32_t n_indexer_top_k = required_u32(m, "glm-dsa.attention.indexer.top_k");
-
-    config_expect_u32("block_count", n_layer, DS4_N_LAYER);
-    config_expect_u64("context_length", n_ctx, DS4_ROPE_ORIG_CTX);
-    config_expect_u32("embedding_length", n_embd, DS4_N_EMBD);
-    config_expect_u32("vocab_size", n_vocab, DS4_N_VOCAB);
-    config_expect_u32("feed_forward_length", n_ff_dense, DS4_N_FF_DENSE);
-    config_expect_u32("attention.head_count", n_head, DS4_N_HEAD);
-    config_expect_u32("attention.head_count_kv", n_head_kv, DS4_N_HEAD_KV);
-    config_expect_u32("attention.key_length", n_head_dim, DS4_N_HEAD_DIM);
-    config_expect_u32("attention.value_length", n_value_dim, DS4_N_VALUE_DIM);
-    config_expect_u32("rope.dimension_count", n_rot, DS4_N_ROT);
-    config_expect_u32("attention.q_lora_rank", n_lora_q, DS4_N_LORA_Q);
-    config_expect_u32("attention.kv_lora_rank", n_kv_lora, DS4_N_KV_LORA);
-    config_expect_u32("attention.key_length_mla", n_key_mla, DS4_N_KEY_MLA);
-    config_expect_u32("attention.value_length_mla", n_value_mla, DS4_N_VALUE_MLA);
-    config_expect_u32("expert_count", n_expert, DS4_N_EXPERT);
-    config_expect_u32("expert_used_count", n_expert_used, DS4_N_EXPERT_USED);
-    config_expect_u32("expert_feed_forward_length", n_ff_exp, DS4_N_FF_EXP);
-    config_expect_u32("expert_shared_count", n_expert_shared, DS4_N_EXPERT_SHARED);
-    config_expect_u32("expert_group_count", n_expert_group, 1);
-    config_expect_u32("expert_group_used_count", n_expert_group_used, 1);
-    config_expect_u32("expert_gating_func", expert_gating_func, 2);
-    config_expect_u32("leading_dense_block_count", n_leading_dense, DS4_N_LEADING_DENSE);
-    config_expect_u32("nextn_predict_layers", n_nextn, DS4_N_NEXTN_PREDICT);
-    config_expect_u32("attention.indexer.head_count", n_indexer_head, DS4_N_INDEXER_HEAD);
-    config_expect_u32("attention.indexer.key_length", n_indexer_head_dim, DS4_N_INDEXER_HEAD_DIM);
-    config_expect_u32("attention.indexer.top_k", n_indexer_top_k, DS4_N_INDEXER_TOP_K);
-
-    const float rope_freq_base = required_f32(m, "glm-dsa.rope.freq_base");
-    config_expect_f32("rope.freq_base", rope_freq_base, DS4_ROPE_FREQ_BASE);
-    const float rms_eps = required_f32(m, "glm-dsa.attention.layer_norm_rms_epsilon");
-    config_expect_f32("attention.layer_norm_rms_epsilon", rms_eps, DS4_RMS_EPS);
-    const float expert_weight_scale = required_f32(m, "glm-dsa.expert_weights_scale");
-    config_expect_f32("expert_weights_scale", expert_weight_scale, DS4_EXPERT_WEIGHT_SCALE);
-    const bool expert_weight_norm = required_bool(m, "glm-dsa.expert_weights_norm");
-    config_expect_bool("expert_weights_norm", expert_weight_norm, true);
-}
-
 static void config_validate_model(const ds4_model *m) {
-    ds4_str arch = {0};
-    if (model_get_string(m, "general.architecture", &arch) &&
-        ds4_streq(arch, "glm-dsa")) {
-        config_validate_glm_dsa_model(m);
-        return;
-    }
     config_validate_deepseek4_model(m);
 }
 
@@ -35066,8 +34934,6 @@ struct ds4_engine {
     uint64_t decode_model_span_bytes;
     ds4_ssd_memory_lock simulated_memory;
     bool quality;
-    bool glm_mtp;
-    bool glm_mtp_timing;
     bool dspark;
     bool dspark_strict;
     bool cuda_tensor_parallel;
@@ -47037,9 +46903,8 @@ bool ds4_engine_has_output_head(ds4_engine *e) {
 
 #ifndef DS4_NO_GPU
 static bool ds4_engine_glm_mtp_spec_enabled(const ds4_engine *e) {
-    return e && e->backend != DS4_BACKEND_CPU &&
-           false &&
-           DS4_N_NEXTN_PREDICT != 0 && e->glm_mtp;
+    (void)e;
+    return false;
 }
 #endif
 
@@ -47050,9 +46915,6 @@ bool ds4_engine_has_mtp(ds4_engine *e) {
 }
 
 int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
-    if (e && false) {
-        return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 ? 2 : 0;
-    }
     if (ds4_engine_has_mtp(e)) return e->mtp_draft_tokens;
 #ifndef DS4_NO_GPU
     if (e &&
@@ -51437,41 +51299,6 @@ size_t ds4_test_compute_entry_bytes_sum(
             tensors, n_tensors, placement_ctx_hint, 0);
 }
 
-size_t ds4_test_compute_glm_entry_bytes_sum_with_sessions(
-        const ds4_test_fake_tensor *tensors,
-        int n_tensors,
-        int placement_ctx_hint,
-        int placement_session_count_hint) {
-    const ds4_shape saved_shape = g_ds4_shape;
-    g_ds4_shape = DS4_SHAPE_GLM52;
-    ds4_engine eng;
-    if (ds4_test_make_engine(&eng, tensors, n_tensors,
-                             placement_ctx_hint) != 0) {
-        g_ds4_shape = saved_shape;
-        return 0;
-    }
-    eng.placement_session_count_hint = placement_session_count_hint;
-    size_t entry_bytes[DS4_MAX_LAYER + 2];
-    size_t sum = 0;
-    if (engine_compute_entry_bytes(&eng, entry_bytes) == 0) {
-        for (uint32_t i = 0; i < (uint32_t)DS4_N_LAYER + 2u; i++) {
-            sum += entry_bytes[i];
-        }
-    }
-    free(eng.model.tensors);
-    g_ds4_shape = saved_shape;
-    return sum;
-}
-
-size_t ds4_test_glm_per_layer_kv_bytes(uint32_t layer, int ctx_size) {
-    const ds4_shape saved_shape = g_ds4_shape;
-    g_ds4_shape = DS4_SHAPE_GLM52;
-    const size_t bytes =
-        engine_glm_per_layer_kv_bytes_planner(layer, ctx_size);
-    g_ds4_shape = saved_shape;
-    return bytes;
-}
-
 int ds4_test_session_read_logits(ds4_session *s, float *out,
                                  uint64_t out_bytes) {
     if (!s || !out ||
@@ -51511,8 +51338,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->mtp_model.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
-    e->glm_mtp = opt->glm_mtp;
-    e->glm_mtp_timing = opt->glm_mtp_timing;
     e->dspark = opt->dspark;
     e->dspark_strict = opt->dspark_strict;
     e->cuda_tensor_parallel = opt->cuda_tensor_parallel;
@@ -53607,7 +53432,8 @@ static int ds4_session_glm_spec_cycle(ds4_session *s, int first_token,
     ds4_glm_gpu_graph *g = &s->glm_graph;
     const uint32_t pos = (uint32_t)s->checkpoint.len;
     const uint32_t executable = glm_graph_normal_layer_count();
-    const bool timing = s->engine->glm_mtp_timing;
+    const bool timing = false;
+ (void)timing;
     if (!s->glm_mtp_hc) {
         s->glm_mtp_hc = malloc(2ull * DS4_N_EMBD * sizeof(float));
         s->glm_mtp_logits0 = malloc((size_t)DS4_N_VOCAB * sizeof(float));
@@ -56086,109 +55912,6 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
     return 1;
 #else
     ds4_engine *e = s->engine;
-    if (ds4_session_is_glm(s)) {
-        /* TP worker under GLM MTP: run the full speculative cycle off the
-         * mirrored EVAL frame so drafts, verify batches, and gate traffic
-         * stay in lockstep with the leader's cycle. */
-        if (!s->glm_spec_inside && s->glm_graph_ready &&
-            e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 &&
-            e->tp.active && e->tp.rank != 0) {
-            int acc[2];
-            const int rc = ds4_session_glm_spec_cycle(s, token, acc, 2, err, errlen);
-            (void)probe_mtp;
-            return rc < 0 ? 1 : 0;
-        }
-        if (!s->glm_graph_ready) {
-            if (errlen) snprintf(err, errlen, "%s GLM graph is not initialized",
-                                 ds4_backend_name(e->backend));
-            return 1;
-        }
-        if ((uint32_t)s->checkpoint.len >= s->glm_graph.ctx_size) {
-            if (errlen) snprintf(err, errlen, "GLM Metal context reached (%u)",
-                                 s->glm_graph.ctx_size);
-            return 1;
-        }
-        if (s->glm_diag_post_prefill_seed_pending) {
-            /* The hotlist was recorded from this prompt's genuine first
-             * Decode route.  Installing it here measures arithmetic without
-             * selected-expert SSD misses; it has no production code path. */
-            ds4_gpu_graph seed_graph;
-            memset(&seed_graph, 0, sizeof(seed_graph));
-            seed_graph.quality = e->quality;
-            seed_graph.ssd_streaming = e->ssd_streaming;
-            seed_graph.ssd_streaming_cold = e->ssd_streaming_cold;
-            seed_graph.streaming_preload_experts =
-                e->ssd_streaming_preload_experts;
-            if (!metal_graph_seed_streaming_expert_cache_from_hotlist(
-                    &seed_graph, &e->model, &e->weights)) {
-                if (errlen) snprintf(err, errlen,
-                                     "GLM diagnostic post-prefill expert seed failed");
-                return 1;
-            }
-            s->glm_diag_post_prefill_seed_pending = false;
-            fprintf(stderr,
-                    "ds4: GLM server diagnostic post-prefill exact expert seed installed\n");
-        }
-        const uint32_t pos = (uint32_t)s->checkpoint.len;
-        const bool updates_dense =
-            glm_graph_decode_updates_dense_cache(&s->glm_graph, pos, s->logits);
-        if (!glm_graph_forward_token(&s->glm_graph,
-                                     &e->model,
-                                     &e->weights,
-                                     token,
-                                     NULL,
-                                     pos,
-                                     NULL,
-                                     s->logits,
-                                     false))
-        {
-            if (errlen) snprintf(err, errlen, "%s GLM decode failed",
-                                 ds4_backend_name(e->backend));
-            s->checkpoint_valid = false;
-            s->mtp_draft_valid = false;
-            ds4_session_glm_cap_dense_cache(s);
-            return 1;
-        }
-        token_vec_push(&s->checkpoint, token);
-        s->checkpoint_valid = true;
-        s->mtp_draft_valid = false;
-        if (updates_dense) ds4_session_glm_note_dense_cache(s, pos, 1);
-        /* MTP acceptance probe (timing/quality only, output untouched):
-         * after each committed token, draft the token two positions ahead
-         * from the nextn block and score it against the next greedy pick.
-         * Both TP ranks must set the env (the draft's routed experts ride
-         * a big-gate exchange). */
-        if (getenv("DS4_GLM_MTP_PROBE") && DS4_N_NEXTN_PREDICT != 0) {
-            static int probe_hits, probe_total, probe_have, probe_draft;
-            static uint32_t probe_min_pos = UINT32_MAX;
-            int nmax = 0;
-            float nbest = s->logits[0];
-            for (uint32_t i = 1; i < DS4_N_VOCAB; i++) {
-                if (s->logits[i] > nbest) { nbest = s->logits[i]; nmax = (int)i; }
-            }
-            if (probe_have) {
-                probe_total++;
-                probe_hits += (probe_draft == nmax);
-                if ((probe_total % 16) == 0) {
-                    fprintf(stderr, "ds4: glm mtp probe: %d/%d hits (%.1f%%)\n",
-                            probe_hits, probe_total,
-                            100.0 * probe_hits / probe_total);
-                }
-            }
-            if (probe_min_pos == UINT32_MAX) probe_min_pos = pos;
-            int draft = -1;
-            if (glm_graph_mtp_step(&s->glm_graph, &e->model, &e->weights,
-                                   nmax, pos, probe_min_pos, &draft)) {
-                probe_draft = draft;
-                probe_have = 1;
-            } else {
-                probe_have = 0;
-                fprintf(stderr, "ds4: glm mtp probe: draft step failed at pos %u\n", pos);
-            }
-        }
-        (void)probe_mtp;
-        return 0;
-    }
     const bool mtp_probe_log = getenv("DS4_MTP_PROBE") != NULL;
     if (probe_mtp && e->support_kind == DS4_SUPPORT_MTP_LEGACY) {
         ds4_session_note_legacy_mtp_probe(s, token, mtp_probe_log);
@@ -56299,16 +56022,6 @@ static bool ds4_sessions_eval_batch_metal_supported(
         ds4_session *s = items[i].session;
         if (!s || s->engine != e || s->distributed ||
             ds4_session_is_cpu(s) || !s->checkpoint_valid) {
-            return false;
-        }
-        if (ds4_session_is_glm(s)) {
-            if (!s->glm_graph_ready || s->glm_graph.ssd_streaming ||
-                glm_debug_hidden_dump_layer() >= 0 ||
-                e->glm_mtp ||
-                getenv("DS4_GLM_MTP_PROBE") != NULL) {
-                return false;
-            }
-        } else if (s->graph.ssd_streaming) {
             return false;
         }
     }
@@ -60449,36 +60162,6 @@ int ds4_session_eval_speculative_argmax(ds4_session *s, int first_token,
         (void)max_tokens;
         (void)eos_token;
         if (!accepted || accepted_cap <= 0) return 0;
-        if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
-        accepted[0] = first_token;
-        return 1;
-    }
-    if (ds4_session_is_glm(s)) {
-        (void)max_tokens;
-        (void)eos_token;
-        if (!accepted || accepted_cap <= 0) return 0;
-#ifndef DS4_NO_GPU
-        if (s->engine->glm_mtp && DS4_N_NEXTN_PREDICT != 0 &&
-            s->glm_graph_ready) {
-            if (ds4_session_tp_leader(s)) {
-                ds4_engine *ge = s->engine;
-                if (!ds4_tp_send_eval(ge->tp.ctx, s->tp_session_id,
-                                      ++ge->tp.eval_seq, first_token)) {
-                    snprintf(err, errlen, "tp: worker eval send failed");
-                    return -1;
-                }
-            }
-            int rc = ds4_session_glm_spec_cycle(s, first_token, accepted,
-                                                accepted_cap, err, errlen);
-#if defined(__APPLE__)
-            if (rc >= 0 && s->engine && s->engine->tp.active && ds4_gpu_tp_failed()) {
-                snprintf(err, errlen, "tp: gate transport failed");
-                return -1;
-            }
-#endif
-            return rc;
-        }
-#endif
         if (ds4_session_eval(s, first_token, err, errlen) != 0) return -1;
         accepted[0] = first_token;
         return 1;
