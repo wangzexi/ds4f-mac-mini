@@ -89,14 +89,6 @@ int ds4_gpu_commands_active(void);
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);
 int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label);
 int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label);
-#ifdef DS4_ROCM_BUILD
-int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,
-                                             uint64_t offset,
-                                             void *data,
-                                             uint64_t bytes,
-                                             uint64_t event_value,
-                                             const char *label);
-#endif
 int ds4_gpu_end_commands(void);
 /* Last completed owned command buffer's device execution time.  This is
  * diagnostic-only; 0 means the backend cannot provide GPU timestamps. */
@@ -139,9 +131,6 @@ int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_q8_cache_suppressed(void);
 void ds4_gpu_set_q8_cache_suppressed(int suppressed);
-#ifdef DS4_ROCM_BUILD
-void ds4_gpu_release_q8_f16_cache(void);
-#endif
 
 /* Model-file ranges assigned to CUDA devices by the multi-GPU placement
  * planner. Metal keeps these declarations for the shared engine interface. */
@@ -288,18 +277,6 @@ int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const int32_t                     *selected_ids,
         uint32_t                           n_tokens,
         uint32_t                           n_selected);
-#endif
-#ifdef DS4_ROCM_BUILD
-int ds4_gpu_stream_expert_cache_load_layer(
-        const ds4_gpu_stream_expert_table *table);
-int ds4_gpu_stream_expert_cache_seed_from_layer_selected(
-        const ds4_gpu_stream_expert_table *table,
-        const ds4_gpu_tensor             *selected,
-        uint32_t                          n_tokens,
-        uint32_t                          n_seed_tokens,
-        uint32_t                          n_selected);
-int ds4_gpu_stream_expert_cache_finish_pending_batch(void);
-int ds4_gpu_stream_expert_cache_release_layer_cache(void);
 #endif
 int ds4_gpu_stream_expert_cache_seed_experts(
         const ds4_gpu_stream_expert_table *table,

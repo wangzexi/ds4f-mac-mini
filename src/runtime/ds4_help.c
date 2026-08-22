@@ -147,10 +147,6 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
                                 ds4_help_tool tool, bool full) {
     title(fp, c, "Model And Runtime");
     opt(fp, c, "-m, --model FILE", "GGUF model path. Default: ds4flash.gguf");
-#ifdef DS4_ROCM_BUILD
-    opt(fp, c, "--metal | --rocm | --cpu", "Select the backend explicitly.");
-    opt(fp, c, "--backend NAME", "Backend name: metal, rocm, or cpu.");
-#else
     opt(fp, c, "--metal | --cuda | --cpu", "Select the backend explicitly.");
     opt(fp, c, "--backend NAME", "Backend name: metal, cuda, or cpu.");
     opt(fp, c, "--gpu-vram N[,N,...]|auto", "CUDA VRAM budgets per device, in GiB, or auto-detect free VRAM.");
@@ -158,7 +154,6 @@ static void print_model_runtime(FILE *fp, const help_colors *c,
     if (tool != DS4_HELP_EVAL) {
         opt(fp, c, "--cuda-tensor-parallel", "Enable the paired DeepSeek tensor/expert path on an even multi-GPU CUDA placement.");
     }
-#endif
     if (tool != DS4_HELP_BENCH) {
         opt(fp, c, "-c, --ctx N", "Allocated context tokens.");
     }

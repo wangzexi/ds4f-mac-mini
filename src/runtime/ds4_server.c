@@ -2736,12 +2736,6 @@ static char *render_live_tool_tail_for_syntax(server_model_syntax syntax,
     return render_deepseek_live_tool_tail(msgs, start, think_mode);
 }
 
-static DS4_SERVER_MAYBE_UNUSED char *render_live_tool_tail(
-        const chat_msgs *msgs, int start,
-        ds4_think_mode think_mode) {
-    return render_live_tool_tail_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK,
-                                            msgs, start, NULL, think_mode);
-}
 
 static void chat_msg_collect_tool_call_ids(const chat_msg *m, stop_list *ids) {
     if (!m || !ids) return;
@@ -13482,18 +13476,10 @@ static void usage(FILE *fp, const char *topic) {
 
 static ds4_backend parse_backend_arg(const char *s, const char *arg) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
-#ifdef DS4_ROCM_BUILD
-    if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
-#else
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
-#endif
     if (!strcmp(s, "cpu")) return DS4_BACKEND_CPU;
     server_log(DS4_LOG_DEFAULT, "ds4-server: invalid %s value: %s", arg, s);
-#ifdef DS4_ROCM_BUILD
-    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, rocm, cpu");
-#else
     server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cuda, cpu");
-#endif
     exit(2);
 }
 
@@ -13680,13 +13666,8 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--metal")) {
             c.engine.backend = DS4_BACKEND_METAL;
-#ifdef DS4_ROCM_BUILD
-        } else if (!strcmp(arg, "--rocm")) {
-            c.engine.backend = DS4_BACKEND_CUDA;
-#else
         } else if (!strcmp(arg, "--cuda")) {
             c.engine.backend = DS4_BACKEND_CUDA;
-#endif
         } else if (!strcmp(arg, "--gpu-vram")) {
             c.gpu_vram_arg = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--gpu-devices")) {
