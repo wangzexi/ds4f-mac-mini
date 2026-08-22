@@ -588,6 +588,18 @@ typedef struct {
 
 static ds4_gpu_model_prefetch_slot
     g_model_prefetch_slots[DS4_METAL_MODEL_PREFETCH_SLOTS];
+/* Multiple prefetched layers may occupy memory at once, but the model file
+ * has one sequential producer.  Serializing whole-layer reads avoids turning
+ * the SSD into six competing random readers. */
+static pthread_mutex_t g_model_prefetch_io_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static uint32_t ds4_gpu_model_prefetch_slot_limit(void) {
+    const uint64_t gib = 1024ull * 1024ull * 1024ull;
+    const uint64_t memory = ds4_gpu_system_memory_bytes();
+    if (memory != 0 && memory <= 24ull * gib) return 2u;
+    if (memory != 0 && memory <= 48ull * gib) return 4u;
+    return DS4_METAL_MODEL_PREFETCH_SLOTS;
+}
 
 enum {
     DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER = 80,
@@ -651,6 +663,10 @@ static ds4_gpu_stream_expert_cache_entry
 
 static ds4_gpu_stream_expert_cache_entry
     g_stream_full_expert_addr_entry[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
+/* This is deliberately a phase bit rather than a process-wide mode: the
+ * exact Prefill path may use full-layer views, while Decode keeps its normal
+ * rolling selected-expert cache. */
+static int g_streaming_prefill_full_expert_addr_table;
 static uint32_t g_stream_expert_cache_layer_count[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint64_t g_stream_expert_cache_layer_hits[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
 static uint64_t g_stream_expert_cache_layer_misses[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER];
@@ -10775,7 +10791,8 @@ static void ds4_gpu_model_prefetch_slot_clear(
 
 static ds4_gpu_model_prefetch_slot *ds4_gpu_model_prefetch_find(
         uint32_t tag) {
-    for (uint32_t i = 0; i < DS4_METAL_MODEL_PREFETCH_SLOTS; i++) {
+    const uint32_t limit = ds4_gpu_model_prefetch_slot_limit();
+    for (uint32_t i = 0; i < limit; i++) {
         ds4_gpu_model_prefetch_slot *slot = &g_model_prefetch_slots[i];
         if (slot->started && slot->tag == tag) return slot;
     }
@@ -10783,7 +10800,8 @@ static ds4_gpu_model_prefetch_slot *ds4_gpu_model_prefetch_find(
 }
 
 static ds4_gpu_model_prefetch_slot *ds4_gpu_model_prefetch_find_free(void) {
-    for (uint32_t i = 0; i < DS4_METAL_MODEL_PREFETCH_SLOTS; i++) {
+    const uint32_t limit = ds4_gpu_model_prefetch_slot_limit();
+    for (uint32_t i = 0; i < limit; i++) {
         if (!g_model_prefetch_slots[i].started) {
             return &g_model_prefetch_slots[i];
         }
@@ -10812,6 +10830,7 @@ static void *ds4_gpu_model_prefetch_thread_main(void *opaque) {
     @autoreleasepool {
         const size_t max_chunk = ds4_gpu_model_prefetch_chunk_bytes();
         int ok = 1;
+        pthread_mutex_lock(&g_model_prefetch_io_mutex);
         for (uint32_t i = 0; ok && i < slot->view_count; i++) {
             ds4_gpu_model_view *view = &slot->views[i];
             uint8_t *dst = view->buffer ? (uint8_t *)[view->buffer contents] : NULL;
@@ -10846,6 +10865,7 @@ static void *ds4_gpu_model_prefetch_thread_main(void *opaque) {
                                                          (NSUInteger)view->bytes)];
             }
         }
+        pthread_mutex_unlock(&g_model_prefetch_io_mutex);
         slot->read_ms = ds4_gpu_now_ms() - slot->start_ms;
         slot->ok = ok && !slot->cancel;
     }
@@ -10994,12 +11014,13 @@ int ds4_gpu_model_prefetch_spans_activate(uint32_t tag) {
 }
 
 void ds4_gpu_model_prefetch_cancel_all(void) {
-    for (uint32_t i = 0; i < DS4_METAL_MODEL_PREFETCH_SLOTS; i++) {
+    const uint32_t limit = ds4_gpu_model_prefetch_slot_limit();
+    for (uint32_t i = 0; i < limit; i++) {
         if (g_model_prefetch_slots[i].started) {
             g_model_prefetch_slots[i].cancel = 1;
         }
     }
-    for (uint32_t i = 0; i < DS4_METAL_MODEL_PREFETCH_SLOTS; i++) {
+    for (uint32_t i = 0; i < limit; i++) {
         ds4_gpu_model_prefetch_slot *slot = &g_model_prefetch_slots[i];
         if (!slot->started) continue;
         (void)pthread_join(slot->thread, NULL);
@@ -13648,8 +13669,17 @@ static int ds4_gpu_glm_streaming_prefill_full_layer_active(void) {
 
 static int ds4_gpu_stream_full_expert_addr_table_requested(void) {
     return g_ssd_streaming_mode &&
-           getenv("DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") != NULL &&
+           (g_streaming_prefill_full_expert_addr_table ||
+            getenv("DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") != NULL) &&
            getenv("DS4_METAL_DISABLE_STREAMING_FULL_EXPERT_ADDR_TABLE") == NULL;
+}
+
+void ds4_gpu_streaming_prefill_full_expert_addr_table_begin(void) {
+    g_streaming_prefill_full_expert_addr_table = 1;
+}
+
+void ds4_gpu_streaming_prefill_full_expert_addr_table_end(void) {
+    g_streaming_prefill_full_expert_addr_table = 0;
 }
 
 static uint64_t ds4_gpu_buffer_address(id<MTLBuffer> buffer, NSUInteger inner) {
@@ -15802,6 +15832,10 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
         const ds4_gpu_stream_expert_table *table,
         const int32_t                     *selected_ids,
         uint32_t                           n_selected) {
+    /* Full-layer Prefill already reads the current layer into owned Metal
+     * views.  The selected loader will blit from those views instead of
+     * starting a duplicate SSD read. */
+    if (g_streaming_prefill_full_expert_addr_table) return 1;
     if (!g_ssd_streaming_mode ||
         getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_EARLY_LOAD") != NULL) {
         return 1;
@@ -16556,7 +16590,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing(
             gate_expert_bytes,
             down_expert_bytes,
             missing_mask,
-            0,
+            g_streaming_prefill_full_expert_addr_table ? 1 : 0,
             entries);
 }
 

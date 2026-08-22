@@ -131,6 +131,10 @@ int ds4_gpu_model_prefetch_spans_begin(const void *model_map,
                                        uint32_t tag);
 int ds4_gpu_model_prefetch_spans_activate(uint32_t tag);
 void ds4_gpu_model_prefetch_cancel_all(void);
+/* Prefill-only full-layer expert views. Decode never enables this path. The
+ * caller must serialize these phase changes with inference execution. */
+void ds4_gpu_streaming_prefill_full_expert_addr_table_begin(void);
+void ds4_gpu_streaming_prefill_full_expert_addr_table_end(void);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 int ds4_gpu_q8_cache_suppressed(void);

@@ -15301,6 +15301,7 @@ typedef struct {
     uint32_t pipeline_capture_chunk_len;
     bool ssd_streaming; /* glm-branch SSD streaming; always false here */
     bool cache_aware_exact_prefill;
+    bool prefill_layer_zero_preload_pending;
 
     /* Optional MTP model state.  It has its own raw cache because the drafter
      * runs on speculative future tokens; target KV state is updated only after
@@ -19781,7 +19782,18 @@ static bool metal_graph_stream_map_decode_static_all(
 /* This tag cannot collide with a transformer layer number. */
 #define DS4_METAL_PREFETCH_STATIC_DECODE_TAG UINT32_MAX
 
+static bool metal_graph_prefill_full_layer_enabled(void) {
+    const char *env = getenv("DS4_METAL_STREAMING_PREFILL_FULL_LAYER");
+    return env && env[0] && strcmp(env, "0") != 0 &&
+           !glm_graph_env_present(
+                   "DS4_ROCM_DISABLE_STREAMING_PREFILL_FULL_LAYER",
+                   "DS4_METAL_DISABLE_STREAMING_PREFILL_FULL_LAYER");
+}
+
 static uint32_t metal_graph_prefill_static_decode_prefetch_max_tokens(void) {
+    if (metal_graph_prefill_full_layer_enabled()) {
+        return UINT32_MAX;
+    }
     uint32_t max_tokens = 1024u;
     const char *env = getenv(
             "DS4_METAL_PREFILL_STATIC_DECODE_PREFETCH_MAX_TOKENS");
@@ -19799,7 +19811,8 @@ static uint32_t metal_graph_prefill_static_decode_prefetch_max_tokens(void) {
 static bool metal_graph_prefill_static_decode_prefetch_enabled(
         uint32_t n_tokens) {
     const char *env = getenv("DS4_METAL_PREFILL_STATIC_DECODE_PREFETCH");
-    return env && env[0] && strcmp(env, "0") != 0 &&
+    const bool explicit_enable = env && env[0] && strcmp(env, "0") != 0;
+    return (metal_graph_prefill_full_layer_enabled() || explicit_enable) &&
         n_tokens <= metal_graph_prefill_static_decode_prefetch_max_tokens();
 }
 
@@ -19905,13 +19918,17 @@ static bool metal_graph_stream_map_prefill_trunk(
     return ok;
 }
 
-static bool metal_graph_prefetch_prefill_trunk(
+static bool metal_graph_prefetch_prefill_layer(
         const ds4_model   *model,
         const ds4_weights *weights,
-        uint32_t           il) {
+        uint32_t           il,
+        bool               full_layer) {
     if (!model || !weights || il >= DS4_N_LAYER) return false;
     ds4_model_map_span_vec spans;
-    if (!weights_model_map_decode_layer_spans(weights, il, &spans)) {
+    const bool spans_ok = full_layer ?
+        weights_model_map_spans(weights, il, il, false, &spans) :
+        weights_model_map_decode_layer_spans(weights, il, &spans);
+    if (!spans_ok) {
         return false;
     }
     uint64_t *offsets = xmalloc((size_t)spans.len * sizeof(offsets[0]));
@@ -19931,6 +19948,24 @@ static bool metal_graph_prefetch_prefill_trunk(
     free(offsets);
     free(spans.v);
     return ok;
+}
+
+static uint32_t metal_graph_prefill_schedule_layers(
+        const ds4_model   *model,
+        const ds4_weights *weights,
+        uint32_t           first_layer,
+        bool               full_layer,
+        bool              *submitted) {
+    uint32_t next_layer = first_layer;
+    while (next_layer < DS4_N_LAYER) {
+        if (!metal_graph_prefetch_prefill_layer(
+                    model, weights, next_layer, full_layer)) {
+            break;
+        }
+        if (submitted) submitted[next_layer] = true;
+        next_layer++;
+    }
+    return next_layer;
 }
 
 static uint32_t metal_graph_prefill_io_chunk_mib(void) {
@@ -34141,10 +34176,18 @@ static bool metal_graph_prefill_layer_major_decode_rows(
      * with a token/layer view would force the next Decode to reread 4.60 GiB
      * of unchanged trunk weights.  Routed experts retain their independent
      * cache and continue to be scheduled per layer below. */
-    const bool reuse_static_decode_map = g->ssd_streaming &&
+    const bool full_layer_prefetch_mode =
+        metal_graph_prefill_full_layer_enabled();
+    bool reuse_static_decode_map = g->ssd_streaming &&
         g->streaming_static_decode_map_current &&
         metal_graph_stream_decode_static_map_enabled() &&
         metal_graph_stream_decode_static_map_state_cache_enabled();
+    /* Full-layer Prefill is intentionally layer-major.  Drop the startup
+     * Decode map before its first layer so its memory becomes the rolling
+     * Prefill window; the static Decode map is rebuilt at the final boundary. */
+    if (full_layer_prefetch_mode) {
+        reuse_static_decode_map = false;
+    }
     if (g->ssd_streaming && !reuse_static_decode_map) {
         g->streaming_static_decode_map_current = false;
         if (!metal_graph_stream_map_token(model, weights)) return false;
@@ -34182,6 +34225,9 @@ static bool metal_graph_prefill_layer_major_decode_rows(
     bool interrupted = false;
     bool static_decode_prefetch_started = false;
     bool static_decode_prefetch_installed = false;
+    bool full_layer_prefetch_available = false;
+    bool full_layer_prefetched[DS4_MAX_LAYER] = { false };
+    uint32_t next_prefetch_layer = 0;
     const char *layer_profile_env =
         getenv("DS4_METAL_PREFILL_LAYER_PROFILE");
     const bool layer_profile = layer_profile_env && layer_profile_env[0] &&
@@ -34190,6 +34236,28 @@ static bool metal_graph_prefill_layer_major_decode_rows(
     uint32_t interrupted_row = UINT32_MAX;
     const uint32_t release_hash_layer0_after =
         metal_graph_prefill_release_hash_layer0_after();
+    if (g->ssd_streaming && !reuse_static_decode_map &&
+        full_layer_prefetch_mode) {
+        ds4_gpu_streaming_prefill_full_expert_addr_table_begin();
+        if (metal_graph_prefetch_prefill_layer(model, weights, 0, true)) {
+            full_layer_prefetched[0] = true;
+            full_layer_prefetch_available = true;
+            next_prefetch_layer = metal_graph_prefill_schedule_layers(
+                    model,
+                    weights,
+                    1,
+                    true,
+                    full_layer_prefetched);
+            fprintf(stderr,
+                    "ds4: Prefill rolling full-layer prefetch enabled "
+                    "submitted_until=%u\n",
+                    next_prefetch_layer);
+        } else {
+            ds4_gpu_streaming_prefill_full_expert_addr_table_end();
+            fprintf(stderr,
+                    "ds4: Prefill full-layer expert prefetch unavailable; using selected cache\n");
+        }
+    }
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const double layer_started = layer_profile ? now_sec() : 0.0;
         if (cancel && cancel(cancel_ud)) {
@@ -34202,20 +34270,54 @@ static bool metal_graph_prefill_layer_major_decode_rows(
              * adopts the owned buffer filled while the preceding layer was
              * executing; a failed/disabled prefetch falls back to the exact
              * synchronous path. */
-            if (!reuse_static_decode_map &&
-                !ds4_gpu_model_prefetch_spans_activate(il) &&
+            const bool current_full_layer =
+                full_layer_prefetch_available && full_layer_prefetched[il];
+            if (current_full_layer) {
+                ds4_gpu_streaming_prefill_full_expert_addr_table_begin();
+            } else {
+                ds4_gpu_streaming_prefill_full_expert_addr_table_end();
+            }
+            bool current_prefetch_activated = reuse_static_decode_map;
+            if (!current_prefetch_activated) {
+                current_prefetch_activated =
+                    ds4_gpu_model_prefetch_spans_activate(il) != 0;
+                if (!current_prefetch_activated && current_full_layer) {
+                    full_layer_prefetch_available = false;
+                    full_layer_prefetched[il] = false;
+                    ds4_gpu_streaming_prefill_full_expert_addr_table_end();
+                    ds4_gpu_model_prefetch_cancel_all();
+                    fprintf(stderr,
+                            "ds4: Prefill full-layer prefetch activation failed at layer=%u; fallback\n",
+                            il);
+                }
+            }
+            if (!current_prefetch_activated &&
                 !metal_graph_stream_map_prefill_trunk(model, weights, il)) {
                 ok = false;
                 break;
             }
+            if (next_prefetch_layer <= il) {
+                next_prefetch_layer = il + 1u;
+            }
+            if (full_layer_prefetch_available) {
+                next_prefetch_layer = metal_graph_prefill_schedule_layers(
+                        model,
+                        weights,
+                        next_prefetch_layer,
+                        true,
+                        full_layer_prefetched);
+            }
             if (!reuse_static_decode_map) {
-                const uint32_t lookahead = 3u;
-                for (uint32_t d = 1;
-                     d <= lookahead && il + d < DS4_N_LAYER;
-                     d++) {
-                    (void)metal_graph_prefetch_prefill_trunk(model,
-                                                             weights,
-                                                             il + d);
+                if (!full_layer_prefetch_available) {
+                    for (uint32_t d = 1;
+                         d <= 3u && il + d < DS4_N_LAYER;
+                         d++) {
+                        (void)metal_graph_prefetch_prefill_layer(
+                                model,
+                                weights,
+                                il + d,
+                                false);
+                    }
                 }
             }
             if (!reuse_static_decode_map && il + 1u == DS4_N_LAYER) {
@@ -34336,6 +34438,8 @@ static bool metal_graph_prefill_layer_major_decode_rows(
         }
         ds4_gpu_model_prefetch_cancel_all();
     }
+    g->prefill_layer_zero_preload_pending = false;
+    ds4_gpu_streaming_prefill_full_expert_addr_table_end();
     if (show_progress) fputc('\n', stderr);
     if (interrupted) {
         if (interrupted_row == UINT32_MAX) {
@@ -58574,6 +58678,28 @@ bool ds4_engine_preload_prefill_hash_layer_zero(ds4_engine *e) {
 #else
     (void)e;
     return true;
+#endif
+}
+
+bool ds4_session_preload_prefill_layer_zero(ds4_session *s) {
+#if !defined(DS4_NO_GPU) && defined(__APPLE__)
+    if (!s || !s->engine || !s->engine->ssd_streaming ||
+        s->engine->backend != DS4_BACKEND_METAL ||
+        !metal_graph_prefill_full_layer_enabled()) {
+        return false;
+    }
+    if (s->graph.prefill_layer_zero_preload_pending) return true;
+    if (!metal_graph_prefetch_prefill_layer(
+                &s->engine->model, &s->engine->weights, 0, true)) {
+        return false;
+    }
+    s->graph.prefill_layer_zero_preload_pending = true;
+    fprintf(stderr,
+            "ds4: Prefill layer 0 full preload started\n");
+    return true;
+#else
+    (void)s;
+    return false;
 #endif
 }
 

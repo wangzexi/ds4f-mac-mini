@@ -124,6 +124,8 @@ run_server() {
     kv_cache_min_tokens=${DS4F_SERVER_KV_CACHE_MIN_TOKENS:-1}
     prefill_measurements=${DS4F_SERVER_PREFILL_MEASUREMENTS:-$project_dir/cache/prefill-measurements.tsv}
     preload_static_decode=${DS4F_SERVER_PRELOAD_STATIC_DECODE_TRUNK:-1}
+    prefill_full_layer=${DS4F_SERVER_PREFILL_FULL_LAYER:-1}
+    preload_prefill_layer=${DS4F_SERVER_PREFILL_PRELOAD_FIRST_LAYER:-1}
     decode_split_min_misses=${DS4F_SERVER_DECODE_SPLIT_MIN_MISSES:-2}
     disable_streaming_expert_addr_table=${DS4F_SERVER_DISABLE_STREAMING_EXPERT_ADDR_TABLE:-1}
 
@@ -163,8 +165,10 @@ run_server() {
         DS4_METAL_STREAMING_EXPERT_PREAD_POOL=1 \
         DS4_METAL_STREAMING_EXPERT_SORT_PREAD_TASKS=1 \
         DS4_METAL_STREAMING_EXPERT_SPLIT_MIN_MISSES="$decode_split_min_misses" \
+        DS4_METAL_STREAMING_PREFILL_FULL_LAYER="$prefill_full_layer" \
         DS4_METAL_PREFILL_MEASUREMENTS_PATH="$prefill_measurements" \
         DS4_SERVER_PRELOAD_STATIC_DECODE_TRUNK="$preload_static_decode" \
+        DS4_SERVER_PREFILL_PRELOAD_FIRST_LAYER="$preload_prefill_layer" \
         DS4_SERVER_PINNED_MIB="$pinned_mib" \
         DS4_SERVER_DECODE_PINNED_MIB="$decode_pinned_mib" \
         DS4_SERVER_MEMORY_RESERVE_MIB="$reserve_mib" \

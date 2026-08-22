@@ -475,6 +475,10 @@ bool ds4_session_streaming_static_decode_map_current(ds4_session *s);
  * useful for a dedicated one-session streaming server that trades a slightly
  * slower ready state for no first-request trunk read. */
 bool ds4_session_preload_static_decode_trunk(ds4_session *s);
+/* Start an idle Prefill full-layer read for layer 0. The single-session server
+ * calls this while it owns inference; the request path adopts the pending
+ * buffer instead of reading layer 0 again. */
+bool ds4_session_preload_prefill_layer_zero(ds4_session *s);
 int ds4_engine_routed_quant_bits(ds4_engine *e);
 bool ds4_engine_has_output_head(ds4_engine *e);
 bool ds4_engine_has_mtp(ds4_engine *e);
