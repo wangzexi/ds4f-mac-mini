@@ -5,7 +5,7 @@
 
 ## 演示
 
-https://github.com/wangzexi/ds4f-mac-mini/releases/download/v0.1.0/ds4f-demo.mp4
+![demo](docs/demo.mp4)
 
 ## 当前目标固定为：
 
