@@ -3,7 +3,11 @@
 面向 Apple Silicon 统一内存设备的 DeepSeek V4 Flash 0731 专用推理运行时；支持
 16 GiB 及以上统一内存。
 
-当前目标固定为：
+## 演示
+
+https://github.com/wangzexi/ds4f-mac-mini/releases/download/v0.1.0/ds4f-demo.mp4
+
+## 当前目标固定为：
 
 - 单会话；
 - 最大 32K 上下文；
