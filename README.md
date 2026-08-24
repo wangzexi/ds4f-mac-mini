@@ -5,7 +5,7 @@
 
 ## 演示
 
-![demo](https://raw.githubusercontent.com/wangzexi/ds4f-mac-mini/main/docs/demo.mp4)
+https://github.com/user-attachments/assets/a43fbd4c-8c4c-4423-a5b9-76777de05b47
 
 ## 当前目标固定为：
 
