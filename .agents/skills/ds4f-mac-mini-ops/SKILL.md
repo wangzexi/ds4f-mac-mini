@@ -21,7 +21,7 @@ description: 在本地初始化 DeepSeek-V4-Flash-0731 模型、构建运行时�
 - 已准备外部 DS4 `gguf-tools/quants.c` 量化后端；
 - 建议准备约 100 GB 的构建盘空间；最终 GGUF 约 77 GB，剩余空间用于当前 shard、
   checkpoint 和安全余量；
-- `agents/skills/ds4f-mac-mini-ops/assets/deepseek-v4-flash-0731.layout.gguf` 存在；
+- `.agents/skills/ds4f-mac-mini-ops/assets/deepseek-v4-flash-0731.layout.gguf` 存在；
 - 不要把模型权重、源 shard 或中间状态提交到 Git。
 
 准备量化后端（只取构建所需文件）。为避免上游接口漂移，固定使用
@@ -51,7 +51,7 @@ make quantizer QUANTS_DIR=reference-ds4/gguf-tools
 下载并流式量化：
 
 ```sh
-python3 agents/skills/ds4f-mac-mini-ops/scripts/build_official_q4_stream.py \
+python3 .agents/skills/ds4f-mac-mini-ops/scripts/build_official_q4_stream.py \
   --quantizer build/deepseek4-quantize \
   --staging /path/with/free-space/ds4f-official-staging \
   --out /path/with/free-space/DeepSeek-V4-Flash-0731-Q4.gguf
@@ -77,7 +77,7 @@ make
 
 ```sh
 DS4F_SERVER_MODEL=/path/to/DeepSeek-V4-Flash-0731-Q4.gguf \
-./agents/skills/ds4f-mac-mini-ops/scripts/ds4f-cli server
+./.agents/skills/ds4f-mac-mini-ops/scripts/ds4f-cli server
 ```
 
 默认按 Metal 设备的推荐工作集自动规划内存，额外内存会用于扩大专家缓存；需要手工
@@ -97,14 +97,14 @@ curl -fsS http://127.0.0.1:8000/v1/models
 在本机终端进行连续对话（只使用 Python 标准库，不注入默认 system prompt）：
 
 ```sh
-python3 agents/skills/ds4f-mac-mini-ops/scripts/ds4f-chat.py \
+python3 .agents/skills/ds4f-mac-mini-ops/scripts/ds4f-chat.py \
   --base-url http://127.0.0.1:8000
 ```
 
 如果 server 在局域网里的 Mini 上运行，把地址改成 Mini 的地址：
 
 ```sh
-python3 agents/skills/ds4f-mac-mini-ops/scripts/ds4f-chat.py \
+python3 .agents/skills/ds4f-mac-mini-ops/scripts/ds4f-chat.py \
   --base-url http://mini:8000
 ```
 
@@ -116,13 +116,13 @@ Prefill 与 Decode 两段 token/s；开启思考模式时，终端会实时显�
 
 ```sh
 DS4F_FAST_MODEL=/path/with/free-space/DeepSeek-V4-Flash-0731-Q4.gguf \
-./agents/skills/ds4f-mac-mini-ops/scripts/ds4f-cli run "你好" 32
+./.agents/skills/ds4f-mac-mini-ops/scripts/ds4f-cli run "你好" 32
 ```
 
 执行固定贪心回归：
 
 ```sh
-./agents/skills/ds4f-mac-mini-ops/scripts/ds4f-cli regression /path/to/DeepSeek-V4-Flash-0731-Q4.gguf
+./.agents/skills/ds4f-mac-mini-ops/scripts/ds4f-cli regression /path/to/DeepSeek-V4-Flash-0731-Q4.gguf
 ```
 
 服务在前台运行，使用 `Ctrl-C` 停止。需要后台运行时，由调用方自行使用标准的

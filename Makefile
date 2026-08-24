@@ -6,7 +6,7 @@ RUNTIME_OBJCFLAGS ?= -O3 -ffast-math -g -mcpu=native -Wall -Wextra -fobjc-arc -f
 BUILDDIR := build
 QUANTS_DIR ?= reference-ds4/gguf-tools
 QUANTIZER ?= $(BUILDDIR)/deepseek4-quantize
-QUANTIZER_SRC := agents/skills/ds4f-mac-mini-ops/src/deepseek4-quantize.c
+QUANTIZER_SRC := .agents/skills/ds4f-mac-mini-ops/src/deepseek4-quantize.c
 
 RUNTIME_CORE_OBJS = \
 	$(BUILDDIR)/src/runtime/ds4.o \
@@ -32,7 +32,7 @@ server: ds4f-server
 quantizer: $(QUANTIZER)
 
 $(QUANTIZER): $(QUANTIZER_SRC) | $(BUILDDIR)
-	@test -f "$(QUANTS_DIR)/quants.c" && test -f "$(QUANTS_DIR)/quants.h" || { echo "missing quants.c/quants.h; see agents/skills/ds4f-mac-mini-ops/SKILL.md for the pinned upstream checkout" >&2; exit 2; }
+	@test -f "$(QUANTS_DIR)/quants.c" && test -f "$(QUANTS_DIR)/quants.h" || { echo "missing quants.c/quants.h; see .agents/skills/ds4f-mac-mini-ops/SKILL.md for the pinned upstream checkout" >&2; exit 2; }
 	$(CC) -O2 -Wall -Wextra -Werror -std=c11 -I"$(QUANTS_DIR)" -o $@ $(QUANTIZER_SRC) "$(QUANTS_DIR)/quants.c" -lm -pthread
 
 ds4f-q4-speed: $(BUILDDIR)/src/ds4f.o $(RUNTIME_CORE_OBJS)

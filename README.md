@@ -21,18 +21,18 @@ https://github.com/user-attachments/assets/a43fbd4c-8c4c-4423-a5b9-76777de05b47
 ```sh
 make
 DS4F_SERVER_MODEL=/path/to/DeepSeek-V4-Flash-0731-Q4.gguf \
-./agents/skills/ds4f-mac-mini-ops/scripts/ds4f-cli server
+./.agents/skills/ds4f-mac-mini-ops/scripts/ds4f-cli server
 ```
 
 构建产物：`ds4f-server`（HTTP server）与 `ds4f-q4-speed`（固定运行器）。
 模型下载量化、磁盘要求与断点续传见
-[ds4f-mac-mini-ops Skill](agents/skills/ds4f-mac-mini-ops/SKILL.md)。
+[ds4f-mac-mini-ops Skill](.agents/skills/ds4f-mac-mini-ops/SKILL.md)。
 
 终端连续对话（每轮结束显示 server 实测的 Prefill/Decode token/s，Prefill 只
 统计本轮未命中 KV 的新增 token）：
 
 ```sh
-python3 agents/skills/ds4f-mac-mini-ops/scripts/ds4f-chat.py --base-url http://mini:8000
+python3 .agents/skills/ds4f-mac-mini-ops/scripts/ds4f-chat.py --base-url http://mini:8000
 ```
 
 ## API
@@ -45,7 +45,7 @@ python3 agents/skills/ds4f-mac-mini-ops/scripts/ds4f-chat.py --base-url http://m
 ## 目录
 
 ```text
-agents/skills/  模型初始化、量化器和服务流程
+.agents/skills/  模型初始化、量化器和服务流程
 src/            固定运行器与 Metal runtime/server
 models/         本地模型权重，已被 Git 忽略
 ```
