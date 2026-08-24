@@ -1,7 +1,7 @@
 # ds4f-mac-mini
 
-面向 Apple Silicon 统一内存设备的 DeepSeek V4 Flash 0731 专用推理运行时；支持
-16 GiB 及以上统一内存。
+面向 Apple Silicon 统一内存设备的 DeepSeek V4 Flash 0731 专用推理运行时；
+16 GiB 统一内存，M4 实测解码约 2.4 tok/s。
 
 ## 演示
 
